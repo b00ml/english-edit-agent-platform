@@ -15,7 +15,7 @@ langgraph-checkpoint-postgres
 psycopg[binary]
 langchain-openai
 # openai 与 httpx>=0.28 的兼容下限（更低版本向 httpx 传已移除的 proxies 参数）
-openai>=1.55.3
+openai>=3.24.0
 # Local OCR V1 client (no heavyweight inference dependency in API/worker).
 httpx>=0.28
 langfuse
