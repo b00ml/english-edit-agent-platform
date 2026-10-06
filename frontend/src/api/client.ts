@@ -13,6 +13,9 @@ import type {
   GenerateResult,
   GenerationTask,
   KnowledgeListResult,
+  KnowledgeCatalogResult,
+  RagScopeMode,
+  KnowledgePreviewResult,
   KnowledgeRetrieveResult,
   KnowledgeUploadResult,
   LoginResult,
@@ -60,7 +63,7 @@ client.interceptors.response.use(
 
 /** 后端 FastAPI 错误响应的载荷结构（HTTPException 返回 {detail: "..."}） */
 interface ApiErrorPayload {
-  detail?: string
+  detail?: string | {loc?: (string | number)[]; msg?: string}[]
 }
 
 /**
@@ -74,6 +77,7 @@ export function getApiErrorMessage(err: unknown, fallback = '请求失败'): str
   if (axios.isAxiosError<ApiErrorPayload>(err)) {
     const detail = err.response?.data?.detail
     if (typeof detail === 'string' && detail) return detail
+    if (Array.isArray(detail) && detail.length) return detail.map(item => `${item.loc?.filter(part => part !== 'body').join('.') || '参数'}：${item.msg || '格式不正确'}`).join('；')
   }
   if (err instanceof Error && err.message) return err.message
   return fallback
@@ -260,15 +264,30 @@ export function uploadKnowledgeText(data: {
 }
 
 /** 上传教研文档（txt/md/docx/pdf）并解析、分块索引 */
-export function uploadKnowledgeFile(file: File, sourceType: string): Promise<KnowledgeUploadResult> {
+export function uploadKnowledgeFile(file: File, sourceType: string, knowledgePoint?: string, knowledgePoints: string[] = [], chunkLayout?: 'legacy' | 'structure'): Promise<KnowledgeUploadResult> {
   const form = new FormData()
+  if (chunkLayout) form.append('chunk_layout', chunkLayout)
   form.append('file', file)
   form.append('source_type', sourceType)
+  if (knowledgePoint) form.append('knowledge_point', knowledgePoint)
+  form.append('knowledge_points', JSON.stringify(knowledgePoints))
   return client
     .post('/knowledge/upload', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     .then((r) => r.data)
+}
+
+export function getKnowledgeCatalog(): Promise<KnowledgeCatalogResult> {
+  return client.get('/knowledge/points').then((r) => r.data)
+}
+
+/** Local parser/chunker preview; never embeds or writes knowledge. */
+export function previewKnowledgeFile(file: File, chunkLayout?: 'legacy' | 'structure'): Promise<KnowledgePreviewResult> {
+  const form = new FormData()
+  if (chunkLayout) form.append('chunk_layout', chunkLayout)
+  form.append('file', file)
+  return client.post('/knowledge/preview', form).then((r) => r.data)
 }
 
 /** 知识分块列表（分页，可按资料类型过滤） */
@@ -287,10 +306,11 @@ export function deleteKnowledge(chunkId: string): Promise<{ deleted: string }> {
 export function retrieveKnowledge(
   query: string,
   knowledge_point?: string,
-  top_k = 3,
+  top_k?: number,
+  options: { scope_mode?: RagScopeMode; source_name?: string; context_mode?: 'legacy' | 'relation' } = {},
 ): Promise<KnowledgeRetrieveResult> {
   return client
-    .get('/knowledge/retrieve', { params: { query, knowledge_point, top_k } })
+    .get('/knowledge/retrieve', { params: { query, knowledge_point, top_k, ...options } })
     .then((r) => r.data)
 }
 
@@ -359,4 +379,48 @@ export function getCalibrations(templateId?: string): Promise<CalibrationRecord[
   return client
     .get('/quality/calibration', { params: templateId ? { template_id: templateId } : {} })
     .then((r) => r.data)
+}
+
+export interface KnowledgeDocumentSummary {
+  chunk_layout?: string; index_input_signature?: string | null
+  id: string; source_name: string; source_type: string; status: string; leaf_count: number
+  parent_count: number; index_revision: number; ocr_job_id: string | null; parser_version: string
+  embedding_models: string[]; source_hash: string; created_at: string
+}
+export const listKnowledgeDocuments = (page = 1) => client.get<{total: number; items: KnowledgeDocumentSummary[]}>('/knowledge/documents', {params: {page, page_size: 20}}).then(r => r.data)
+export const removeKnowledgeDocument = (id: string) => client.delete<{deleted_document: string; deleted_chunks: number; ocr_source_retained: boolean}>(`/knowledge/documents/${id}`).then(r => r.data)
+
+
+export const getKnowledgeStructure = (id: string) => client.get<import('./types').StructurePlan>(`/knowledge/documents/${id}/structure`).then(r => r.data)
+export const reviewKnowledgeStructure = (id: string, body: {
+  review_signature: string; expected_index_revision: number; source_reviewed: boolean
+  accepted_edge_ids: string[]; rejected_edge_ids: string[]
+}) => client.post<import('./types').StructurePlan>(`/knowledge/documents/${id}/structure-review`, body).then(r => r.data)
+
+
+export interface ModelProviderConfig {id: string; name: string; base_url: string; status: 'enabled' | 'disabled'; has_api_key: boolean; config_hash: string}
+export interface EditableModelProfile {id?: string; name: string; provider: string; provider_id: string | null; model_name: string; cost_tier: string; is_default: boolean; status: 'enabled' | 'disabled'; max_fallbacks: number; budget_per_task: number | null; tenant_id?: string | null}
+export interface ModelTemplateRoute {template_id: string; name?: string; generation_profile: string | null; judge_profile: string | null; template_generation?: unknown; template_judge?: string | null}
+export const getModelCapabilities = () => client.get<{credential_storage_ready: boolean; legacy_base_url: string; legacy_model: string; protocol: string}>('/model-settings/capabilities').then(r => r.data)
+export const getModelProviders = () => client.get<ModelProviderConfig[]>('/model-settings/providers').then(r => r.data)
+export const saveModelProvider = (data: {id?: string; name: string; base_url: string; api_key?: string; status: 'enabled' | 'disabled'}) => client.post<ModelProviderConfig>('/model-settings/providers', data).then(r => r.data)
+export const deleteModelProvider = (id: string) => client.delete(`/model-settings/providers/${id}`)
+export const probeModelProvider = (id: string) => client.post<{reachable: boolean; models: string[]; generation_verified: boolean}>(`/model-settings/providers/${id}/probe`).then(r => r.data)
+export const getModelProfiles = () => client.get<EditableModelProfile[]>('/model-profiles').then(r => r.data)
+export const saveModelProfile = (data: EditableModelProfile) => client.post<EditableModelProfile>('/model-profiles', data).then(r => r.data)
+export const getModelRoutes = () => client.get<ModelTemplateRoute[]>('/model-settings/routes').then(r => r.data)
+export const saveModelRoute = (data: ModelTemplateRoute) => client.post('/model-settings/routes', {template_id: data.template_id, generation_profile: data.generation_profile, judge_profile: data.judge_profile})
+
+
+export function getTraceSnapshot(rowId: string): Promise<{row_id: string; replay_level: string; content_hash: string; data: Record<string, unknown>}> {
+  return client.get(`/traces/records/${rowId}/snapshot`).then(r => r.data)
+}
+export function setSamplePurpose(sampleId: string, purpose: 'sft' | 'fewshot') {
+  return client.patch(`/samples/${sampleId}/purpose`, null, {params: {purpose}}).then(r => r.data)
+}
+
+
+/** Cooperative cancellation: acknowledgement is not a terminal cancelled task. */
+export function cancelGenerationTask(taskId: string): Promise<{task_id: string; status: string; message: string}> {
+  return client.post(`/tasks/${taskId}/cancel`).then(r => r.data)
 }

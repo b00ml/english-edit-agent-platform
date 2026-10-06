@@ -33,6 +33,12 @@ interface ReadingPayload {
   questions?: ReadingQuestion[]
 }
 
+/** Display one assigned option label; do not mutate stored model output or answers. */
+function optionBody(option: string, index: number): string {
+  const label = String.fromCharCode(65 + index)
+  return option.replace(new RegExp(`^\\s*${label}[.、):：]\\s*`), '')
+}
+
 /** 渲染一题选择题（可用于单选/阅读小题） */
 function renderChoice(stem: string, options: string[], answer: string, explanation: string) {
   return (
@@ -40,7 +46,7 @@ function renderChoice(stem: string, options: string[], answer: string, explanati
       <p className="preview-stem">{stem}</p>
       {options.map((opt, i) => (
         <p key={i} className="preview-option">
-          {String.fromCharCode(65 + i)}. {opt}
+          {String.fromCharCode(65 + i)}. {optionBody(opt, i)}
         </p>
       ))}
       <p className="preview-answer">答案：{answer}</p>
@@ -49,7 +55,7 @@ function renderChoice(stem: string, options: string[], answer: string, explanati
   )
 }
 
-export default function ContentPreview({ item }: { item: ContentItem }) {
+function PayloadPreview({ item }: { item: ContentItem }) {
   const ts = item.template_id
   const payload = item.payload as Record<string, any>
 
@@ -72,7 +78,7 @@ export default function ContentPreview({ item }: { item: ContentItem }) {
             </p>
             {(b.options ?? []).map((opt, j) => (
               <p key={j} className="preview-option">
-                {String.fromCharCode(65 + j)}. {opt}
+                {String.fromCharCode(65 + j)}. {optionBody(opt, j)}
               </p>
             ))}
             <p className="preview-explanation">解析：{b.explanation ?? '-'}</p>
@@ -95,7 +101,7 @@ export default function ContentPreview({ item }: { item: ContentItem }) {
             </p>
             {(q.options ?? []).map((opt, j) => (
               <p key={j} className="preview-option">
-                {String.fromCharCode(65 + j)}. {opt}
+                {String.fromCharCode(65 + j)}. {optionBody(opt, j)}
               </p>
             ))}
             <p className="preview-answer">答案：{q.answer ?? '-'}</p>
@@ -108,4 +114,15 @@ export default function ContentPreview({ item }: { item: ContentItem }) {
 
   // 兜底：原样输出 JSON
   return <pre className="pre">{JSON.stringify(payload, null, 2)}</pre>
+}
+export default function ContentPreview({ item }: { item: ContentItem }) {
+  const report = item.validation_report
+  return <div>
+    {report && <div className="preview-block" role="note">
+      {report.errors.map((issue, i) => <p key={`error-${i}`} className="preview-explanation">结构校验未通过：{issue.message}</p>)}
+      {report.warnings.map((issue, i) => <p key={`warning-${i}`} className="preview-explanation">质量提示：{issue.message}</p>)}
+      <p className="preview-explanation">结构校验不代表答案正确或唯一；请人工核对题目及干扰项。</p>
+    </div>}
+    <PayloadPreview item={item} />
+  </div>
 }

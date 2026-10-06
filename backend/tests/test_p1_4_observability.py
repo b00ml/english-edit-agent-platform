@@ -185,6 +185,8 @@ def test_get_trace_preserves_persisted_lifecycle_stage(monkeypatch):
         classmethod(lambda cls, row: SimpleNamespace(stage=row.stage or "generate")),
     )
 
-    result = routes.get_trace("trace-1", db=_Db(), current_user=SimpleNamespace())
+    result = routes.get_trace(
+        "trace-1", db=_Db(), current_user=SimpleNamespace(role="admin", tenant_id=None)
+    )
 
     assert [item.stage for item in result] == ["queue_item", "qc"]

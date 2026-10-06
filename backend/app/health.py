@@ -26,7 +26,7 @@ def _probe(name: str, check: Any) -> dict[str, Any]:
             "name": name,
             "status": "unavailable",
             "latency_ms": _elapsed(started),
-            "detail": str(exc)[:200],
+            "detail": type(exc).__name__,
         }
 
 
@@ -50,8 +50,9 @@ def check_alembic() -> dict[str, Any]:
     def _check() -> str:
         session = SessionLocal()
         try:
-            row = session.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).first()
-            return str(row[0]) if row else "未记录版本"
+            from app.main import _verify_migrations
+
+            return _verify_migrations(session)
         finally:
             session.close()
 
@@ -103,7 +104,21 @@ def check_checkpointer() -> dict[str, Any]:
 
 
 def dependency_report() -> dict[str, Any]:
-    checks = [check_database(), check_alembic(), check_redis(), check_checkpointer()]
+    from app.engine.trace_recovery import trace_diagnostics
+
+    diagnostics = trace_diagnostics()
+    checks = [
+        check_database(),
+        check_alembic(),
+        check_redis(),
+        check_checkpointer(),
+        {
+            "name": "trace",
+            "status": diagnostics["status"],
+            "latency_ms": 0.0,
+            "detail": f"process={diagnostics['process_id']} spooled={diagnostics['spooled']}",
+        },
+    ]
     statuses = {item["status"] for item in checks}
     overall = (
         "unavailable"
@@ -130,6 +145,12 @@ def readiness_report() -> dict[str, Any]:
         and not settings.ALLOW_MEMORY_CHECKPOINTER
     ):
         failed.append(checkpointer)
+    if settings.TRACE_REQUIRE_DURABILITY:
+        failed.extend(
+            item
+            for item in report["dependencies"]
+            if item["name"] == "trace" and item["status"] == "unavailable"
+        )
     report["ready"] = not failed
     report["blocking"] = [item["name"] for item in failed]
     if failed:

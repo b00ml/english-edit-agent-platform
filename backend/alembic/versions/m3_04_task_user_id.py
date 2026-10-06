@@ -30,7 +30,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index("ix_generation_task_user_id", table_name="generation_task")
-    op.drop_constraint(
-        "fk_generation_task_user_id_users", "generation_task", type_="foreignkey"
-    )
+    op.drop_constraint("fk_generation_task_user_id_users", "generation_task", type_="foreignkey")
     op.drop_column("generation_task", "user_id")

@@ -2,21 +2,25 @@
 # 实现平台的 6 张核心表，字段对照架构文档第 7 节。
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def new_uuid() -> str:
@@ -70,6 +74,26 @@ class GenerationTask(Base):
     """一次批量生成请求，记录切片子任务与整体进度。"""
 
     __tablename__ = "generation_task"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','dispatched','running','awaiting_review','succeeded',"
+            "'partially_succeeded','failed','cancelled')",
+            name="ck_generation_task_status",
+        ),
+        Index(
+            "uq_active_generation_request",
+            "request_hash",
+            unique=True,
+            postgresql_where=text(
+                "request_hash IS NOT NULL AND status IN "
+                "('pending','dispatched','running','awaiting_review')"
+            ),
+            sqlite_where=text(
+                "request_hash IS NOT NULL AND status IN "
+                "('pending','dispatched','running','awaiting_review')"
+            ),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     template_id: Mapped[str] = mapped_column(
@@ -108,6 +132,10 @@ class GenerationTaskItem(Base):
     __tablename__ = "generation_task_item"
     __table_args__ = (
         UniqueConstraint("task_id", "item_index", name="uq_generation_task_item_index"),
+        CheckConstraint(
+            "status IN ('pending','running','awaiting_review','succeeded','failed','cancelled')",
+            name="ck_generation_item_status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -122,10 +150,11 @@ class GenerationTaskItem(Base):
     )
     failure_code: Mapped[str] = mapped_column(String(64), nullable=True)
     failure_reason: Mapped[str] = mapped_column(Text, nullable=True)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
-    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -150,6 +179,10 @@ class TaskOutbox(Base):
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_base: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )
@@ -171,11 +204,14 @@ class ContentItem(Base):
     """生成出的单条内容（含题干/选项/答案等载荷），待质检。"""
 
     __tablename__ = "content_item"
+    __table_args__ = (UniqueConstraint("thread_id", name="uq_content_item_thread_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     task_id: Mapped[str] = mapped_column(ForeignKey("generation_task.id"), index=True)
     template_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    validation_report: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     qc_score: Mapped[float] = mapped_column(Float, nullable=True)
     # 状态流转：pending_qc -> passed / rejected / published；
     # awaiting_review（P1-1 灰区人工卡点，interrupt 暂停等待人工裁决）
@@ -228,6 +264,55 @@ class QualityRecord(Base):
 # ---------------------------------------------------------------------------
 # 5. 模型档案表
 # ---------------------------------------------------------------------------
+class QualityEvaluation(Base):
+    """每条草稿的自动质检事件，独立于内容是否达标/入库。"""
+
+    __tablename__ = "quality_evaluation"
+    __table_args__ = (UniqueConstraint("thread_id", "revise_count", name="uq_quality_eval_round"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    task_id: Mapped[str] = mapped_column(ForeignKey("generation_task.id"), index=True)
+    template_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    revise_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    is_final: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dimension_scores: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    config_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ModelProvider(Base):
+    """Admin-owned OpenAI-compatible endpoint; secrets never appear in output schemas."""
+
+    __tablename__ = "model_provider"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    base_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    api_key_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    key_revision: Mapped[str] = mapped_column(String(36), nullable=False, default=new_uuid)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="enabled")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ModelRoute(Base):
+    """Persistent UI overrides, separate from YAML which startup synchronizes."""
+
+    __tablename__ = "model_route"
+    template_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    generation_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    judge_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class ModelProfile(Base):
     """模型配置档案，用于路由主/备/默认模型。"""
 
@@ -236,6 +321,9 @@ class ModelProfile(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_id: Mapped[str | None] = mapped_column(ForeignKey("model_provider.id"), nullable=True)
+    provider_config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_record: Mapped[ModelProvider | None] = relationship(ModelProvider)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)
     model_hash: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
     cost_tier: Mapped[str] = mapped_column(String(32), nullable=False, default="standard")
@@ -248,6 +336,15 @@ class ModelProfile(Base):
     max_fallbacks: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     budget_per_task: Mapped[float] = mapped_column(Float, nullable=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=True)
+    __table_args__ = (
+        Index(
+            "uq_default_model_scope",
+            func.coalesce(tenant_id, ""),
+            unique=True,
+            postgresql_where=text("is_default"),
+            sqlite_where=text("is_default = 1"),
+        ),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -256,6 +353,22 @@ class ModelProfile(Base):
 # ---------------------------------------------------------------------------
 # 6. 调用链路日志表
 # ---------------------------------------------------------------------------
+class TraceSnapshot(Base):
+    """Bounded encrypted, redacted request/response; never sent to external trace sinks."""
+
+    __tablename__ = "trace_snapshot"
+    trace_row_id: Mapped[str] = mapped_column(
+        ForeignKey("trace_log.id", ondelete="CASCADE"), primary_key=True
+    )
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    stored_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    replay_level: Mapped[str] = mapped_column(String(48), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+
 class TraceLog(Base):
     """记录每次 LLM 调用的链路信息，用于成本与可观测性分析。"""
 
@@ -267,12 +380,21 @@ class TraceLog(Base):
     template_id: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
     # 所属生成任务（用于成本按任务聚合，与 item_id 解耦）
     task_id: Mapped[str] = mapped_column(String(36), nullable=True, index=True)
+    snapshot_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="legacy_unavailable",
+        server_default="legacy_unavailable",
+    )
     trace_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=True)
     model: Mapped[str] = mapped_column(String(128), nullable=True)
     input_data: Mapped[dict] = mapped_column(JSONB, nullable=True)
     output_data: Mapped[dict] = mapped_column(JSONB, nullable=True)
     latency_ms: Mapped[float] = mapped_column(Float, nullable=True)
+    usage_reported: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    prompt_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completion_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     cost: Mapped[float] = mapped_column(Float, nullable=True)
     # 调用阶段：generate（生成）/ qc（质检），供深度成本按阶段拆分
     stage: Mapped[str] = mapped_column(String(32), nullable=True, index=True)
@@ -405,12 +527,63 @@ class QualityCalibration(Base):
 # ---------------------------------------------------------------------------
 # 8. 知识库分块表（RAG）
 # ---------------------------------------------------------------------------
+class KnowledgeDocument(Base):
+    """Normalized source snapshot and parser diagnostics; old chunks need no document."""
+
+    __tablename__ = "knowledge_document"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    parser_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="indexed")
+    normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
+    original_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    blocks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    warnings: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    stats: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    meta: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class KnowledgeChunk(Base):
     """知识库分块：教材/课标/真题等资料按知识点分块并向量化，供生成时检索注入。"""
 
     __tablename__ = "knowledge_chunk"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("knowledge_document.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    parent_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("knowledge_chunk.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    prev_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("knowledge_chunk.id", ondelete="SET NULL"), nullable=True
+    )
+    next_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("knowledge_chunk.id", ondelete="SET NULL"), nullable=True
+    )
+    chunk_type: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    search_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    knowledge_point_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    knowledge_point_labels: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    chunk_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    context_header: Mapped[str | None] = mapped_column(Text, nullable=True)
+    section_path: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    chunker_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    embedding_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    embedding_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # 资料类型：教材 / 课标 / 真题
     source_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     source_name: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -418,7 +591,7 @@ class KnowledgeChunk(Base):
     knowledge_point: Mapped[str] = mapped_column(String(128), nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     # 向量（维度与 embedding 模型输出一致，默认 1024）
-    embedding: Mapped[list] = mapped_column(Vector(1024), nullable=False)
+    embedding: Mapped[list | None] = mapped_column(Vector(1024), nullable=True)
     meta: Mapped[dict] = mapped_column(JSONB, nullable=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -455,4 +628,108 @@ class User(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+
+class OcrJob(Base):
+    """Durable parsing job, independent from knowledge indexing or content generation."""
+
+    __tablename__ = "ocr_job"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    created_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    filename: Mapped[str] = mapped_column(String(256), nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    input_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    selected_pages: Mapped[list[int]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    dispatch_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    index_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_requested")
+    approval: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    index_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    index_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    index_dispatch_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    index_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    indexed_document_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("knowledge_document.id", ondelete="SET NULL"), nullable=True
+    )
+    preview_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    preview_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class OcrPage(Base):
+    """Per-page checkpoint; committed successful pages survive cancellation/restarts."""
+
+    __tablename__ = "ocr_page"
+    __table_args__ = (UniqueConstraint("job_id", "page_no", name="uq_ocr_page_job_number"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("ocr_job.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    page_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    attempt_history: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    result_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    result_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    engine_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    latency_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class OcrBoundaryJob(Base):
+    """Separate explicit local multi-page review; never rewrites successful OCR/index data."""
+
+    __tablename__ = "ocr_boundary_job"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("ocr_job.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    pages: Mapped[list[int]] = mapped_column(JSONB, nullable=False)
+    source_preview_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    result_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    result_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    engine_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

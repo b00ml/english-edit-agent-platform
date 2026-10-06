@@ -29,6 +29,7 @@ _bearer = HTTPBearer(auto_error=False)
 # ---------------------------------------------------------------------------
 # 权限点定义（映射 PRD 第 13 节）。权限点 -> 允许的角色集合。
 ROLE_PERMISSIONS: dict[str, List[str]] = {
+    "model:manage": ["admin"],
     # 用户管理（仅管理员）
     "user:manage": ["admin"],
     # 题型模板 / 模型路由配置（仅管理员）
@@ -38,6 +39,7 @@ ROLE_PERMISSIONS: dict[str, List[str]] = {
     # 取消生成任务
     "generate:cancel": ["admin", "researcher"],
     # 查看任务 / 内容（已发布内容对查看者开放，见 apply_scope）
+    "task:read": ["admin", "researcher"],
     "content:read": ["admin", "researcher", "reviewer", "viewer"],
     # 人工质检标注
     "quality:review": ["admin", "researcher", "reviewer"],
@@ -63,6 +65,7 @@ ROLE_PAGES: dict[str, List[str]] = {
         "/traces",
         "/notifications",
         "/users",
+        "/model-settings",
     ],
     "researcher": [
         "/",

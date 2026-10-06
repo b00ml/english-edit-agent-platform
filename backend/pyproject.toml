@@ -9,6 +9,8 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic",
     "pydantic>=2.0",
+    "jsonschema>=4.0",
+    "cryptography>=43",
     "psycopg2-binary",
     "redis",
     "celery",
@@ -16,6 +18,12 @@ dependencies = [
     "langchain-openai",
     "langfuse",
     "pyyaml",
+    "python-docx",
+    "pypdf",
+    "pypdfium2>=4.30",
+    "Pillow>=10",
+    "openpyxl>=3.1.5",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +35,7 @@ dev = [
     "isort",
     "flake8",
     "mypy",
-    "pydantic-settings",
+    "pydantic-settings>=2.7",
 ]
 
 [tool.setuptools.packages.find]
@@ -59,6 +67,13 @@ addopts = "-q --cov=app --cov-report=term-missing"
 markers = [
     "integration: 需要真实 Postgres 的集成测试（设 TEST_DATABASE_URL 后运行 tests/integration）",
 ]
+
+[tool.setuptools.package-data]
+"app.rag" = ["knowledge_points.yml"]
+
+"app.rag.structure" = ["policy.yml"]
+
+"app.rag.retrieval" = ["planning.yml"]
 
 [tool.coverage.run]
 # 工作区中保留的历史重构/备份副本不属于运行时模块，不应稀释生产代码覆盖率。

@@ -8,18 +8,18 @@ from typing import Optional
 
 import jsonschema
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.dedup import compute_request_hash
+from app.engine.router import _resolve_primary_profile_name
 from app.errors import DuplicateTaskError, InvalidTemplateParamsError
 from app.models import GenerationTask, ModelProfile, QuestionTemplate, User
 from app.outbox import create_generation_dispatch, relay_pending
 from app.repositories import TaskRepository
 from app.schemas import GenerateRequest, GenerateResponse, TaskListOut, TaskOut
-from app.versioning import task_version_snapshot_with_model
-
-# 正在执行、不应重复提交的任务状态
-_ACTIVE_TASK_STATUSES = ("pending", "running")
+from app.tenancy import require_scope, scope_query
+from app.versioning import hash_value, task_version_snapshot_with_model
 
 
 class GenerationService:
@@ -55,6 +55,7 @@ class GenerationService:
         if template is None or template.status == "disabled":
             raise HTTPException(status_code=404, detail="题型模板不存在或已禁用")
 
+        require_scope(template, current_user, shared=True)
         # 校验输入参数符合模板 input_schema（JSON Schema Draft 2020-12）
         if template.input_schema:
             try:
@@ -75,9 +76,50 @@ class GenerationService:
                 )
 
         # 去重：相同题型+规范参数+schema版本且任务仍在执行中，则拒绝重复提交
-        # 使用 template.updated_at 作为 schema 版本标识（模板更新后允许重新生成）
-        schema_version = template.updated_at.isoformat() if template.updated_at else None
-        request_hash = compute_request_hash(req.template_id, req.params, schema_version)
+        # Stable executable template identity, not startup-updated timestamps.
+        schema_version = hash_value(
+            {
+                "version": template.version,
+                "template_hash": template.template_hash,
+                "output_schema": template.output_schema,
+            }
+        )
+        params = {
+            key: value
+            for key, value in req.params.items()
+            if key not in {"tenant_id", "fewshot_context", "fewshot_provenance"}
+        }
+        if "quantity" in params:
+            params["quantity"] = 1
+        from app.engine.providers import route_for_template
+
+        route = route_for_template(self.db, template.type_id)
+        route_profile_names = [
+            name
+            for name in (
+                route.generation_profile if route else None,
+                route.judge_profile if route else None,
+            )
+            if name
+        ]
+        route_profiles = (
+            self.db.query(ModelProfile).filter(ModelProfile.name.in_(route_profile_names)).all()
+            if route_profile_names
+            else []
+        )
+        request_hash = hash_value(
+            {
+                "tenant_id": current_user.tenant_id,
+                "batch_quantity": req.quantity,
+                "model_route": (
+                    {"generation": route.generation_profile, "judge": route.judge_profile}
+                    if route and (route.generation_profile or route.judge_profile)
+                    else None
+                ),
+                "model_config_hashes": {p.name: p.model_hash for p in route_profiles},
+                "request": compute_request_hash(req.template_id, params, schema_version),
+            }
+        )
         existing = self.task_repo.get_by_request_hash(request_hash)
         if existing is not None:
             raise DuplicateTaskError(
@@ -86,55 +128,83 @@ class GenerationService:
             )
 
         # 创建任务
-        model_name = (template.run_config or {}).get("model_profile")
-        if isinstance(model_name, dict):
-            model_name = model_name.get("default")
+        override = route
+        model_name = (
+            override.generation_profile
+            if override and override.generation_profile
+            else _resolve_primary_profile_name(template.run_config or {}, params)
+        )
         profile = None
         if isinstance(model_name, str):
-            profile = self.db.query(ModelProfile).filter(ModelProfile.name == model_name).first()
+            profile = (
+                scope_query(self.db.query(ModelProfile), ModelProfile, current_user, shared=True)
+                .filter(ModelProfile.name == model_name)
+                .first()
+            )
         if profile is None:
-            profile = self.db.query(ModelProfile).filter(ModelProfile.is_default.is_(True)).first()
+            profile = (
+                scope_query(self.db.query(ModelProfile), ModelProfile, current_user, shared=True)
+                .filter(ModelProfile.is_default.is_(True))
+                .first()
+            )
         if profile is not None and not isinstance(profile, ModelProfile):
             profile = None
+        snapshot = task_version_snapshot_with_model(template, profile)
+        snapshot["model_route"] = (
+            {"generation": override.generation_profile, "judge": override.judge_profile}
+            if override
+            else None
+        )
+        snapshot["route_profile_hashes"] = {p.name: p.model_hash for p in route_profiles}
         task = self.task_repo.create(
             template_id=req.template_id,
-            params=req.params,
+            params=params,
             request_hash=request_hash,
             quantity=req.quantity,
             status="pending",
             progress=0.0,
-            user_id=current_user.id,
+            user_id=getattr(current_user, "id", None),
             tenant_id=current_user.tenant_id,
-            version_snapshot=task_version_snapshot_with_model(template, profile),
+            version_snapshot=snapshot,
         )
-        self.db.flush()
-        create_generation_dispatch(self.db, task)
-        self.db.commit()
+        try:
+            self.db.flush()
+            create_generation_dispatch(self.db, task)
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+            sqlite_conflict = "generation_task.request_hash" in str(exc.orig)
+            if constraint != "uq_active_generation_request" and not sqlite_conflict:
+                raise
+            winner = (
+                self.db.query(GenerationTask)
+                .filter(GenerationTask.request_hash == request_hash)
+                .order_by(GenerationTask.created_at.desc())
+                .first()
+            )
+            if winner is None:
+                raise
+            raise DuplicateTaskError(
+                "并发提交的相同请求已有任务，请使用已有任务", winner.id
+            ) from exc
         self.db.refresh(task)
 
         # 数据库提交后立即尝试 relay；进程/Redis 故障时保留 pending outbox，
         # 不再留下“任务已创建但消息丢失”的不可解释状态。
         try:
-            relay_result = relay_pending(
+            relay_pending(
                 self.db,
                 lambda name, args, task_id=None: celery_app.send_task(
                     name, args=args, task_id=task_id
                 ),
                 limit=1,
             )
-            # 兼容未执行新迁移的测试/旧实例：Outbox 未能被扫描时保留旧发送路径，
-            # 但真实数据库仍有 pending 事件，后续 relay 会再次校正投递状态。
-            if relay_result.get("scanned", 0) == 0:
-                celery_app.send_task(
-                    "app.worker.tasks.process_generation_task",
-                    args=[task.id],
-                    task_id=f"task:{task.id}:dispatch",
-                )
         except Exception:  # noqa: BLE001 - relay 失败由 outbox worker 后续补偿
             self.logger.warning("任务 outbox 首次 relay 失败 task_id=%s", task.id, exc_info=True)
         return GenerateResponse(task_id=task.id, status=task.status)
 
-    def get_task(self, task_id: str) -> GenerationTask:
+    def get_task(self, task_id: str, current_user: User | None = None) -> GenerationTask:
         """查询单个任务详情与进度。
 
         Raises:
@@ -143,7 +213,7 @@ class GenerationService:
         task = self.task_repo.get_by_id(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
-        return task
+        return require_scope(task, current_user)
 
     def list_tasks(
         self,
@@ -151,6 +221,7 @@ class GenerationService:
         page_size: int = 20,
         user_id: Optional[int] = None,
         tenant_id: Optional[str] = None,
+        current_user: User | None = None,
     ) -> TaskListOut:
         """任务列表（分页）。
 
@@ -160,23 +231,21 @@ class GenerationService:
             user_id: 按用户过滤（可选）
             tenant_id: 按租户过滤（可选）
         """
-        skip = (page - 1) * page_size
-
-        if user_id:
-            tasks = self.task_repo.list_by_user(user_id, skip, page_size)
-            total = self.task_repo.count_by_user(user_id)
-        elif tenant_id:
-            tasks = self.task_repo.list_by_tenant(tenant_id, skip, page_size)
-            total = self.task_repo.count_by_tenant(tenant_id)
-        else:
-            tasks = self.task_repo.list_all(skip, page_size)
-            total = self.task_repo.count()
-
+        query = scope_query(self.db.query(GenerationTask), GenerationTask, current_user)
+        if tenant_id is not None and (current_user is None or current_user.role == "admin"):
+            query = query.filter(GenerationTask.tenant_id == tenant_id)
+        total = query.count()
+        tasks = (
+            query.order_by(GenerationTask.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
         return TaskListOut(
             total=total,
             page=page,
             page_size=page_size,
-            items=[TaskOut.model_validate(t) for t in tasks],
+            items=[TaskOut.model_validate(task) for task in tasks],
         )
 
     def update_task_status(
@@ -193,6 +262,11 @@ class GenerationService:
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
 
+        from app.domain.status import TASK_STATUSES
+        from app.errors import InvalidGenerationStateError
+
+        if status not in TASK_STATUSES or (progress is not None and not 0 <= progress <= 1):
+            raise InvalidGenerationStateError("任务状态或进度不合法")
         update_data = {"status": status}
         if progress is not None:
             update_data["progress"] = progress

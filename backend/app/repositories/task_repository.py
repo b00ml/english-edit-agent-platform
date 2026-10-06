@@ -9,6 +9,7 @@ from typing import List, Optional
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
+from app.domain.status import ACTIVE_TASK_STATUSES
 from app.models import GenerationTask
 from app.repositories.base import BaseRepository
 
@@ -24,7 +25,7 @@ class TaskRepository(BaseRepository[GenerationTask]):
         return (
             self.db.query(GenerationTask)
             .filter(GenerationTask.request_hash == request_hash)
-            .filter(GenerationTask.status.in_(["pending", "running"]))
+            .filter(GenerationTask.status.in_(ACTIVE_TASK_STATUSES))
             .first()
         )
 
@@ -94,24 +95,17 @@ class TaskRepository(BaseRepository[GenerationTask]):
         """
         按状态统计任务数量
 
-        返回: {"pending": 10, "running": 5, "completed": 100, ...}
+        返回全部八种现役任务状态计数；不把 awaiting_review 归为已完成。
         """
-        from sqlalchemy import case
-
-        result = (
-            self.db.query(
-                func.count(case((self.model.status == "pending", 1))).label("pending"),
-                func.count(case((self.model.status == "running", 1))).label("running"),
-                func.count(case((self.model.status == "completed", 1))).label("completed"),
-                func.count(case((self.model.status == "failed", 1))).label("failed"),
-            )
+        rows = (
+            self.db.query(self.model.status, func.count(self.model.id))
             .filter(self.model.tenant_id == tenant_id)
-            .first()
+            .group_by(self.model.status)
+            .all()
         )
+        from app.domain.status import TASK_STATUSES
 
-        return {
-            "pending": int(result.pending or 0),
-            "running": int(result.running or 0),
-            "completed": int(result.completed or 0),
-            "failed": int(result.failed or 0),
-        }
+        result = {status: 0 for status in TASK_STATUSES}
+        for status, count in rows:
+            result[status] = int(count)
+        return result

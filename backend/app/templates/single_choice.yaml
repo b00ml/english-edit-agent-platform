@@ -1,6 +1,6 @@
 type_id: single_choice
 name: 单项选择
-version: 1
+version: 3
 input_schema:
   type: object
   properties:
@@ -12,14 +12,15 @@ output_schema:
   type: object
   required: [stem, options, answer, explanation]
   properties:
-    stem: {type: string}
+    stem: {type: string, minLength: 1}
     options:
       type: array
-      items: {type: string}
+      items: {type: string, minLength: 1}
       minItems: 4
       maxItems: 4
+      uniqueItems: true
     answer: {type: string, enum: [A, B, C, D]}
-    explanation: {type: string}
+    explanation: {type: string, minLength: 1}
 quality_rules:
   - id: kp_match
     weight: 0.3
@@ -60,7 +61,14 @@ run_config:
   # 按难度分档路由：单选为简单题型，默认走轻量级模型 lite，难题才用 standard
   model_profile:
     default: lite
-    hard: standard
+    难: standard
   max_retry: 3
   max_revise: 3
   quality_threshold: 70
+  # These templates are knowledge-based. Missing source must not silently become free generation.
+  rag:
+    mode: required
+    require_human_verification: true
+  content_validation:
+    choice_sets:
+    - path: ''

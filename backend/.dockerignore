@@ -8,3 +8,16 @@ __pycache__/
 .env
 install.log
 import_check.txt
+# Historical workspace-only backups are not application modules.
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+app/api/routes_original.py
+app/api/routes_refactored.py
+app/api/routes_step1.py
+app/api/routes_step2.py
+app/worker/tasks_backup.py
+
+# Private durable OCR inputs/results must only live on mounted storage.
+.local-ocr/

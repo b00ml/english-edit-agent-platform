@@ -156,7 +156,7 @@ export default function ContentLibraryPage() {
                     </button>
                     <button
                       className="btn btn-ghost"
-                      disabled={item.status === 'published'}
+                      disabled={item.status !== 'passed' || item.validation_report?.valid === false}
                       onClick={() => handlePublish(item)}
                     >
                       {item.status === 'published' ? '已发布' : '发布'}

@@ -15,13 +15,17 @@ class _FakeQuery:
     def __init__(self, session, model):
         self._session = session
         self._model = model
+        self._filters = []
 
     def filter(self, *args, **kwargs):
+        self._filters.extend(args)
         return self
 
     def first(self):
         for obj in self._session.added:
-            if isinstance(obj, self._model):
+            if isinstance(obj, self._model) and all(
+                getattr(obj, expr.left.key) == expr.right.value for expr in self._filters
+            ):
                 return obj
         return None
 
@@ -84,7 +88,7 @@ def _wired(monkeypatch):
     calls = {"generate": 0, "quality": [], "notified": []}
 
     monkeypatch.setattr(wf, "_load_template", lambda s, tid: _template())
-    monkeypatch.setattr(wf, "get_effective_weights", lambda s, tid: (None, None))
+    monkeypatch.setattr(wf, "get_effective_weights", lambda s, tid, **kwargs: (None, None))
     monkeypatch.setattr(wf, "build_rag_context", lambda *a, **kw: "")
 
     def _fake_generate(template, params, session, profile_name=None, **kw):
@@ -351,7 +355,7 @@ class TestReviseNodeFix:
             "_load_template",
             lambda s, tid: _template({"enabled": False}),
         )
-        monkeypatch.setattr(wf, "get_effective_weights", lambda s, tid: (None, None))
+        monkeypatch.setattr(wf, "get_effective_weights", lambda s, tid, **kwargs: (None, None))
         state = {
             "task_id": "t",
             "trace_id": "th",

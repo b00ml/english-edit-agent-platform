@@ -10,10 +10,10 @@ from pathlib import Path
 # 默认只把 scripts/ 放入 sys.path，无法解析同级 app 包。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy.exc import SQLAlchemyError  # noqa: E402
 
-from app.config import settings
+from app.config import settings  # noqa: E402
 
 
 def main() -> int:
@@ -28,6 +28,20 @@ def main() -> int:
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
+            exists = connection.execute(text("SELECT to_regclass('public.content_item')")).scalar()
+            if exists is not None:
+                duplicates = connection.execute(
+                    text(
+                        "SELECT thread_id, count(*) FROM content_item WHERE thread_id IS NOT NULL "
+                        "GROUP BY thread_id HAVING count(*) > 1 LIMIT 10"
+                    )
+                ).all()
+                if duplicates:
+                    print(
+                        "ERROR: content_item 存在重复 thread_id，先人工核对，迁移不会自动删数据",
+                        file=sys.stderr,
+                    )
+                    return 3
             if MigrationContext is not None:
                 context = MigrationContext.configure(connection)
                 current = sorted(context.get_current_heads())

@@ -1,6 +1,6 @@
 # app/schemas.py —— Pydantic v2 请求/响应模型
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,9 +26,10 @@ class GenerateRequest(BaseModel):
 class ModelProfileIn(BaseModel):
     """创建/更新模型档案的入参。"""
 
-    name: str
-    provider: str
-    model_name: str
+    name: str = Field(min_length=1, max_length=64)
+    provider: str = Field(min_length=1, max_length=64)
+    provider_id: Optional[str] = None
+    model_name: str = Field(min_length=1, max_length=128)
     cost_tier: str = "standard"
     is_default: bool = False
     status: str = Field(default="enabled", pattern="^(enabled|disabled)$")
@@ -42,6 +43,7 @@ class QualityReviewRequest(BaseModel):
 
     pass_: bool = Field(..., alias="pass")
     reason: str = ""
+    reference_verified: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +53,17 @@ class TaskBase(ORMSchema):
     id: str
     template_id: str
     quantity: int
-    status: str
-    progress: float
+    status: Literal[
+        "pending",
+        "dispatched",
+        "running",
+        "awaiting_review",
+        "succeeded",
+        "partially_succeeded",
+        "failed",
+        "cancelled",
+    ]
+    progress: float = Field(ge=0, le=1)
     trace_ref: Optional[str] = None
     tenant_id: Optional[str] = None
     created_at: datetime
@@ -78,7 +89,10 @@ class ContentOut(ORMSchema):
     id: str
     task_id: str
     template_id: str
+    tenant_id: Optional[str] = None
     payload: Dict[str, Any]
+    provenance: Optional[Dict[str, Any]] = None
+    validation_report: Optional[Dict[str, Any]] = None
     qc_score: Optional[float] = None
     status: str
     revise_count: int
@@ -116,6 +130,7 @@ class CalibrateRequest(BaseModel):
     """触发质检权重校准的入参。"""
 
     template_id: str
+    tenant_id: Optional[str] = None
     alpha: float = Field(default=1.0, ge=0.0, le=2.0)
     min_samples: int = Field(default=20, ge=1)
     min_fp: int = Field(default=5, ge=1)
@@ -126,6 +141,7 @@ class CalibrationOut(ORMSchema):
 
     id: str
     template_id: str
+    tenant_id: Optional[str] = None
     weights: Dict[str, Any]
     threshold: float
     default_weights: Dict[str, Any]
@@ -146,6 +162,8 @@ class ModelProfileOut(ORMSchema):
     id: str
     name: str
     provider: str
+    provider_id: Optional[str] = None
+    provider_config_hash: Optional[str] = None
     model_name: str
     model_hash: Optional[str] = None
     cost_tier: str
@@ -270,6 +288,8 @@ class CostTraceOut(BaseModel):
 class CostDeepOut(BaseModel):
     """深度成本报表聚合结果。"""
 
+    unknown_usage_calls: int = 0
+    unknown_pricing_calls: int = 0
     total_cost: float
     total_count: int
     total_prompt_tokens: int
@@ -293,7 +313,7 @@ class DashboardKpi(BaseModel):
 
     key: str
     label: str
-    value: float
+    value: Optional[float]
     unit: str = ""
     target: Optional[float] = None
     # goal: higher_better / lower_better（仅达标判定方向）
@@ -304,6 +324,7 @@ class DashboardOut(BaseModel):
     """指标看板聚合结果（PRD 第 15.1 节口径）。"""
 
     kpis: List[DashboardKpi]
+    quality_pipeline: dict[str, int | float | None] = Field(default_factory=dict)
     # 按题型的质检通过率/人工驳回率明细
     by_template: List[dict]
     # 近 N 条任务的生产周期明细
@@ -320,6 +341,7 @@ class TraceOut(ORMSchema):
     """单条 TraceLog 记录（链路中的一步 LLM 调用）。"""
 
     id: str
+    snapshot_status: str = "legacy_unavailable"
     trace_id: str
     task_id: Optional[str] = None
     template_id: Optional[str] = None
@@ -448,11 +470,13 @@ class UnreadCountOut(BaseModel):
 class KnowledgeUploadIn(BaseModel):
     """上传一份知识资料并分块索引。"""
 
+    chunk_layout: Literal["legacy", "structure"] | None = None
     source_type: str  # 教材 / 课标 / 真题
     source_name: str
     text: str
     knowledge_point: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
+    knowledge_points: List[str] = Field(default_factory=list, max_length=16)
 
 
 class KnowledgeUploadOut(BaseModel):
@@ -462,6 +486,8 @@ class KnowledgeUploadOut(BaseModel):
     source_type: str
     source_name: str
     knowledge_point: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeChunkOut(ORMSchema):
@@ -473,6 +499,24 @@ class KnowledgeChunkOut(ORMSchema):
     knowledge_point: Optional[str] = None
     content: str
     created_at: datetime
+    parent_chunk_id: Optional[str] = None
+    prev_chunk_id: Optional[str] = None
+    next_chunk_id: Optional[str] = None
+    chunk_type: Optional[str] = None
+    knowledge_point_ids: Optional[List[str]] = None
+    knowledge_point_labels: Optional[List[str]] = None
+    document_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    content_start: Optional[int] = None
+    content_end: Optional[int] = None
+    page_no: Optional[int] = None
+    context_header: Optional[str] = None
+    section_path: Optional[List[str]] = None
+    parser_version: Optional[str] = None
+    chunker_version: Optional[str] = None
+    embedding_model: Optional[str] = None
+    embedding_dimension: Optional[int] = None
+    meta: Optional[Dict[str, Any]] = None
 
 
 class KnowledgeListOut(BaseModel):
@@ -487,6 +531,10 @@ class KnowledgeRetrieveOut(BaseModel):
 
     query: str
     snippets: List[str]
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
+    protocol_version: str = "rag-context-v1"
+    bundles: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +616,7 @@ class UserCreateIn(BaseModel):
     username: str
     password: str = Field(min_length=6)
     display_name: str = ""
+    tenant_id: Optional[str] = None
     role: str = Field(default="viewer", pattern="^(admin|researcher|reviewer|viewer)$")
 
 

@@ -1,9 +1,10 @@
 import sys
 
 sys.path.insert(0, "/code")
+from datetime import datetime, timezone
+
 from app.database import SessionLocal
 from app.models import GenerationTask
-from datetime import datetime, timezone
 
 db = SessionLocal()
 print("--- non-terminal tasks ---")

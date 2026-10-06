@@ -13,6 +13,7 @@ celery_app = Celery(
     "english_edit",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
+    include=["app.worker.tasks", "app.worker.ocr_tasks"],
 )
 
 # 任务模块自动发现
@@ -20,6 +21,19 @@ celery_app.autodiscover_tasks(["app.worker"])
 
 # 基础配置
 celery_app.conf.update(
+    task_routes={"app.worker.ocr_tasks.*": {"queue": "ocr"}},
+    beat_schedule={
+        "generation-durable-reconcile": {
+            "task": "app.worker.tasks.maintain_generation",
+            "schedule": settings.GENERATION_MAINTENANCE_SECONDS,
+            "options": {"queue": "celery", "expires": settings.GENERATION_MAINTENANCE_SECONDS * 2},
+        },
+        "ocr-durable-sweep": {
+            "task": "app.worker.ocr_tasks.sweep_ocr_jobs",
+            "schedule": settings.RAG_OCR_SWEEP_SECONDS,
+            "options": {"queue": "ocr", "expires": settings.RAG_OCR_SWEEP_SECONDS * 2},
+        },
+    },
     task_track_started=True,
     task_serializer="json",
     accept_content=["json"],
@@ -44,19 +58,15 @@ celery_app.conf.update(
 
 @worker_ready.connect
 def _recover_stale_tasks_on_startup(**_kwargs):
-    """worker 启动时恢复僵尸任务：running 且超时的任务重置为 pending 并重新入队。
+    """启动时触发有界SQL对账与Outbox投递，与周期maintenance共用路径。
 
     恢复失败仅告警，不阻断 worker 启动。
     """
-    from app.database import SessionLocal
-    from app.worker.recovery import recover_stale_tasks
-
-    session = SessionLocal()
+    if str(getattr(_kwargs.get("sender"), "hostname", "")).startswith("ocr@"):
+        return  # OCR recovery belongs to the dedicated periodic sweep, not generation replay.
     try:
-        recovered = recover_stale_tasks(session)
-        if recovered:
-            logger.warning("启动恢复僵尸任务 %d 个（重置 pending 并重新入队）", recovered)
-    except Exception:  # noqa: BLE001 —— 恢复失败不阻断 worker 启动
-        logger.warning("僵尸任务恢复失败", exc_info=True)
-    finally:
-        session.close()
+        celery_app.send_task("app.worker.tasks.maintain_generation", queue="celery")
+    except (
+        Exception
+    ):  # noqa: BLE001 - periodic SQL reconciliation remains available after broker recovery.
+        logger.warning("Generation reconciliation enqueue failed at startup", exc_info=True)

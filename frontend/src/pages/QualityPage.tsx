@@ -12,6 +12,7 @@ import type { ContentItem, Template } from '../api/types'
 /** 内容状态中文标签 */
 const STATUS_LABEL: Record<string, string> = {
   pending_qc: '待质检',
+  awaiting_review: '等待人工裁决',
   passed: '已通过',
   rejected: '已驳回',
   published: '已发布',
@@ -39,6 +40,8 @@ export default function QualityPage() {
   // 质检表单
   const [reason, setReason] = useState('')
   const [acting, setActing] = useState(false)
+  const [referenceVerified, setReferenceVerified] = useState(false)
+  useEffect(() => setReferenceVerified(false), [current?.id])
 
   const load = useCallback(
     async (p: number) => {
@@ -90,7 +93,7 @@ export default function QualityPage() {
     setActing(true)
     setError('')
     try {
-      await reviewContent(current.id, { pass, reason: reason.trim() })
+      await reviewContent(current.id, { pass, reason: reason.trim(), reference_verified: referenceVerified })
       setCurrent(null)
       setReason('')
       // 刷新列表
@@ -220,6 +223,18 @@ export default function QualityPage() {
             </div>
             <div className="modal-body">
               <ContentPreview item={current} />
+              {current.provenance && (
+                <div className="form-group">
+                  <p>知识来源状态：{current.provenance.status ?? '未记录'}（未自动证明答案正确）</p>
+                  <ul>{current.provenance.citations?.map((c, index) => (
+                    <li key={c.segment_id ?? `${c.chunk_id}:${index}`} data-source-segment={c.segment_id}>
+                      {c.source_name} · 页 {c.page_no ?? '未知'} · {c.block_id ?? '旧引用'} · {c.chunk_id}
+                      {c.content && <pre className="ocr-text">{c.content}</pre>}
+                    </li>
+                  ))}</ul>
+                  {current.provenance.require_review && <label><input type="checkbox" checked={referenceVerified} onChange={e => setReferenceVerified(e.target.checked)} /> 我已核对上述来源与题目、答案及解析</label>}
+                </div>
+              )}
               <div className="form-group">
                 <label className="form-label">驳回原因</label>
                 <textarea
@@ -240,7 +255,7 @@ export default function QualityPage() {
                 </button>
                 <button
                   className="btn btn-primary"
-                  disabled={acting}
+                  disabled={acting || current.validation_report?.valid === false || (Boolean(current.provenance?.require_review) && !referenceVerified)}
                   onClick={() => handleReview(true)}
                 >
                   通过

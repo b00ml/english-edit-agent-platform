@@ -4,12 +4,10 @@
 #   2. 重复提交去重 409；
 #   3. 灰区 interrupt 人工卡点：任务 awaiting → review API 恢复图 → 终态。
 # 口径：先脚本化 LLM 响应，再提交任务并同步执行（inline_celery）。
-import pytest
-
-pytestmark = pytest.mark.integration
-
+import uuid
 from pathlib import Path
 
+import pytest
 import yaml
 
 from app.database import SessionLocal
@@ -24,31 +22,23 @@ from app.models import (
 from app.template_loader import _validate_template
 from tests.integration.conftest import GEN_OK, JUDGE_GRAY, JUDGE_HIGH  # noqa: F401
 
+pytestmark = pytest.mark.integration
+
 _PARAMS = {"knowledge_point": "一般现在时", "difficulty": "易", "quantity": 1}
 
 
 @pytest.fixture(autouse=True)
-def _clean_db():
-    """每个用例前清空业务表（保留 users/model_profile 种子），保证幂等可重复运行。"""
-    from sqlalchemy import text
+def indexed_reference_sources(pg_app_sessions):
+    # Built-in templates now require sources. Provide test-owned real PG indexes,
+    # using the existing no-cloud embedding fixture, not disabling production gates.
+    from app.rag.indexer import index_document
 
-    session = SessionLocal()
-    try:
-        for table in (
-            "trace_log",
-            "quality_record",
-            "sample_pool",
-            "quality_calibration",
-            "app_notification",
-            "content_item",
-            "generation_task",
-            "question_template",
-        ):
-            session.execute(text(f"TRUNCATE TABLE {table} CASCADE"))
-        session.commit()
-    finally:
-        session.close()
-    yield
+    with pg_app_sessions() as session:
+        for point, body in [
+            ("一般现在时", "A third-person singular subject uses goes. He goes to school daily."),
+            ("被动语态", "The passive voice uses be plus a past participle. The door is opened."),
+        ]:
+            index_document(session, "教材", "Pipeline source " + point, body, knowledge_point=point)
 
 
 def _submit_and_run(
@@ -66,14 +56,14 @@ def _submit_and_run(
     return resp.json()["task_id"]
 
 
-def _make_hr_template():
+def _make_hr_template() -> str:
     """插入开启灰区人工卡点的单选模板（配置驱动，不改代码）。"""
     base = yaml.safe_load(
         (Path(__file__).parents[2] / "app" / "templates" / "single_choice.yaml").read_text(
             encoding="utf-8"
         )
     )
-    base["type_id"] = "single_choice_hr"
+    base["type_id"] = f"single_choice_hr_{uuid.uuid4().hex[:16]}"
     base["name"] = "单选（灰区转人工）"
     base["run_config"]["human_review"] = {"enabled": True, "gray_margin": 10}
     assert not _validate_template(base)
@@ -98,6 +88,8 @@ def _make_hr_template():
     finally:
         session.close()
 
+    return base["type_id"]
+
 
 class TestFullPipeline:
     def test_generate_qc_store(self, client, auth_headers, inline_celery, mock_llm):
@@ -107,7 +99,15 @@ class TestFullPipeline:
         # 任务同步执行后：状态成功、进度 100%
         resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers)
         assert resp.status_code == 200
-        assert resp.json()["status"] == "succeeded"
+        if resp.json()["status"] != "succeeded":
+            from app.models import GenerationTaskItem
+
+            with SessionLocal() as debug:
+                reasons = [
+                    (row.failure_code, row.failure_reason)
+                    for row in debug.query(GenerationTaskItem).filter_by(task_id=task_id)
+                ]
+            pytest.fail(f"Task did not succeed: {reasons}")
         assert resp.json()["progress"] == 1.0
 
         # 内容条目入库（pending_qc）且绑定 auto 质检记录
@@ -124,7 +124,9 @@ class TestFullPipeline:
         try:
             traces = session.query(TraceLog).filter(TraceLog.task_id == task_id).all()
             assert {"generate", "qc"} <= {t.stage for t in traces}
-            assert all(t.attempt == 1 and t.success for t in traces)
+            assert all(
+                t.attempt == 1 and t.success for t in traces if t.stage in {"generate", "qc"}
+            )
             records = session.query(QualityRecord).filter(QualityRecord.item_id == item["id"]).all()
             assert len(records) == 1 and records[0].source == "auto"
         finally:
@@ -170,13 +172,14 @@ class TestFullPipeline:
             headers=auth_headers,
         )
         assert resp.status_code == 409
+        assert resp.json()["existing_task_id"] == task_id
 
 
 class TestGrayZoneHumanReview:
     def test_interrupt_and_resume(self, client, auth_headers, inline_celery, mock_llm):
         """灰区：任务 awaiting → 条目 awaiting_review → review API 恢复图 → 终态。"""
         gen_client, judge_client = mock_llm
-        _make_hr_template()
+        template_id = _make_hr_template()
 
         gen_client._contents.append(GEN_OK)
         judge_client._contents.append(JUDGE_GRAY)  # 65 分：落在 [60, 70) 灰区
@@ -184,7 +187,7 @@ class TestGrayZoneHumanReview:
         resp = client.post(
             "/api/generate",
             json={
-                "template_id": "single_choice_hr",
+                "template_id": template_id,
                 "params": _PARAMS,
                 "quantity": 1,
             },
@@ -193,9 +196,10 @@ class TestGrayZoneHumanReview:
         assert resp.status_code == 200, resp.text
         task_id = resp.json()["task_id"]
 
-        # 任务部分成功（1 条 awaiting，非失败）
+        # Review waiting is active; progress counts finalized items only.
         resp = client.get(f"/api/tasks/{task_id}", headers=auth_headers)
-        assert resp.json()["status"] == "partially_succeeded"
+        assert resp.json()["status"] == "awaiting_review"
+        assert resp.json()["progress"] == 0.0
 
         # 条目 awaiting_review，thread_id 已绑定
         session = SessionLocal()
@@ -211,7 +215,7 @@ class TestGrayZoneHumanReview:
         # 人工通过：review API 凭 thread_id 恢复图
         resp = client.post(
             f"/api/quality/{item_id}/review",
-            json={"pass": True, "reason": ""},
+            json={"pass": True, "reason": "", "reference_verified": True},
             headers=auth_headers,
         )
         assert resp.status_code == 200, resp.text
@@ -234,7 +238,7 @@ class TestGrayZoneHumanReview:
     def test_reject_path_notifies(self, client, auth_headers, inline_celery, mock_llm):
         """灰区驳回：终态 rejected + 站内通知。"""
         gen_client, judge_client = mock_llm
-        _make_hr_template()
+        template_id = _make_hr_template()
 
         gen_client._contents.append(GEN_OK)
         judge_client._contents.append(JUDGE_GRAY)
@@ -242,7 +246,7 @@ class TestGrayZoneHumanReview:
         resp = client.post(
             "/api/generate",
             json={
-                "template_id": "single_choice_hr",
+                "template_id": template_id,
                 "params": {"knowledge_point": "被动语态", "difficulty": "中", "quantity": 1},
                 "quantity": 1,
             },

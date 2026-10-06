@@ -5,7 +5,8 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.models import ContentItem, GenerationTask, SamplePool
+from app.models import ContentItem, GenerationTask, SamplePool, User
+from app.tenancy import scope_query
 
 # 高质量判定：人工质检通过或已发布
 ELIGIBLE_STATUSES = ("passed", "published")
@@ -43,6 +44,7 @@ def pool_item(
         purpose=purpose,
         knowledge_point=_resolve_knowledge_point(db, item),
         payload=item.payload,
+        tenant_id=item.tenant_id,
         meta={"qc_score": item.qc_score, "status": item.status},
     )
     db.add(sample)
@@ -55,9 +57,14 @@ def sync_eligible(
     db: Session,
     source: str = "auto",
     purpose: str = "sft",
+    user: User | None = None,
 ) -> int:
     """自动将全部高质量内容（人工通过/已发布）沉淀为样本，返回新增数。"""
-    items = db.query(ContentItem).filter(ContentItem.status.in_(ELIGIBLE_STATUSES)).all()
+    items = (
+        scope_query(db.query(ContentItem), ContentItem, user)
+        .filter(ContentItem.status.in_(ELIGIBLE_STATUSES))
+        .all()
+    )
     added = 0
     for item in items:
         exists = db.query(SamplePool).filter(SamplePool.item_id == item.id).first()
@@ -75,9 +82,10 @@ def list_samples(
     source: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
+    user: User | None = None,
 ) -> tuple[list[SamplePool], int]:
     """检索回流样本（按题型/知识点/用途/来源过滤，分页）。"""
-    query = db.query(SamplePool)
+    query = scope_query(db.query(SamplePool), SamplePool, user)
     if template_id:
         query = query.filter(SamplePool.template_id == template_id)
     if knowledge_point:

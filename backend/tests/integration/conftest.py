@@ -4,9 +4,13 @@
 #      `pytest tests/integration`；
 #   2. CI：backend-ci.yml integration job 注入 service 容器与 TEST_DATABASE_URL。
 # 未设置 TEST_DATABASE_URL 时整个目录被跳过（默认单测流程不受影响）。
-# 注意：本 conftest 在 app.config 首次导入前把 DATABASE_URL 重定向到测试库，
-# 因此集成测试应独立运行（CI 分 job），避免与单元测试共享进程内的旧配置单例。
+# 可复用已有 PostgreSQL：先执行 Alembic，再用事务或 UUID 清理测试自己的数据；不清库。
+# app.config 可能已被纯单测导入；pg_engine/pg_app_sessions 显式绑定 TEST_DATABASE_URL，
+# 因此完整 suite 和单独 integration 运行都必须验证真正的数据库 head。
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +19,7 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
 if TEST_DATABASE_URL:
     # 必须在 app.config 首次导入前生效
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
-    # 进程内 checkpointer（interrupt 恢复在同进程内验证；PostgresSaver 由 P0-3 单测覆盖）
+    # API pipeline 使用进程内 saver；独立进程持久化由 test_persistent_recovery 真 PG 验证
     os.environ.setdefault("CHECKPOINTER_BACKEND", "memory")
     # 测试专用 JWT 密钥（避免弱密钥告警干扰）
     os.environ.setdefault("JWT_SECRET", "test-secret-test-secret-test-secret")
@@ -32,23 +36,55 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="session")
 def _pg_ready():
-    """确保 pgvector 扩展可用（create_all 建含 vector 列的表前必须装扩展）。"""
+    """Run actual Alembic migrations, not ORM create_all or an assumed stamp."""
     from sqlalchemy import create_engine, text
 
+    if not TEST_DATABASE_URL:
+        pytest.skip("需要 TEST_DATABASE_URL（真实 Postgres）")
+    root = Path(__file__).resolve().parents[2]
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    expected = set(ScriptDirectory.from_config(config).get_heads())
+    migrated = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=root,
+        env={**os.environ, "DATABASE_URL": TEST_DATABASE_URL, "ENVIRONMENT": "development"},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+    if migrated.returncode:
+        # Provider credentials/connection strings must not leak via exception payloads.
+        pytest.fail(
+            "真实 Alembic upgrade head 失败；请检查现有数据库迁移版本，不自动 stamp 或删除数据"
+        )
     engine = create_engine(TEST_DATABASE_URL)
-    with engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        conn.commit()
-    engine.dispose()
+    try:
+        with engine.connect() as connection:
+            actual = set(
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalars()
+            )
+            assert actual == expected, "数据库实际迁移版本必须等于代码 head"
+            assert connection.execute(
+                text("SELECT extversion FROM pg_extension WHERE extname='vector'")
+            ).scalar()
+    finally:
+        engine.dispose()
     return True
 
 
 @pytest.fixture(autouse=True)
 def mock_embedding(monkeypatch):
-    """替换 embedding 客户端：返回确定性的 1024 维零向量（走真 pgvector 距离查询）。"""
+    """Hash test vectors are normalized, non-zero and vary by input; never call a cloud API."""
     from types import SimpleNamespace
 
+    from app.config import settings
     from app.rag import embedding as embedding_module
+    from tests.integration.embedding_stub import mock_vector
 
     class _FakeEmbeddingClient:
         @property
@@ -58,17 +94,84 @@ def mock_embedding(monkeypatch):
         def create(self, model=None, input=None, **kwargs):
             return SimpleNamespace(
                 data=[
-                    SimpleNamespace(index=i, embedding=[0.0] * 1024)
-                    for i, _ in enumerate(input or [])
+                    SimpleNamespace(index=i, embedding=mock_vector(value, settings.EMBEDDING_DIM))
+                    for i, value in enumerate(input or [])
                 ]
             )
 
     monkeypatch.setattr(embedding_module, "_get_openai_client", lambda: _FakeEmbeddingClient())
 
 
+@pytest.fixture(autouse=True)
+def unpaid_rag_providers(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "RAG_RERANK_MODE", "off")
+    monkeypatch.setattr(settings, "RAG_QUERY_EXPANSION_MODE", "aliases")
+
+
+@pytest.fixture(scope="session")
+def pg_engine(_pg_ready):
+    from sqlalchemy import create_engine
+
+    engine = create_engine(TEST_DATABASE_URL)
+    yield engine
+    engine.dispose()
+
+
 @pytest.fixture()
-def client(_pg_ready, monkeypatch):
-    """FastAPI TestClient：进入上下文触发 lifespan（建表/模板/种子管理员）。"""
+def pg_session(pg_engine):
+    """Reuse the existing DB, roll back only this test's transaction (no TRUNCATE)."""
+    from sqlalchemy.orm import Session
+
+    with pg_engine.connect() as connection:
+        transaction = connection.begin()
+        session = Session(bind=connection, join_transaction_mode="create_savepoint")
+        try:
+            yield session
+        finally:
+            session.close()
+            transaction.rollback()
+
+
+@pytest.fixture()
+def pg_app_sessions(pg_engine, monkeypatch, request):
+    """Joined savepoint sessions let API/worker/Trace commits share a rollback envelope."""
+    from sqlalchemy.orm import sessionmaker
+
+    from app import database, main
+    from app.config import settings
+    from app.engine import trace
+    from app.worker import tasks
+    from app.workflow import graph
+
+    with pg_engine.connect() as connection:
+        transaction = connection.begin()
+        factory = sessionmaker(
+            bind=connection, join_transaction_mode="create_savepoint", autoflush=False
+        )
+        for module in [database, main, tasks, graph, request.module]:
+            if hasattr(module, "SessionLocal"):
+                monkeypatch.setattr(module, "SessionLocal", factory)
+        monkeypatch.setattr(settings, "DATABASE_URL", TEST_DATABASE_URL)
+        monkeypatch.setattr(settings, "CHECKPOINTER_BACKEND", "memory")
+        monkeypatch.setattr(settings, "ALLOW_MEMORY_CHECKPOINTER", True)
+        monkeypatch.setattr(settings, "ENVIRONMENT", "staging")
+        monkeypatch.setattr(settings, "TRACE_SINKS", "db")
+        monkeypatch.setattr(settings, "JWT_SECRET", "test-secret-test-secret-test-secret")
+        graph.reset_checkpointer()
+        trace.reset_sinks()
+        try:
+            yield factory
+        finally:
+            graph.reset_checkpointer()
+            trace.reset_sinks()
+            transaction.rollback()
+
+
+@pytest.fixture()
+def client(pg_app_sessions, monkeypatch):
+    """Startup requires migrated head; staging avoids create_all masking migration gaps."""
     from fastapi.testclient import TestClient
 
     from app.main import app
@@ -78,26 +181,40 @@ def client(_pg_ready, monkeypatch):
 
 
 @pytest.fixture()
-def auth_headers(client):
-    resp = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+def auth_headers(client, pg_app_sessions):
+    import uuid
+
+    from app.models import User
+    from app.security import hash_password
+
+    username = f"integration-{uuid.uuid4().hex[:16]}"
+    password = "only-for-this-test-transaction"
+    with pg_app_sessions() as session:
+        session.add(
+            User(
+                username=username,
+                password_hash=hash_password(password),
+                role="admin",
+                status="active",
+            )
+        )
+        session.commit()
+    resp = client.post("/api/auth/login", json={"username": username, "password": password})
     assert resp.status_code == 200, resp.text
-    token = resp.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
 @pytest.fixture()
 def inline_celery(monkeypatch):
-    """把 celery send_task 替换为进程内同步执行（不依赖 redis）。"""
-    import app.worker.tasks as tasks_module
+    """Execute worker bodies in-process; never send fixture jobs to a real broker."""
     from app.api import routes as routes_module
+    from app.worker import tasks
 
-    process_generation_task = tasks_module.process_generation_task
-    original_generate_single_item = tasks_module.generate_single_item
-
-    def _fake_send_task(name, args=None, **kwargs):
-        assert name == "app.worker.tasks.process_generation_task"
-        result = process_generation_task.apply(args=args or [])
-        return SimpleAsyncResult(result.get())
+    # shared_task is a current-app proxy; patching proxy.delay can target the
+    # wrong Task when Celery changes current app during .apply(). Pin bodies and
+    # replace the dispatch module's producer, not a transient proxy attribute.
+    dispatch = tasks.dispatch_generation_items._get_current_object()
+    generate = tasks.generate_single_item._get_current_object()
 
     class SimpleAsyncResult:
         def __init__(self, value):
@@ -106,17 +223,22 @@ def inline_celery(monkeypatch):
         def get(self, timeout=None):
             return self._value
 
-    def _fake_item_delay(task_id, item_index):
-        """让父任务拆出的 item 也在当前进程执行，避免隐式连接真实 broker。"""
-        return original_generate_single_item.apply(args=[task_id, item_index])
+    def _fake_send_task(name, args=None, **kwargs):
+        if name == "app.worker.tasks.process_generation_task":
+            return SimpleAsyncResult(dispatch.run(*(args or [])))
+        if name == "app.worker.tasks.generate_single_item":
+            return SimpleAsyncResult(generate.run(*(args or [])))
+        raise AssertionError("Unexpected task in offline pipeline")
 
+    def _fake_item_delay(*args, **kwargs):
+        return SimpleAsyncResult(generate.run(*args, **kwargs))
+
+    monkeypatch.setattr(
+        tasks,
+        "_item_sender",
+        lambda name, args, task_id=None: _fake_send_task(name, args, task_id=task_id),
+    )
     monkeypatch.setattr(routes_module.celery_app, "send_task", _fake_send_task)
-
-    class _InlineItemTask:
-        def delay(self, task_id, item_index):
-            return _fake_item_delay(task_id, item_index)
-
-    monkeypatch.setattr(tasks_module, "generate_single_item", _InlineItemTask())
     return _fake_send_task
 
 

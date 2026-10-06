@@ -1,6 +1,6 @@
 # tests/test_task_cancellation.py —— 任务取消功能测试（P1-3）
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy.orm import Session
@@ -80,7 +80,7 @@ def test_dispatch_creates_items(db: Session, sample_task: GenerationTask):
 
     # Mock SessionLocal 和 Celery 投递
     with patch("app.worker.tasks.SessionLocal", return_value=db):
-        with patch("app.worker.tasks.generate_single_item.delay") as mock_delay:
+        with patch("app.worker.tasks._item_sender") as mock_delay:
             result = dispatch_generation_items(task_id)
 
     assert result["status"] == "dispatched"

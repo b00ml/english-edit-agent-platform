@@ -1,12 +1,17 @@
 # app/engine/observability.py —— Trace 分发 Sink（P0-5 / OPT-017）
 # 自研 TraceLog 表为事实源（SSOT），Langfuse 为可选导出通道：
 #   - TraceLogSink：写自研 TraceLog 表（独立会话，失败不影响业务）；
-#   - LangfuseSink：LANGFUSE_* 未配置或 SDK 未安装时为 no-op，配置后按
+#   - LangfuseSink：LANGFUSE_* 未配置或 SDK 不可用时报告失败，配置后按
 #     trace_id 聚合上传 generation（stage/model/输入输出/token/耗时）。
 # record_trace（trace.py）按 settings.TRACE_SINKS 把 trace dict 分发到各 Sink，
-# 任一 Sink 抛错只记告警，不中断其余 Sink 与生成主流程。
+# Sink 失败可落持久化补偿文件；严格模式无任何持久化通道则失败关闭。
 import logging
-from typing import Any, Dict, Protocol
+from typing import TYPE_CHECKING, Any, Dict, Protocol
+
+from sqlalchemy.exc import IntegrityError, OperationalError
+
+if TYPE_CHECKING:
+    from app.engine.trace_snapshots import PreparedSnapshot
 
 logger = logging.getLogger("app.engine.observability")
 
@@ -14,11 +19,33 @@ logger = logging.getLogger("app.engine.observability")
 class TraceSink(Protocol):
     """Trace 分发协议：emit 接收完整 trace dict，自行负责落存储。"""
 
-    def emit(self, trace: Dict[str, Any]) -> None: ...
+    def emit(self, trace: Dict[str, Any]) -> None:
+        """Persist a record or raise; no-op is not a confirmed export."""
+        raise NotImplementedError
 
 
 class TraceLogSink:
     """自研 TraceLog 表写入（SSOT）。"""
+
+    name = "db"
+
+    def emit_with_snapshot(self, trace: Dict[str, Any], prepared: "PreparedSnapshot") -> None:
+        from app.database import SessionLocal
+        from app.engine.trace_snapshots import store_snapshot
+        from app.models import TraceLog
+
+        with SessionLocal() as session:
+            if session.get(TraceLog, trace["id"]) is not None:
+                return
+            row = TraceLog(**trace)
+            session.add(row)
+            session.flush()
+            try:
+                with session.begin_nested():
+                    store_snapshot(session, row, prepared)
+            except (IntegrityError, OperationalError):
+                row.snapshot_status = "capture_failed"
+            session.commit()
 
     def emit(self, trace: Dict[str, Any]) -> None:
         # 延迟导入：便于测试替换 SessionLocal，也避免循环依赖
@@ -27,14 +54,23 @@ class TraceLogSink:
 
         session = SessionLocal()
         try:
+            if trace.get("id") and session.get(TraceLog, trace["id"]) is not None:
+                return
             session.add(TraceLog(**trace))
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                if not trace.get("id") or session.get(TraceLog, trace["id"]) is None:
+                    raise
         finally:
             session.close()
 
 
 class LangfuseSink:
     """Langfuse 可选导出：未配置密钥或 SDK 未安装时静默降级为 no-op。"""
+
+    name = "langfuse"
 
     def __init__(self) -> None:
         self._client: Any = None
@@ -66,7 +102,7 @@ class LangfuseSink:
     def emit(self, trace: Dict[str, Any]) -> None:
         client = self._get_client()
         if client is None:
-            return
+            raise RuntimeError("Langfuse sink has not been configured")
         stage = trace.get("stage") or "llm_call"
         latency_ms = trace.get("latency_ms")
         usage = None

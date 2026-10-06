@@ -5,7 +5,8 @@ uvicorn[standard]
 sqlalchemy>=2.0
 alembic
 pydantic>=2.0
-pydantic-settings
+jsonschema>=4.0
+pydantic-settings>=2.7
 psycopg2-binary
 redis
 celery
@@ -15,12 +16,21 @@ psycopg[binary]
 langchain-openai
 # openai 与 httpx>=0.28 的兼容下限（更低版本向 httpx 传已移除的 proxies 参数）
 openai>=1.55.3
+# Local OCR V1 client (no heavyweight inference dependency in API/worker).
+httpx>=0.28
 langfuse
 pyyaml
-jsonschema
 pgvector
 python-docx
 pypdf
 PyJWT
 passlib[bcrypt]
 bcrypt==4.2.1
+openpyxl>=3.1.5
+
+# Small PDFium renderer for authenticated original-page QA; no OCR model weights.
+pypdfium2>=4.30
+Pillow>=10
+
+# Provider credentials are encrypted at rest with a dedicated server key.
+cryptography>=43

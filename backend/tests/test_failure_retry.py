@@ -1,5 +1,6 @@
 # tests/test_failure_retry.py —— 失败分类与重试策略测试（P1-3）
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models import ContentItem, GenerationTask, GenerationTaskItem, QuestionTemplate
@@ -56,7 +57,7 @@ def test_permanent_failure_no_retry(db: Session, retry_task: GenerationTask, mon
 
     # Mock run_generation 抛出 422 错误
     def mock_run_generation(*args, **kwargs):
-        raise Exception("422 Unprocessable Entity: Invalid parameters")
+        raise HTTPException(status_code=422, detail="Invalid parameters")
 
     monkeypatch.setattr("app.worker.tasks.run_generation", mock_run_generation)
 
@@ -64,7 +65,7 @@ def test_permanent_failure_no_retry(db: Session, retry_task: GenerationTask, mon
     result = generate_single_item.apply(args=[retry_task.id, 0]).get()
     assert result["status"] == "failed"
     assert result["failure_code"] == "PERMANENT_ERROR"
-    assert "422" in result["reason"]
+    assert result["reason"] == "HTTPException"
 
     # 验证 item 状态
     item = (
@@ -91,7 +92,7 @@ def test_transient_failure_backoff(db: Session, retry_task: GenerationTask, monk
     def mock_run_generation(*args, **kwargs):
         call_count["count"] += 1
         if call_count["count"] < 3:
-            raise Exception("429 Too Many Requests: Rate limit exceeded")
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
         return {"status": "stored", "content_id": "content-retry-001"}
 
     monkeypatch.setattr("app.worker.tasks.run_generation", mock_run_generation)
@@ -99,7 +100,7 @@ def test_transient_failure_backoff(db: Session, retry_task: GenerationTask, monk
     # 执行 item（应重试并最终成功）
     # 注意：实际测试中 Celery 的 retry 是异步的，这里简化为同步模拟
     try:
-        result = generate_single_item.apply(args=[retry_task.id, 0]).get()
+        generate_single_item.apply(args=[retry_task.id, 0]).get()
     except Exception as exc:
         # 第一次执行应触发重试（抛出异常）
         assert "429" in str(exc)
@@ -124,7 +125,7 @@ def test_400_permanent_failure(db: Session, retry_task: GenerationTask, monkeypa
 
     # Mock run_generation 抛出 400 错误
     def mock_run_generation(*args, **kwargs):
-        raise Exception("400 Bad Request: Missing required field")
+        raise HTTPException(status_code=400, detail="Missing required field")
 
     monkeypatch.setattr("app.worker.tasks.run_generation", mock_run_generation)
 
@@ -163,7 +164,7 @@ def test_unknown_error_standard_retry(db: Session, retry_task: GenerationTask, m
 
     # 执行 item（应触发标准重试）
     try:
-        result = generate_single_item.apply(args=[retry_task.id, 0]).get()
+        generate_single_item.apply(args=[retry_task.id, 0]).get()
     except Exception as exc:
         # 第一次执行应触发重试
         assert "Unknown network error" in str(exc)

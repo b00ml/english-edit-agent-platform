@@ -28,6 +28,7 @@ def mock_user():
     user = MagicMock(spec=User)
     user.id = 1
     user.tenant_id = "test-tenant"
+    user.role = "researcher"
     return user
 
 
@@ -44,6 +45,7 @@ def single_choice_template():
     """模拟单选题模板（带 input_schema）。"""
     template = MagicMock(spec=QuestionTemplate)
     template.type_id = "single_choice"
+    template.tenant_id = None
     template.disabled = False
     template.updated_at = None
     template.input_schema = {
@@ -81,12 +83,16 @@ def test_valid_params_pass_validation(mock_db, mock_user, mock_celery, single_ch
             quantity=10,
         )
 
-        response = service.create_task(req, mock_user, mock_celery)
+        with patch(
+            "app.services.generation_service.relay_pending", return_value={"scanned": 0}
+        ) as relay:
+            response = service.create_task(req, mock_user, mock_celery)
+            relay.assert_called_once()
 
         assert response.task_id == "task-123"
         assert response.status == "pending"
         # 验证 Celery 任务已投递
-        mock_celery.send_task.assert_called_once()
+        mock_celery.send_task.assert_not_called()  # No unsafe direct-send fallback.
 
 
 def test_missing_required_field_fails(mock_db, mock_user, mock_celery, single_choice_template):
@@ -174,6 +180,7 @@ def test_template_without_schema_skips_validation(mock_db, mock_user, mock_celer
     """模板无 input_schema 时跳过参数校验。"""
     template = MagicMock(spec=QuestionTemplate)
     template.type_id = "legacy_template"
+    template.tenant_id = None
     template.disabled = False
     template.updated_at = None
     template.input_schema = None  # 无 schema
@@ -195,7 +202,11 @@ def test_template_without_schema_skips_validation(mock_db, mock_user, mock_celer
             quantity=5,
         )
 
-        response = service.create_task(req, mock_user, mock_celery)
+        with patch(
+            "app.services.generation_service.relay_pending", return_value={"scanned": 0}
+        ) as relay:
+            response = service.create_task(req, mock_user, mock_celery)
+            relay.assert_called_once()
 
         assert response.task_id == "task-456"
-        mock_celery.send_task.assert_called_once()
+        mock_celery.send_task.assert_not_called()  # No unsafe direct-send fallback.

@@ -1,0 +1,75 @@
+{
+  "scope": "结构复现与合成语义反例；不冒充专家金标，不包含教材正文。历史原稿保留在受限 .local-eval/str58。",
+  "cases": [
+    {
+      "id": "legacy-cloze-word-answer",
+      "source_item_id": "8d5da6df-2a96-4590-92b2-08694fb6b29f",
+      "source_auto_score": 88.95,
+      "representation": "结构复现，句子非原文",
+      "expected": "deterministic_reject",
+      "human_adjudication": "pending",
+      "payload": {
+        "passage": "It rained, ____ we stayed inside.",
+        "blanks": [
+          {
+            "index": 1,
+            "options": [
+              "so",
+              "and",
+              "but",
+              "or"
+            ],
+            "answer": "so",
+            "explanation": "Cause and consequence."
+          }
+        ]
+      }
+    },
+    {
+      "id": "legacy-cloze-prefixed-options",
+      "source_item_id": "d3422c95-ac90-4445-9d3b-5b21af52efb9",
+      "source_auto_score": 91.28,
+      "representation": "结构复现，句子非原文",
+      "expected": "deterministic_reject",
+      "human_adjudication": "pending",
+      "payload": {
+        "passage": "It rained, ____ we stayed inside.",
+        "blanks": [
+          {
+            "index": 1,
+            "options": [
+              "A. so",
+              "B. and",
+              "C. but",
+              "D. or"
+            ],
+            "answer": "A",
+            "explanation": "Cause and consequence."
+          }
+        ]
+      }
+    },
+    {
+      "id": "conjunction-alternative-interpretation",
+      "representation": "合成语义待核验反例，and 也可表达事实并列",
+      "expected": "format_pass_semantic_review",
+      "human_adjudication": "pending",
+      "payload": {
+        "passage": "It rained, ____ we stayed inside.",
+        "blanks": [
+          {
+            "index": 1,
+            "options": [
+              "so",
+              "and",
+              "but",
+              "or"
+            ],
+            "answer": "A",
+            "explanation": "so can express cause and consequence; alternative interpretation still needs review."
+          }
+        ]
+      }
+    }
+  ]
+}

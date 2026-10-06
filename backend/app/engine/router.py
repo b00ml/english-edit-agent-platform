@@ -3,16 +3,20 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.engine.providers import route_for_template
 from app.engine.structured_output import generate_structured
+from app.engine.trace_recovery import pending_task_cost
 from app.errors import ModelRoutingError
 from app.models import ModelProfile, TraceLog
 
 
-def resolve_model_profile(session: Session, profile_name: Optional[str]) -> Optional[ModelProfile]:
+def resolve_model_profile(
+    session: Session, profile_name: Optional[str], tenant_id: str | None = None
+) -> Optional[ModelProfile]:
     """按 profile_name 解析模型档案，找不到时降级到 is_default 的默认档案。
 
     - 优先精确匹配 profile_name；
@@ -21,15 +25,27 @@ def resolve_model_profile(session: Session, profile_name: Optional[str]) -> Opti
     """
     if profile_name:
         profile = session.execute(
-            select(ModelProfile).where(ModelProfile.name == profile_name)
+            select(ModelProfile).where(
+                ModelProfile.name == profile_name,
+                or_(ModelProfile.tenant_id == tenant_id, ModelProfile.tenant_id.is_(None)),
+            )
         ).scalar_one_or_none()
         if profile and _is_eligible(profile):
             return profile
 
     # 降级到默认档案
-    default = session.execute(
-        select(ModelProfile).where(ModelProfile.is_default.is_(True))
-    ).scalar_one_or_none()
+    default = (
+        session.execute(
+            select(ModelProfile)
+            .where(
+                ModelProfile.is_default.is_(True),
+                or_(ModelProfile.tenant_id == tenant_id, ModelProfile.tenant_id.is_(None)),
+            )
+            .order_by(ModelProfile.tenant_id.is_(None))
+        )
+        .scalars()
+        .first()
+    )
     if default and _is_eligible(default):
         return default
     return None
@@ -55,7 +71,7 @@ def _task_cost(session: Session, task_id: Optional[str]) -> float:
     value = (
         session.execute(select(TraceLog.cost).where(TraceLog.task_id == task_id)).scalars().all()
     )
-    return sum(float(v or 0.0) for v in value)
+    return sum(float(v or 0.0) for v in value) + pending_task_cost(task_id)
 
 
 def _mark_success(session: Session, profile: ModelProfile) -> None:
@@ -108,12 +124,17 @@ def _resolve_primary_profile_name(
     return None
 
 
-def _get_named_profile(session: Session, name: Optional[str]) -> Optional[ModelProfile]:
+def _get_named_profile(
+    session: Session, name: Optional[str], tenant_id: str | None = None
+) -> Optional[ModelProfile]:
     """精确查询档案，不隐式替换为默认档案。"""
     if not name:
         return None
     return session.execute(
-        select(ModelProfile).where(ModelProfile.name == name)
+        select(ModelProfile).where(
+            ModelProfile.name == name,
+            or_(ModelProfile.tenant_id == tenant_id, ModelProfile.tenant_id.is_(None)),
+        )
     ).scalar_one_or_none()
 
 
@@ -134,15 +155,22 @@ def generate_with_fallback(
     任一成功即返回；全部失败抛异常。
     """
     run_config = template.run_config or {}
+    override = (
+        route_for_template(session, template.type_id)
+        if isinstance(session, Session) and getattr(template, "type_id", None)
+        else None
+    )
+    if override is not None and override.generation_profile:
+        profile_name = override.generation_profile
     primary_name = _resolve_primary_profile_name(run_config, params, profile_name)
 
     # 候选模型档案列表（主 -> 默认）。这里必须精确查询主档案，避免配置拼写
     # 错误被静默替换为默认模型，导致 trace 中无法识别实际执行配置。
     candidates: list[Optional[ModelProfile]] = []
-    primary = _get_named_profile(session, primary_name)
+    primary = _get_named_profile(session, primary_name, tenant_id)
     candidates.append(primary)
 
-    default = resolve_model_profile(session, None)
+    default = resolve_model_profile(session, None, tenant_id)
     if default is not None and default.id != (primary.id if primary else None):
         candidates.append(default)
 
@@ -180,11 +208,17 @@ def generate_with_fallback(
             fallback_count += 1
             max_fallbacks = min(
                 settings.MODEL_MAX_FALLBACKS,
-                int(candidate.max_fallbacks or settings.MODEL_MAX_FALLBACKS),
+                int(
+                    candidate.max_fallbacks
+                    if candidate.max_fallbacks is not None
+                    else settings.MODEL_MAX_FALLBACKS
+                ),
             )
             if fallback_count > max_fallbacks:
                 break
             continue
 
     reason = last_error or RuntimeError("无可用模型档案（已禁用或仍在冷却）")
-    raise ModelRoutingError(f"模型路由降级后仍生成失败，最后错误: {reason}", reason)
+    raise ModelRoutingError(
+        f"模型路由降级后仍生成失败，最后错误类型: {type(reason).__name__}", reason
+    )

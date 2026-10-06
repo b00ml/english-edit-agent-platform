@@ -45,6 +45,7 @@ def test_validate_template_model_references_reports_missing_profiles() -> None:
     template = SimpleNamespace(
         type_id="reading",
         status="enabled",
+        tenant_id=None,
         run_config={"model_profile": {"default": "standard", "hard": "missing"}},
     )
 
@@ -73,7 +74,7 @@ def test_validate_template_model_references_reports_missing_profiles() -> None:
 
 def test_manual_heads_handles_multiline_merge_revision() -> None:
     versions_dir = Path(__file__).parents[1] / "alembic" / "versions"
-    assert _manual_heads(versions_dir) == ["m3_04_task_user_id"]
+    assert _manual_heads(versions_dir) == ["opt079_public_merge"]
 
 
 def test_migration_precheck_adds_backend_root_for_direct_script_execution() -> None:
@@ -128,6 +129,8 @@ def test_send_event_passes_stable_event_id_as_celery_task_id() -> None:
     calls = []
     event = SimpleNamespace(
         event_id="task:abc:dispatch",
+        event_type="generation_dispatch",
+        task_id="abc",
         payload={"task_id": "abc"},
     )
 

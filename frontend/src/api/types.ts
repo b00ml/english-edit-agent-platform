@@ -56,7 +56,7 @@ export interface CostDeepResult {
 export interface DashboardKpi {
   key: string
   label: string
-  value: number
+  value: number | null
   unit: string
   target?: number | null
   /** higher_better / lower_better */
@@ -67,7 +67,7 @@ export interface DashboardKpi {
 export interface DashboardByTemplate {
   template_id: string
   generated: number
-  pass_rate: number
+  pass_rate: number | null
 }
 
 /** 单条任务生产周期明细 */
@@ -103,12 +103,14 @@ export interface GenerateResult {
   status: string
 }
 
+export type TaskStatus = 'pending' | 'dispatched' | 'running' | 'awaiting_review' | 'succeeded' | 'partially_succeeded' | 'failed' | 'cancelled'
+
 /** 生成任务（对应 TaskOut） */
 export interface GenerationTask {
   id: string
   template_id: string
   quantity: number
-  status: string
+  status: TaskStatus
   progress: number
   trace_ref?: string | null
   tenant_id?: string | null
@@ -124,11 +126,25 @@ export interface TaskListResult {
 }
 
 /** 内容条目（对应 ContentOut） */
+export interface RagProvenance {
+  status?: string
+  require_review?: boolean
+  citations?: {chunk_id: string; segment_id?: string; page_no?: number | null; block_id?: string; source_name: string; content_hash: string; content?: string}[]
+  reference_review?: {verified?: boolean; reviewer?: string}
+}
+
 export interface ContentItem {
   id: string
   task_id: string
   template_id: string
   payload: Record<string, unknown>
+  provenance?: RagProvenance | null
+  validation_report?: {
+    valid: boolean
+    errors: {code: string; path: string; message: string}[]
+    warnings: {code: string; path: string; message: string}[]
+    semantic_verification: string
+  } | null
   qc_score?: number | null
   status: string
   revise_count: number
@@ -145,6 +161,7 @@ export interface ContentListResult {
 
 /** 人工质检标注入参 */
 export interface QualityReviewRequest {
+  reference_verified?: boolean
   pass: boolean
   reason: string
 }
@@ -219,6 +236,7 @@ export interface UnreadCount {
 /** 单条 TraceLog 记录（链路中的一步 LLM 调用，对应 TraceOut） */
 export interface TraceStep {
   id: string
+  snapshot_status?: string
   trace_id: string
   task_id?: string | null
   template_id?: string | null
@@ -284,6 +302,19 @@ export interface SampleSyncResult {
 // RAG 知识库
 // ---------------------------------------------------------------------------
 /** 知识分块条目（对应 KnowledgeChunkOut） */
+export type RagScopeMode = 'exact' | 'ancestor' | 'descendant' | 'related' | 'semantic'
+export interface KnowledgePoint {
+  id: string
+  canonical_name: string
+  aliases: string[]
+  parent_id?: string | null
+}
+export interface KnowledgeCatalogResult {
+  catalog_hash: string
+  items: KnowledgePoint[]
+  defaults: { top_k: number; scope_mode: RagScopeMode; method: string; chunk_layout: 'legacy' | 'structure'; context_mode: 'legacy' | 'relation'; context_max_chars: number }
+}
+
 export interface KnowledgeChunk {
   id: string
   source_type: string
@@ -291,6 +322,16 @@ export interface KnowledgeChunk {
   knowledge_point?: string | null
   content: string
   created_at: string
+  parent_chunk_id?: string | null
+  chunk_type?: string | null
+  knowledge_point_labels?: string[] | null
+  document_id?: string | null
+  page_no?: number | null
+  context_header?: string | null
+  section_path?: string[] | null
+  parser_version?: string | null
+  chunker_version?: string | null
+  meta?: Record<string, unknown> | null
 }
 
 /** 知识分块列表（分页，对应 KnowledgeListOut） */
@@ -300,8 +341,31 @@ export interface KnowledgeListResult {
 }
 
 /** 文件/文本上传索引结果（对应 KnowledgeUploadOut） */
+export interface ChunkDiagnostics {
+  layout?: string; source_coverage_scope?: string; excluded_navigation_blocks?: string[]; plan_signature?: string | null
+  strategy_used: string
+  chunk_count: number
+  coverage_ratio: number
+  hard_splits: number
+  warnings: string[]
+}
+
+export interface KnowledgePreviewResult {
+  chunk_layout: 'legacy' | 'structure';
+  structure?: StructurePlan | null;
+  indexable: boolean
+  reason_code?: string | null
+  message?: string | null
+  document: { warnings: string[]; source_name: string; parser_version: string }
+  chunks: { content: string; embedding_content: string; content_start: number | null; content_end: number | null; pages?: number[]; source_segments?: Record<string, unknown>[] }[]
+  diagnostics: ChunkDiagnostics
+  parents?: { content: string; child_indexes: number[] }[]
+}
+
 export interface KnowledgeUploadResult {
   chunks: number
+  warnings?: string[]
+  diagnostics?: ChunkDiagnostics
   source_type: string
   source_name: string
   knowledge_point?: string | null
@@ -309,8 +373,12 @@ export interface KnowledgeUploadResult {
 
 /** 检索结果（对应 KnowledgeRetrieveOut） */
 export interface KnowledgeRetrieveResult {
+  protocol_version?: string;
+  bundles?: ContextBundle[];
   query: string
   snippets: string[]
+  citations: Record<string, unknown>[]
+  diagnostics: Record<string, unknown>
 }
 
 // ---------------------------------------------------------------------------
@@ -359,4 +427,35 @@ export interface CalibrationRecord {
   rejection_rate: number
   note: string
   created_at: string
+}
+
+export interface StructureEdge {
+  id: string; from: string; to: string; relation: string
+  state: 'accepted' | 'proposed' | 'rejected'; evidence: string[]
+}
+export interface StructurePlan {
+  version: string; signature: string; policy_hash: string
+  source_scope_signature?: string; review_signature?: string
+  index_revision?: number; structure_revision?: number; expansion_allowed?: boolean
+  sections: { id: string; parent_id: string | null; level: number; title: string }[]
+  units: { id: string; section_path: string[]; member_ids: string[] }[]
+  blocks: {block_id: string; page_no: number | null; role: string; section_path: string[]; content_start: number; content_end: number}[]
+  edges: StructureEdge[]; barriers: {block_id: string; reason: string}[]
+  decisions: {accepted_edge_ids: string[]; rejected_edge_ids: string[]}
+  logical_tables?: {id: string; physical_tables: {block_id:string; table_id:string; page_no:number; header_confirmed:boolean}[]; cell_edges: StructureEdge[]}[]
+  unresolved_references?: {from:string; target:string; reason:string}[]
+  counts: {sections: number; units: number; source_segments: number; accepted_edges: number; proposed_edges: number; furniture: number}
+}
+export interface SourceSegment {
+  segment_id: string; chunk_id: string; document_id: string | null; page_no: number | null
+  block_id: string | null; content: string; content_hash: string; source_content_hash: string
+  content_start: number | null; content_end: number | null; section_path: string[]
+  source_role: string; context_role: string; truncated: boolean; partial_row: boolean
+  table_id: string | null; source_locator: Record<string, unknown>[]
+}
+export interface ContextBundle {
+  id: string; seed_chunk_id: string; document_id: string | null; pages: number[]
+  section_path: string[]; complete: boolean; incomplete_reasons: string[]
+  source_segments: SourceSegment[]; rendered_context: string
+  logical_table_views?: {logical_table_id:string; rendered_table:string; confirmed_cell_joins:string[]; physical_table_ids:string[]; rows:Record<string,unknown>[]; derived_view:boolean}[]
 }

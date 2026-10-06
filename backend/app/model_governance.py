@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models import ModelProfile, QuestionTemplate
@@ -21,11 +22,18 @@ def referenced_profile_names(run_config: dict[str, Any]) -> set[str]:
 
 def validate_template_model_references(session: Session) -> list[str]:
     """返回启用模板引用了不存在模型档案的错误列表。"""
-    available_names = {name for (name,) in session.query(ModelProfile.name).all()}
     errors: list[str] = []
     templates = session.query(QuestionTemplate).filter(QuestionTemplate.status == "enabled").all()
     for template in templates:
-        missing = referenced_profile_names(template.run_config or {}) - available_names
+        scoped_names = {
+            name
+            for (name,) in session.query(ModelProfile.name)
+            .filter(
+                or_(ModelProfile.tenant_id == template.tenant_id, ModelProfile.tenant_id.is_(None))
+            )
+            .all()
+        }
+        missing = referenced_profile_names(template.run_config or {}) - scoped_names
         if missing:
             errors.append(
                 f"模板 {template.type_id} 引用了不存在的模型档案: {', '.join(sorted(missing))}"

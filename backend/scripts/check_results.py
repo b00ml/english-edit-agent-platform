@@ -1,9 +1,10 @@
 import sys
 
 sys.path.insert(0, "/code")
-from app.database import SessionLocal
-from app.models import GenerationTask, ContentItem
 from sqlalchemy import func
+
+from app.database import SessionLocal
+from app.models import ContentItem, GenerationTask
 
 db = SessionLocal()
 print("--- stress.log ---")

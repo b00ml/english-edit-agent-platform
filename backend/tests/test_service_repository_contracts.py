@@ -146,65 +146,57 @@ def test_auth_service_contracts(monkeypatch):
         service.enable_user("missing")
 
 
-def test_content_service_contracts(monkeypatch):
-    db = _CommitDB()
-    service = ContentService(db)
-    item = ContentItem(
-        id="content-1",
-        task_id="task-1",
-        template_id="single_choice",
-        payload={"question": "Q"},
-        status=CONTENT_PASSED,
-        revise_count=0,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+def test_content_service_contracts(db):
+    from app.errors import TenantScopeDeniedError
+    from app.models import GenerationTask, QuestionTemplate
+
+    template = QuestionTemplate(
+        type_id="fixture",
+        name="Fixture",
+        version=1,
+        input_schema={},
+        output_schema={},
+        quality_rules=[],
+        gen_prompt={},
+        run_config={},
+    )
+    db.add(template)
+    db.flush()
+    task = GenerationTask(
+        template_id=template.type_id,
+        quantity=1,
+        params={},
+        status="succeeded",
         tenant_id="tenant-1",
     )
-
-    class Contents:
-        def get_by_id(self, content_id):
-            return item if content_id == item.id else None
-
-        def update(self, instance, **kwargs):
-            for key, value in kwargs.items():
-                setattr(instance, key, value)
-            return instance
-
-        def __getattr__(self, name):
-            if name.startswith("list_"):
-                return lambda *args, **kwargs: []
-            if name.startswith("count_"):
-                return lambda *args, **kwargs: 0
-            raise AttributeError(name)
-
-    service.content_repo = Contents()
-    viewer = _user(role="viewer", tenant_id="tenant-1")
-    other_viewer = _user(user_id="user-2", role="viewer", tenant_id="tenant-2")
-    assert service.get_content(item.id, viewer) is item
-    with pytest.raises(HTTPException, match="无权访问此内容"):
-        service.get_content(item.id, other_viewer)
-    with pytest.raises(HTTPException, match="内容不存在"):
-        service.get_content("missing", viewer)
-
-    for kwargs in (
-        {"template_id": "single_choice", "status": "passed"},
-        {"template_id": "single_choice"},
-        {"status": "passed"},
-        {},
-    ):
-        assert service.list_contents(viewer, **kwargs).total == 0
-
-    assert service.publish_content(item.id, viewer).status == "published"
-    item.status = CONTENT_PENDING_QC
+    db.add(task)
+    db.flush()
+    item = ContentItem(
+        task_id=task.id,
+        template_id=template.type_id,
+        payload={},
+        status=CONTENT_PENDING_QC,
+        tenant_id="tenant-1",
+    )
+    db.add(item)
+    db.commit()
+    service = ContentService(db)
+    viewer = _user(role="viewer")
+    researcher = _user(role="researcher")
+    with pytest.raises(HTTPException):
+        service.get_content(item.id, viewer)
+    assert service.get_content(item.id, researcher).id == item.id
+    with pytest.raises(TenantScopeDeniedError):
+        service.get_content(item.id, _user(tenant_id="other"))
+    with pytest.raises(HTTPException):
+        service.get_content("missing", researcher)
+    assert service.list_contents(researcher).total == 1
     with pytest.raises(ContentStateConflictError):
-        service.publish_content(item.id, viewer)
-    with pytest.raises(HTTPException, match="内容不存在"):
-        service.publish_content("missing", viewer)
-    assert service.update_content_status(item.id, CONTENT_PASSED, qc_score=99).qc_score == 99
-    with pytest.raises(HTTPException, match="内容不存在"):
-        service.update_content_status("missing", CONTENT_PASSED)
-    assert service.list_by_task("task-1") == []
-    assert service.count_by_task("task-1") == 0
+        service.publish_content(item.id, researcher)
+    service.update_content_status(item.id, CONTENT_PASSED)
+    assert service.publish_content(item.id, researcher).status == "published"
+    assert service.get_content(item.id, viewer).id == item.id
+    assert service.count_by_task(task.id) == 1
 
 
 def test_repository_query_contracts(db):
@@ -318,7 +310,7 @@ def test_health_probe_reports_success_and_failure():
     assert _probe("ok", lambda: "ready")["status"] == "healthy"
     failed = _probe("broken", lambda: (_ for _ in ()).throw(RuntimeError("down")))
     assert failed["status"] == "unavailable"
-    assert failed["detail"] == "down"
+    assert failed["detail"] == "RuntimeError"
 
 
 def test_health_database_and_alembic_probes(monkeypatch):
@@ -335,6 +327,7 @@ def test_health_database_and_alembic_probes(monkeypatch):
 
     monkeypatch.setattr("app.health.SessionLocal", lambda: Session())
     assert check_database()["status"] == "healthy"
+    monkeypatch.setattr("app.main._verify_migrations", lambda session: "verified-head")
     assert check_alembic()["status"] == "healthy"
 
 

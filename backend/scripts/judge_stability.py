@@ -12,9 +12,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0] + "/..")
 
+import yaml  # noqa: E402
+
 from app.engine.quality import run_quality_check  # noqa: E402
 from app.template_loader import _validate_template  # noqa: E402
-import yaml  # noqa: E402
 
 
 def parse_args():

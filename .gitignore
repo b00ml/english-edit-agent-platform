@@ -55,3 +55,29 @@ htmlcov/
 backend/.venv/
 frontend/node_modules/
 *.swp
+
+# Local OCR engine weights, private course samples and benchmark runtimes
+.local-eval/
+
+# Durable local OCR input, checkpoints and private course previews
+.local-ocr/
+
+# Local/private content-addressed course-material blobs
+blobs/
+
+# Local copyrighted material previews and private evidence manifests
+docs/现状文档/验证截图/
+docs/现状文档2/历史与证据/证据资产清单.json
+docs/现状文档2/历史与证据/现役证据补充清单.json
+
+# Prevent accidental public staging of environment variants/credentials/dumps
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.rdb
+*.aof
+*.private.*

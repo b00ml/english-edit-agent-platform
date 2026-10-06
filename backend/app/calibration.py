@@ -95,6 +95,7 @@ def collect_labeled(
     db: Session,
     template_id: str,
     threshold: float,
+    tenant_id: str | None = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]], int, int, float]:
     """从 DB 收集既有 auto 又有 manual_review 标注的内容，返回：
     (fp_dims, pass_dims, sample_size, false_pass_cnt, rejection_rate)
@@ -103,7 +104,11 @@ def collect_labeled(
     - pass_dims: 人工通过集的各维度分
     """
     # 查找该模板下有 manual_review 记录的内容条目
-    items = db.query(ContentItem).filter(ContentItem.template_id == template_id).all()
+    items = (
+        db.query(ContentItem)
+        .filter(ContentItem.template_id == template_id, ContentItem.tenant_id == tenant_id)
+        .all()
+    )
     fp_dims: List[Dict[str, float]] = []
     pass_dims: List[Dict[str, float]] = []
     labeled = 0
@@ -121,6 +126,8 @@ def collect_labeled(
         auto_rec = next((r for r in records if r.source == "auto"), None)
         manual_rec = next((r for r in records if r.source == "manual_review"), None)
         if not auto_rec or not manual_rec:
+            continue
+        if auto_rec.tenant_id != item.tenant_id or manual_rec.tenant_id != item.tenant_id:
             continue
 
         labeled += 1
@@ -164,6 +171,7 @@ def recalibrate(
     alpha: float = _DEFAULT_ALPHA,
     min_samples: int = _MIN_LABELED_SAMPLES,
     min_fp: int = _MIN_FALSE_PASS,
+    tenant_id: str | None = None,
 ) -> QualityCalibration:
     """编排校准全流程：collect → fit → 持久化，返回校准记录。
 
@@ -176,13 +184,14 @@ def recalibrate(
     default_weights, threshold = _get_template_defaults(template)
 
     fp_dims, pass_dims, sample_size, fp_count, rejection_rate = collect_labeled(
-        db, template_id, threshold
+        db, template_id, threshold, tenant_id
     )
 
     # 守卫：样本不足时保持默认权重
     if sample_size < min_samples or fp_count < min_fp:
         calib = QualityCalibration(
             template_id=template_id,
+            tenant_id=tenant_id,
             weights=default_weights,
             threshold=threshold,
             default_weights=default_weights,
@@ -214,6 +223,7 @@ def recalibrate(
 
     calib = QualityCalibration(
         template_id=template_id,
+        tenant_id=tenant_id,
         weights=new_weights,
         threshold=new_threshold,
         default_weights=default_weights,
@@ -232,7 +242,7 @@ def recalibrate(
 
 
 def get_effective_weights(
-    db: Session, template_id: str
+    db: Session, template_id: str, tenant_id: str | None = None
 ) -> Tuple[Optional[Dict[str, float]], Optional[float]]:
     """读取最新校准记录的生效权重与阈值。
 
@@ -240,7 +250,9 @@ def get_effective_weights(
     """
     calib = (
         db.query(QualityCalibration)
-        .filter(QualityCalibration.template_id == template_id)
+        .filter(
+            QualityCalibration.template_id == template_id, QualityCalibration.tenant_id == tenant_id
+        )
         .order_by(QualityCalibration.created_at.desc())
         .first()
     )

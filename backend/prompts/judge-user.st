@@ -1,3 +1,6 @@
+# 本次生成目标与约束（JSON，独立于待评审内容）
+{{generation_constraints}}
+
 # 评分标准（rubric）
 {{rubric}}
 

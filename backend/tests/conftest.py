@@ -2,10 +2,10 @@
 import os
 
 import pytest
-from sqlalchemy import JSON, create_engine, event
+from sqlalchemy import create_engine, event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # 设置测试环境变量
@@ -68,7 +68,7 @@ def db(monkeypatch):
     monkeypatch.setattr("app.worker.tasks.SessionLocal", lambda: session)
     # Dispatch tests execute tasks eagerly and exercise child jobs separately;
     # avoid requiring a live broker for the dispatch-side publish call.
-    monkeypatch.setattr("app.worker.tasks.generate_single_item.delay", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.worker.tasks._item_sender", lambda *args, **kwargs: None)
 
     yield session
 

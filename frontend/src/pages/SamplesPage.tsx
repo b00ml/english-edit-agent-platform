@@ -4,6 +4,7 @@ import {
   deleteSample,
   exportSamples,
   getApiErrorMessage,
+  setSamplePurpose,
   listSamples,
   listTemplates,
   syncSamples,
@@ -200,6 +201,9 @@ export default function SamplesPage() {
                   <button className="btn btn-ghost" onClick={() => setPreview(s)}>
                     预览
                   </button>
+                  <button className="btn btn-ghost" onClick={async () => {
+                    try {await setSamplePurpose(s.id, s.purpose === 'fewshot' ? 'sft' : 'fewshot'); setSuccess('用途已更新；few-shot仍需实际人工记录、当前规则与来源校验'); load(page)} catch(e) {setError(getApiErrorMessage(e, '用途更新失败'))}
+                  }}>{s.purpose === 'fewshot' ? '改为微调语料' : '用于 Few-shot'}</button>
                   <button className="btn btn-ghost" onClick={() => handleDelete(s)}>
                     移除
                   </button>

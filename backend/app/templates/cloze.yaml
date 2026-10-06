@@ -1,6 +1,6 @@
 type_id: cloze
 name: 完形填空
-version: 1
+version: 3
 input_schema:
   type: object
   properties:
@@ -10,22 +10,45 @@ input_schema:
   required: [knowledge_point, difficulty, quantity]
 output_schema:
   type: object
-  required: [passage, blanks]
+  required:
+  - passage
+  - blanks
   properties:
     passage:
       type: string
+      minLength: 1
     blanks:
       type: array
       items:
         type: object
-        required: [index, answer, options, explanation]
+        required:
+        - index
+        - answer
+        - options
+        - explanation
         properties:
-          index: {type: integer}
-          answer: {type: string}
+          index:
+            type: integer
+            minimum: 1
+          answer:
+            type: string
+            enum:
+            - A
+            - B
+            - C
+            - D
           options:
             type: array
-            items: {type: string}
-          explanation: {type: string}
+            items:
+              type: string
+              minLength: 1
+            minItems: 4
+            maxItems: 4
+            uniqueItems: true
+          explanation:
+            type: string
+            minLength: 1
+      minItems: 1
 quality_rules:
   - id: context_coherence
     weight: 0.3
@@ -66,7 +89,17 @@ run_config:
   # 按难度分档路由：完形为中等题型，默认走 standard，难题升级到 high
   model_profile:
     default: standard
-    hard: high
+    难: high
   max_retry: 3
   max_revise: 3
   quality_threshold: 70
+  # These templates are knowledge-based. Missing source must not silently become free generation.
+  rag:
+    mode: required
+    require_human_verification: true
+  content_validation:
+    choice_sets:
+    - path: blanks
+      index_field: index
+      passage_field: passage
+      blank_marker: ____

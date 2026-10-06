@@ -1,14 +1,113 @@
 # docker-compose.yml —— 英语教研 AI 内容生成平台全栈编排
 # 服务：postgres / redis / langfuse / backend / worker / frontend
-# 说明：从项目根运行 `docker compose -f deploy/docker-compose.yml up`，
-#       插值 ${VAR} 会读取项目根目录的 .env 文件作为配置来源。
+# 说明：从项目根运行 `docker compose --env-file .env -f deploy/docker-compose.yml up`。
+# 显式指定根 .env，避免 Compose 按 deploy/ 项目目录查找而漏掉本地配置。
+# One shared RAG environment keeps API ingestion and Celery generation in sync.
+x-rag-environment: &rag-environment
+  GENERATION_MAINTENANCE_SECONDS: ${GENERATION_MAINTENANCE_SECONDS:-20}
+  GENERATION_RECONCILE_BATCH_SIZE: ${GENERATION_RECONCILE_BATCH_SIZE:-50}
+  GENERATION_DELIVERY_TIMEOUT_SECONDS: ${GENERATION_DELIVERY_TIMEOUT_SECONDS:-3600}
+  GENERATION_STALE_ITEM_SECONDS: ${GENERATION_STALE_ITEM_SECONDS:-1800}
+  OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-5}
+  OUTBOX_RELAY_BATCH_SIZE: ${OUTBOX_RELAY_BATCH_SIZE:-50}
+  OUTBOX_RETRY_BACKOFF_SECONDS: ${OUTBOX_RETRY_BACKOFF_SECONDS:-5}
+  OUTBOX_SENDING_TIMEOUT_SECONDS: ${OUTBOX_SENDING_TIMEOUT_SECONDS:-300}
+  EMBEDDING_TIMEOUT: "${EMBEDDING_TIMEOUT:-30}"
+  EMBEDDING_DIM: "${EMBEDDING_DIM:-1024}"
+  RAG_MODE: "${RAG_MODE:-optional}"
+  RAG_MIN_SIMILARITY: "${RAG_MIN_SIMILARITY:-0.3}"
+  RAG_CHUNK_STRATEGY: "${RAG_CHUNK_STRATEGY:-auto}"
+  RAG_EXPERIMENT_MAX_CHUNKS: "${RAG_EXPERIMENT_MAX_CHUNKS:-128}"
+  RAG_EXPERIMENT_MAX_SENTENCES: "${RAG_EXPERIMENT_MAX_SENTENCES:-128}"
+  RAG_EXPERIMENT_SEMANTIC_THRESHOLD: "${RAG_EXPERIMENT_SEMANTIC_THRESHOLD:-0.65}"
+  RAG_EXPERIMENT_CONTEXT_MAX_CHARS: "${RAG_EXPERIMENT_CONTEXT_MAX_CHARS:-4096}"
+  RAG_EXPERIMENT_MAX_LLM_CALLS: "${RAG_EXPERIMENT_MAX_LLM_CALLS:-8}"
+  RAG_EXPERIMENT_MAX_TOKENS: "${RAG_EXPERIMENT_MAX_TOKENS:-8192}"
+  RAG_EXPERIMENT_MAX_INPUT_BYTES: "${RAG_EXPERIMENT_MAX_INPUT_BYTES:-4194304}"
+  RAG_CHUNK_LAYOUT: "${RAG_CHUNK_LAYOUT:-structure}"
+  RAG_CHUNK_SIZE: "${RAG_CHUNK_SIZE:-512}"
+  RAG_CHUNK_OVERLAP: "${RAG_CHUNK_OVERLAP:-80}"
+  RAG_CHUNK_MIN_CHARS: "${RAG_CHUNK_MIN_CHARS:-80}"
+  RAG_CHUNK_TOKEN_LIMIT: "${RAG_CHUNK_TOKEN_LIMIT:-}"
+  RAG_EMBEDDING_BATCH_SIZE: "${RAG_EMBEDDING_BATCH_SIZE:-32}"
+  RAG_PARENT_CHILD_ENABLED: "${RAG_PARENT_CHILD_ENABLED:-true}"
+  RAG_PARENT_MIN_CHARS: "${RAG_PARENT_MIN_CHARS:-1024}"
+  RAG_PARENT_SIZE: "${RAG_PARENT_SIZE:-2048}"
+  RAG_NEIGHBOR_WINDOW: "${RAG_NEIGHBOR_WINDOW:-1}"
+  RAG_CONTEXT_MAX_CHARS: "${RAG_CONTEXT_MAX_CHARS:-32768}"
+  RAG_CONTEXT_TOKEN_LIMIT: "${RAG_CONTEXT_TOKEN_LIMIT:-}"
+  RAG_CONTEXT_EXPANSION_LIMIT: "${RAG_CONTEXT_EXPANSION_LIMIT:-24}"
+  RAG_CONTEXT_MODE: "${RAG_CONTEXT_MODE:-relation}"
+  RAG_STRUCTURE_ENABLED: "${RAG_STRUCTURE_ENABLED:-true}"
+  RAG_QUERY_PLANNING_MODE: "${RAG_QUERY_PLANNING_MODE:-rules}"
+  RAG_QUERY_PLAN_MAX_PARTS: "${RAG_QUERY_PLAN_MAX_PARTS:-4}"
+  RAG_QUERY_PLAN_MAX_QUERIES: "${RAG_QUERY_PLAN_MAX_QUERIES:-8}"
+  RAG_OCR_BOUNDARY_TIMEOUT: "${RAG_OCR_BOUNDARY_TIMEOUT:-360}"
+  RAG_OCR_BOUNDARY_MAX_ATTEMPTS: "${RAG_OCR_BOUNDARY_MAX_ATTEMPTS:-3}"
+  RAG_STRUCTURE_MAX_BLOCKS: "${RAG_STRUCTURE_MAX_BLOCKS:-10000}"
+  RAG_STRUCTURE_MAX_LEAFS: "${RAG_STRUCTURE_MAX_LEAFS:-2000}"
+  RAG_CONTEXT_BUNDLE_MAX_MEMBERS: "${RAG_CONTEXT_BUNDLE_MAX_MEMBERS:-24}"
+  RAG_CONTEXT_BUNDLE_MAX_HOPS: "${RAG_CONTEXT_BUNDLE_MAX_HOPS:-32}"
+  RAG_CONTEXT_MAX_SEGMENTS: "${RAG_CONTEXT_MAX_SEGMENTS:-128}"
+  RAG_CANDIDATE_POOL: "${RAG_CANDIDATE_POOL:-30}"
+  RAG_TOP_K: "${RAG_TOP_K:-5}"
+  RAG_RETRIEVAL_METHOD: "${RAG_RETRIEVAL_METHOD:-hybrid}"
+  RAG_RRF_K: "${RAG_RRF_K:-60}"
+  RAG_KEYWORD_MIN_SCORE: "${RAG_KEYWORD_MIN_SCORE:-0.001}"
+  RAG_CJK_KEYWORD_MODE: "${RAG_CJK_KEYWORD_MODE:-bigram}"
+  RAG_KEYWORD_MAX_TERMS: "${RAG_KEYWORD_MAX_TERMS:-32}"
+  RAG_RERANK_MODE: "${RAG_RERANK_MODE:-off}"
+  RAG_RERANK_URL: "${RAG_RERANK_URL:-}"
+  RAG_RERANK_API_KEY: "${RAG_RERANK_API_KEY:-}"
+  RAG_RERANK_MODEL: "${RAG_RERANK_MODEL:-}"
+  RAG_RERANK_TIMEOUT: "${RAG_RERANK_TIMEOUT:-10.0}"
+  RAG_RERANK_THRESHOLD: "${RAG_RERANK_THRESHOLD:-0.0}"
+  RAG_KNOWLEDGE_CATALOG: "${RAG_KNOWLEDGE_CATALOG:-}"
+  RAG_KNOWLEDGE_SCOPE: "${RAG_KNOWLEDGE_SCOPE:-exact}"
+  RAG_QUERY_EXPANSION_MODE: "${RAG_QUERY_EXPANSION_MODE:-aliases}"
+  RAG_KNOWLEDGE_SCOPE_MAX: "${RAG_KNOWLEDGE_SCOPE_MAX:-128}"
+  RAG_QUERY_EXPANSION_MAX_OUTPUT_TOKENS: "${RAG_QUERY_EXPANSION_MAX_OUTPUT_TOKENS:-512}"
+  RAG_QUERY_EXPANSION_MAX: "${RAG_QUERY_EXPANSION_MAX:-4}"
+  RAG_QUERY_EXPANSION_MODEL: "${RAG_QUERY_EXPANSION_MODEL:-}"
+  RAG_QUERY_EXPANSION_API_BASE: "${RAG_QUERY_EXPANSION_API_BASE:-}"
+  RAG_QUERY_EXPANSION_API_KEY: "${RAG_QUERY_EXPANSION_API_KEY:-}"
+  RAG_QUERY_EXPANSION_TIMEOUT: "${RAG_QUERY_EXPANSION_TIMEOUT:-8.0}"
+
+  RAG_OCR_ENGINE: "${RAG_OCR_ENGINE:-off}"
+  RAG_OCR_URL: "${RAG_OCR_URL:-}"
+  RAG_OCR_API_KEY: "${RAG_OCR_API_KEY:-}"
+  RAG_OCR_PAGE_TIMEOUT: "${RAG_OCR_PAGE_TIMEOUT:-180}"
+  RAG_OCR_MAX_PAGES: "${RAG_OCR_MAX_PAGES:-3}"
+  RAG_OCR_MAX_INPUT_BYTES: "${RAG_OCR_MAX_INPUT_BYTES:-134217728}"
+  RAG_OCR_MAX_RESULT_BYTES: "${RAG_OCR_MAX_RESULT_BYTES:-4194304}"
+  RAG_PDF_MIN_TEXT_CHARS: "${RAG_PDF_MIN_TEXT_CHARS:-10}"
+  RAG_PDF_SCAN_IMAGE_RATIO: "${RAG_PDF_SCAN_IMAGE_RATIO:-0.5}"
+
+  RAG_OCR_STORAGE_DIR: "${RAG_OCR_STORAGE_DIR:-/var/lib/english-edit/ocr}"
+  RAG_OCR_IMPORT_ROOT: "${RAG_OCR_IMPORT_ROOT:-/course-materials}"
+  RAG_OCR_MAX_JOB_PAGES: "${RAG_OCR_MAX_JOB_PAGES:-500}"
+  RAG_OCR_MAX_ATTEMPTS: "${RAG_OCR_MAX_ATTEMPTS:-3}"
+  RAG_OCR_RETRY_SECONDS: "${RAG_OCR_RETRY_SECONDS:-10}"
+  RAG_OCR_LEASE_SECONDS: "${RAG_OCR_LEASE_SECONDS:-360}"
+  RAG_OCR_SWEEP_SECONDS: "${RAG_OCR_SWEEP_SECONDS:-20}"
+  RAG_OCR_MAX_PREVIEW_BYTES: "${RAG_OCR_MAX_PREVIEW_BYTES:-67108864}"
+  RAG_OCR_CACHE_REVISION: "${RAG_OCR_CACHE_REVISION:-mineru-middle2-adapter-v1}"
+
+  RAG_OCR_INDEX_TIMEOUT: "${RAG_OCR_INDEX_TIMEOUT:-900}"
+  RAG_OCR_INDEX_MAX_CHUNKS: "${RAG_OCR_INDEX_MAX_CHUNKS:-1000}"
+  EMBEDDING_PROVIDER_BATCH_LIMIT: "${EMBEDDING_PROVIDER_BATCH_LIMIT:-10}"
+
 networks:
   english-edit-net:
     driver: bridge
 
 volumes:
+  redis-data:
   postgres-data:
   langfuse-data:
+  trace-spool-backend:
+  trace-spool-worker:
+  knowledge-ocr-data:
 
 services:
   # 主数据库（pgvector 提供向量检索能力）
@@ -35,6 +134,9 @@ services:
   redis:
     image: redis:7
     container_name: english-edit-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
     networks:
       - english-edit-net
     healthcheck:
@@ -57,7 +159,7 @@ services:
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?LANGFUSE_ENCRYPTION_KEY must be set}
       NODE_ENV: production
     ports:
-      - "3001:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:3001:3000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,17 +174,39 @@ services:
       context: ../backend
     container_name: english-edit-backend
     environment:
+      <<: *rag-environment
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/english_edit
       REDIS_URL: redis://redis:6379/0
       LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}
       LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY must be set}
       LLM_MODEL_NAME: ${LLM_MODEL_NAME:-deepseek-v4-flash}
+      JUDGE_MODEL_NAME: ${JUDGE_MODEL_NAME:-}
+      JUDGE_SAMPLE_ROUNDS: ${JUDGE_SAMPLE_ROUNDS:-1}
+      JUDGE_MAX_RETRIES: ${JUDGE_MAX_RETRIES:-3}
+      JUDGE_API_BASE: ${JUDGE_API_BASE:-}
+      JUDGE_API_KEY: ${JUDGE_API_KEY:-}
+      MODEL_PROFILE_MODELS: '${MODEL_PROFILE_MODELS:-}'
+      REQUIRE_DISTINCT_MODEL_TIERS: ${REQUIRE_DISTINCT_MODEL_TIERS:-false}
+      REQUIRE_INDEPENDENT_JUDGE: ${REQUIRE_INDEPENDENT_JUDGE:-false}
+      CORS_ALLOWED_ORIGINS: '${CORS_ALLOWED_ORIGINS:-["http://localhost:3000"]}'
+      CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-false}
+      TRACE_REQUIRE_DURABILITY: ${TRACE_REQUIRE_DURABILITY:-true}
+      TRACE_FAILURE_SPOOL_DIR: /var/lib/english-edit/trace-spool
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
       EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://your-embedding-provider.example/v1}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?EMBEDDING_API_KEY must be set}
       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-text-embedding-v3}
+      PROVIDER_SECRET_KEY: ${PROVIDER_SECRET_KEY:-}
+      TRACE_SNAPSHOT_ENABLED: ${TRACE_SNAPSHOT_ENABLED:-false}
+      TRACE_SNAPSHOT_SECRET_KEY: ${TRACE_SNAPSHOT_SECRET_KEY:-}
+      TRACE_SNAPSHOT_MAX_BYTES: ${TRACE_SNAPSHOT_MAX_BYTES:-1048576}
+      TRACE_SNAPSHOT_TOTAL_BYTES: ${TRACE_SNAPSHOT_TOTAL_BYTES:-134217728}
+      TRACE_SNAPSHOT_RETENTION_DAYS: ${TRACE_SNAPSHOT_RETENTION_DAYS:-7}
+      FEWSHOT_ENABLED: ${FEWSHOT_ENABLED:-false}
+      FEWSHOT_MAX_EXAMPLES: ${FEWSHOT_MAX_EXAMPLES:-2}
+      FEWSHOT_MAX_CHARS: ${FEWSHOT_MAX_CHARS:-8192}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
       JWT_EXPIRE_SECONDS: ${JWT_EXPIRE_SECONDS:-43200}
       SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
@@ -91,10 +215,81 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-production}
       CHECKPOINTER_BACKEND: ${CHECKPOINTER_BACKEND:-postgres}
       ALLOW_MEMORY_CHECKPOINTER: ${ALLOW_MEMORY_CHECKPOINTER:-false}
+    volumes:
+      - trace-spool-backend:/var/lib/english-edit/trace-spool
+      - knowledge-ocr-data:${RAG_OCR_STORAGE_DIR:-/var/lib/english-edit/ocr}
+      - "${OCR_IMPORT_HOST_PATH:-../docs}:/course-materials:ro"
     command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
-      - "8000:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:8000:8000"
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+    networks:
+      - english-edit-net
+
+  # Celery Worker（与 backend 共享同一镜像，仅启动命令不同）
+  worker: &worker-service
+    build:
+      context: ../backend
+    container_name: english-edit-worker
+    environment:
+      <<: *rag-environment
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/english_edit
+      REDIS_URL: redis://redis:6379/0
+      LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY must be set}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-deepseek-v4-flash}
+      JUDGE_MODEL_NAME: ${JUDGE_MODEL_NAME:-}
+      JUDGE_SAMPLE_ROUNDS: ${JUDGE_SAMPLE_ROUNDS:-1}
+      JUDGE_MAX_RETRIES: ${JUDGE_MAX_RETRIES:-3}
+      JUDGE_API_BASE: ${JUDGE_API_BASE:-}
+      JUDGE_API_KEY: ${JUDGE_API_KEY:-}
+      MODEL_PROFILE_MODELS: '${MODEL_PROFILE_MODELS:-}'
+      REQUIRE_DISTINCT_MODEL_TIERS: ${REQUIRE_DISTINCT_MODEL_TIERS:-false}
+      REQUIRE_INDEPENDENT_JUDGE: ${REQUIRE_INDEPENDENT_JUDGE:-false}
+      CORS_ALLOWED_ORIGINS: '${CORS_ALLOWED_ORIGINS:-["http://localhost:3000"]}'
+      CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-false}
+      TRACE_REQUIRE_DURABILITY: ${TRACE_REQUIRE_DURABILITY:-true}
+      TRACE_FAILURE_SPOOL_DIR: /var/lib/english-edit/trace-spool
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://your-embedding-provider.example/v1}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?EMBEDDING_API_KEY must be set}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-text-embedding-v3}
+      PROVIDER_SECRET_KEY: ${PROVIDER_SECRET_KEY:-}
+      TRACE_SNAPSHOT_ENABLED: ${TRACE_SNAPSHOT_ENABLED:-false}
+      TRACE_SNAPSHOT_SECRET_KEY: ${TRACE_SNAPSHOT_SECRET_KEY:-}
+      TRACE_SNAPSHOT_MAX_BYTES: ${TRACE_SNAPSHOT_MAX_BYTES:-1048576}
+      TRACE_SNAPSHOT_TOTAL_BYTES: ${TRACE_SNAPSHOT_TOTAL_BYTES:-134217728}
+      TRACE_SNAPSHOT_RETENTION_DAYS: ${TRACE_SNAPSHOT_RETENTION_DAYS:-7}
+      FEWSHOT_ENABLED: ${FEWSHOT_ENABLED:-false}
+      FEWSHOT_MAX_EXAMPLES: ${FEWSHOT_MAX_EXAMPLES:-2}
+      FEWSHOT_MAX_CHARS: ${FEWSHOT_MAX_CHARS:-8192}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      JWT_EXPIRE_SECONDS: ${JWT_EXPIRE_SECONDS:-43200}
+      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
+      SEED_ADMIN_DISPLAY_NAME: ${SEED_ADMIN_DISPLAY_NAME:-系统管理员}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      CHECKPOINTER_BACKEND: ${CHECKPOINTER_BACKEND:-postgres}
+      ALLOW_MEMORY_CHECKPOINTER: ${ALLOW_MEMORY_CHECKPOINTER:-false}
+    volumes:
+      - trace-spool-worker:/var/lib/english-edit/trace-spool
+      - knowledge-ocr-data:${RAG_OCR_STORAGE_DIR:-/var/lib/english-edit/ocr}
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--queues=celery", "--concurrency=5"]
+    depends_on:
+      backend:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -102,39 +297,18 @@ services:
     networks:
       - english-edit-net
 
-  # Celery Worker（与 backend 共享同一镜像，仅启动命令不同）
-  worker:
-    build:
-      context: ../backend
-    container_name: english-edit-worker
-    environment:
-      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/english_edit
-      REDIS_URL: redis://redis:6379/0
-      LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}
-      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY must be set}
-      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-deepseek-v4-flash}
-      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
-      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
-      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-https://your-embedding-provider.example/v1}
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?EMBEDDING_API_KEY must be set}
-      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-text-embedding-v3}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
-      JWT_EXPIRE_SECONDS: ${JWT_EXPIRE_SECONDS:-43200}
-      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
-      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
-      SEED_ADMIN_DISPLAY_NAME: ${SEED_ADMIN_DISPLAY_NAME:-系统管理员}
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      CHECKPOINTER_BACKEND: ${CHECKPOINTER_BACKEND:-postgres}
-      ALLOW_MEMORY_CHECKPOINTER: ${ALLOW_MEMORY_CHECKPOINTER:-false}
-    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=5"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - english-edit-net
+  # Optional dedicated OCR queue and durable dispatch/recovery scheduler.
+  ocr-worker:
+    <<: *worker-service
+    container_name: english-edit-ocr-worker
+    profiles: ["ocr"]
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--queues=ocr", "--concurrency=1", "--hostname=ocr@%h"]
+
+  # Always-on shared beat: generation recovery must not depend on the OCR profile.
+  ocr-scheduler:
+    <<: *worker-service
+    container_name: english-edit-ocr-scheduler
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=info", "--schedule=/var/lib/english-edit/ocr/beat-schedule"]
 
   # 前端工作台
   frontend:
@@ -142,8 +316,9 @@ services:
       context: ../frontend
     container_name: english-edit-frontend
     ports:
-      - "3000:80"
+      - "${BIND_ADDRESS:-127.0.0.1}:3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - english-edit-net

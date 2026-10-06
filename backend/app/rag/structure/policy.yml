@@ -1,0 +1,26 @@
+version: structure-policy-v1
+furniture_types: [header, footer, page_number]
+native_roles: {table_caption: caption, table_footnote: footnote}
+chapter_pattern: '^第[一二三四五六七八九十百千零〇0-9]+章'
+section_pattern: '^第[一二三四五六七八九十百千零〇0-9]+节'
+subsection_pattern: '^(?:[（(][一二三四五六七八九十0-9]+[）)]|[一二三四五六七八九十]+[、.])'
+roles:
+  - role: exercise
+    pattern: '^(?:链接中考|中考链接|课堂练习|练习题|随堂练习|Exercises?|Practice|Quiz)[:：\s]*$'
+  - role: answer
+    pattern: '^(?:【(?:答案|解析)】|答案[:：]|解析[:：]|Answers?[:：]|\d+[.、)]\s*[A-D](?:\s|(?=[\u3400-\u9fff])))'
+  - role: note
+    pattern: '^(?:温馨提示|知识拓展|注意事项|注意|例外|例外说明|特殊情况|Note|Notes|Tip|Tips|Exceptions)[:：\s]*$'
+  - role: question
+    pattern: '^(?:\d+[.、)]\s*\(|Question\s+\d+)'
+  - role: example
+    pattern: '^(?:例句|例如|如[:：]|Examples?[:：]|[•·])'
+unit_break_roles: [exercise, answer, question, code]
+table_reference_pattern: '(?:如下表|下表|表中|表格|following table|table below)[:：.。\s]*$'
+
+table_bottom_min: 0.65
+table_top_max: 0.35
+table_alignment_tolerance: 0.04
+table_continuation_pattern: '(?:续表|续|continued|cont[.])'
+table_number_pattern: '(?:表\s*\d+|table\s*\d+)'
+explicit_reference_pattern: '(?:参见|参照|见|see)\s*(?P<target>第[一二三四五六七八九十百千零〇0-9]+[章节]|Chapter\s+\d+|Section\s+\d+)'

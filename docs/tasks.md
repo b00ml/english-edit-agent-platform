@@ -238,7 +238,7 @@
   - 内容：用人工抽检结果校准 judge 权重/threshold
   - 验收：校准后人工驳回率 ≤5%
   - 完成：新增 `quality_calibration` 表（迁移 g6b7c8d9e0f1）+ `QualityRecord.reason` 列；`app/calibration.py` 纯函数模块（`fit_weights` 放水度计算与降权归一化 + `collect_labeled` 标注对收集 + `recalibrate` 编排与守卫 + `get_effective_weights` 覆盖权重读取）；`quality.py` `_aggregate_score` 支持 `weights_override`；`graph.py` `qc_node` 接入覆盖权重；新增 `POST /api/quality/calibrate` + `GET /api/quality/calibration`；前端看板页新增"质检校准中心"（一键校准 + 生效/默认权重对比表 + 驳回率）；8 个校准纯函数单测，全量 109 测试通过。详见 `docs/优化记录.md` OPT-014
-  - 闭环叙事：低分自动改版（graph.py after_qc）→ 人工驳回记录（review_content 存 reason）→ 假阳性样本（auto 高分但 manual 驳回）→ 计算放水度 → 降权 → 下次质检更准 → 驳回率下降
+  - 已实现链路：低分自动改版（graph.py after_qc）→ 人工驳回记录（review_content 存 reason）→ 假阳性样本（auto 高分但 manual 驳回）→ 计算放水度 → 降权；质量收益与 ≤5% 目标待独立标注集验证。
 
 - [x] **J2. 数据回流**
   - 依赖：P1
@@ -353,13 +353,47 @@ P3: P2 ──→ K1→K2→K3→K4→K5
 
 ---
 
+## 自用生产 P0 修复（2026-10-04）
+
+> 对应本次 [验证状态与风险](现状文档/验证状态与风险.md) 的七项，按原顺序执行；这里的完成勾选仅表示代码和纯单测交付。历史 P0/P1 验收不替代当前生产准入证据。用户要求暂不启动 Docker，数据库集成未执行。
+
+- [x] **SELF-P0-1. Judge 生成目标上下文**（OPT-039）：独立传入 input_schema 声明参数，Prompt/Trace 留存目标；不混入 RAG、改版和凭据。
+- [x] **SELF-P0-2. Judge 输出硬校验**（OPT-040）：动态 Pydantic 校验完整维度、范围和有限数；失败轮有限重试、记录成本；禁止缺维度归一化放行。
+- [x] **SELF-P0-3. JSON Schema 错误反馈重试**（OPT-041）：精确异常捕获、字段反馈、失败 Trace 与耗尽回归；补直接 jsonschema 依赖声明。
+- [x] **SELF-P0-4. 自动质检分母修复**（OPT-042）：草稿级 quality_evaluation；拒绝最终 auto 记录；首轮和最终终结分母分开；看板无样本 null；待真实迁移。
+- [x] **SELF-P0-5. 有效阈值统一**（OPT-043）：路由、灰区、事件、auto/manual 快照一致；0 阈值和重放冻结值回归。
+- [ ] **SELF-P0-6. 真实人工金标验收**（OPT-044）：候选导出、双人标注/第三人仲裁、hash/版本校验与离线报告工具已交付；真实教研人员标注未完成，不宣称 ≤5% 或答案正确率达标。
+- [ ] **SELF-P0-7. 真实跨进程恢复验收**（OPT-045）：dict_row、生产禁内存降级、invoke(None)、终态/人工重放、thread 锁与唯一键、父子状态修复及 3 条真 Postgres 子进程测试已交付；真实数据库测试按用户要求暂缓。
+
+本轮系统解释器回归：**287 passed, 8 skipped**（新增 47 条纯单测，新增 3 条集成用例未执行）；前端构建、修改文件 lint 和三模块 scoped mypy 通过。新 Alembic head：`p0_07_thread_unique`（仅离线 SQL 校验）。操作说明见 [P0-质量金标与恢复验收](P0-质量金标与恢复验收.md)。
+
+---
+
+## 自用生产 P1 修复（2026-10-04）
+
+> 对应 [验证状态与风险](现状文档/验证状态与风险.md) 中 P1 九项，勾选仅表示代码与本地回归。仍遵守不启动 Docker、不执行真实数据库/付费模型测试；P0 的真实金标与跨进程验收保持未完成。
+
+- [x] **SELF-P1-1. 租户上下文贯通**（OPT-046）：任务认证来源覆盖参数伪造；所有派生内容/评分/知识/样本/Trace 归属一致；默认租户不虚构为 default；迁移先审计非空冲突。
+- [x] **SELF-P1-2. API 读写/运营 scope**（OPT-047）：非 admin 固定资源 scope，Null 显式 IS NULL；详情/取消/审核/发布/删除/导出同控；共享配置仅可读；viewer 发布内容规则、JWT/禁用账号及登录/用户/通知接口契约回归。
+- [x] **SELF-P1-3. RAG 策略与来源证据**（OPT-048）：命中/无命中/降级、来源文本快照/hash、required 失败关闭、人工来源声明与发布门控、金标 RAG 分层；不冒充自动事实核验。
+- [x] **SELF-P1-4. 知识服务边界统一**（OPT-049）：文件/文本共用索引、同一 scope 检索/删除；有限文件读取、输入/向量完整性校验；去除占位服务方法。
+- [x] **SELF-P1-5. 结构化失败分类**（OPT-050）：状态码/SDK/连接异常解包；未知错误不看字符串数字；重试有上限，耗尽父子终态与通知。
+- [x] **SELF-P1-6. 模型档案可配置差异**（OPT-051）：显式映射、实际字段 hash、难度中文键修正、独立 Judge endpoint/key 与可选启动策略；真实模型差异和收益仍未验。
+- [x] **SELF-P1-7. 启动关键失败关闭**（OPT-052）：生产不 create_all、只接受迁移 head；部分模板/模型/管理员失败阻启动；worker/frontend 等待 backend ready。
+- [x] **SELF-P1-8. CORS 与默认网络边界**（OPT-053）：origins 白名单、默认无凭据、禁生产/凭据通配符、回环端口；真实 TLS/LAN 配置待验。
+- [x] **SELF-P1-9. Trace 持久化补偿与费用核对**（OPT-054）：稳定 ID、原子补偿/幂等 replay、健康与丢失告警、严格失败关闭、pending 预算、未知 usage 与冻结单价分量、规范化账单比对 CLI；不是事务/供应商金额证明。
+
+本轮：**365 passed, 8 skipped**，P0 后 287→365（新增 78 条纯单测）；前端构建通过，六个 P1 模块 scoped mypy、修改文件 lint 通过。迁移新 head `p1_09_trace_ledger` 仅离线 SQL 校验。操作/环境边界见 [P1 修复与验收](P1-修复与验收.md)。
+
+---
+
 ## 里程碑验收
 
 | 里程碑 | 通过标准 | 状态 |
 |---|---|---|
 | P0 完成 | 单选可从工作台发起生成→自动质检→入库→人工质检，全链路可用 | ✅ 已通过 |
 | P1 完成 | 3 类题型可生产，RAG 生效，任务稳定，成本可查，Prompt/Skill 工程化 | ✅ 已通过 |
-| P2 完成 | 人工驳回率 ≤5%，质检稳定，Trace 可回放（微调评估 J3 暂缓，因云端 API 技术路线） | ✅ 已通过（J1 校准闭环 + J2 数据回流 + J4 稳定采样 + J5 Trace 回放 + J6 看板；J3 微调暂缓） |
+| P2 功能交付 | 人工驳回率 ≤5%，质检稳定，Trace 可回放（微调评估 J3 暂缓，因云端 API 技术路线） | 机制已交付（J1/J2/J4/J5/J6）；驳回率与稳定性目标待真实标注样本验证，J3 暂缓 |
 | P3 完成 | 多租户/多角色可用，成本可下钻，多模态预留可用 | 进行中 |
 
 ---
@@ -388,7 +422,313 @@ P3: P2 ──→ K1→K2→K3→K4→K5
 | V3.0 | 2026-09-07 | 新增《优化技术设计3.0》：生产一致性、安全边界、Outbox/幂等、租户隔离、状态契约与可运维性设计；全部标记为待实施 |
 | V3.1 | 2026-09-08 | 批次 A P0 完成（OPT-028）：状态终态一致性/租户隔离/Outbox幂等键/生产fail-fast；9文件+迁移脚本+19单测全绿 |
 | V2.7 | 2026-09-08 | OPT-031 P1-2 Schema 真校验完成：输入 JSON Schema 校验（422 拦截）、输出约束保留（minItems/maxItems/enum/minLength/maxLength）、去重版本化、双重校验（Pydantic + jsonschema）；210 单测全过，覆盖率 51% |
+| V3.2-P0 | 2026-10-04 | OPT-039～045：自用生产 P0 按序修复；287 纯单测通过、8 集成跳过；真实金标与跨进程验收未完成，Docker 测试按用户要求暂缓 |
+| V3.3-P1 | 2026-10-04 | OPT-046～054：P1 九项代码修复；365 通过/8 跳过，新增 78 条纯单测；真实迁移、模型/来源效果、账单和 Docker 验收仍暂缓 |
 
 
+## RAG P0 A/B/C（2026-10-04，OPT-055～057）
+
+> 配套：`docs/现状文档/RAG优化计划.md`、`RAG-P0-ABC落地与验收.md`。以下完成代表代码及单测/离线验证，不代表真实部署通过；P1 D/E/F、P2 G 保持未完成。
+
+- [x] **RAG-A：基线、许可与兼容迁移**（OPT-055）
+  - legacy chunk/API/tenant/knowledge_point/RAG 模式回归保留；新增 `knowledge_document` + nullable chunk 来源与版本字段，不重嵌入老数据。
+  - 单 head `rag_p0_abc`；离线 upgrade/downgrade SQL；MIT 版权许可保留，参考源码逐文件 SHA-256，上游 commit 不冒认父目录 Git。
+- [x] **RAG-B：结构化解析与内容完整性**（OPT-056）
+  - DOCX 正文/表格 body-order、空/合并/嵌套单元格；Markdown/HTML 表格；PDF 页面/空页/错误；XLSX/CSV sheet/列/真实行号/公式与合并告警。
+  - ParsedDocument/Block 原始与规范化快照、源 hash、解析统计/warning，无模型调用预览。
+- [x] **RAG-C：自适应切块与诊断**（OPT-057）
+  - heading/heuristic/recursive/legacy + 验证 fallback，边界递减小块修复，ContextHeader/section_path、表头上下文、真实源区间、row_range、预算与覆盖率验证。
+  - 分批 embedding 全部校验后一次事务写入；旧来源门控保留；前端新格式/知识点/预览/warning。
+  - 回归：新增 **56 条**；非集成 **421 passed / 8 deselected**（最终复跑见验收文档）；修改模块静态检查与前端构建通过。
+- [x] **RAG-P1 D/E/F**：Parent-Child/邻接上下文、混合召回/RRF/rerank、知识点别名/层级/query expansion（代码/离线验证，见下节；真实运行效果未验收）。
+- [ ] **RAG-P2 G 与真实验收**：重建索引运营化、真实检索评测/压测、Postgres 迁移与供应商验证、OCR/PDF 布局后续版。
 
 
+## RAG P1 D/E/F（2026-10-04，OPT-058～060）
+
+- [x] **RAG-D**（OPT-058）：兼容父子/邻接 schema；parent 无 embedding；child 命中回溯 parent、范围校验、去重、source wrapper/字符/保守字节预算；来源坐标与 snapshot/hash 同步。
+- [x] **RAG-E**（OPT-059）：候选 pool/top_k 分开；pgvector + PostgreSQL FTS/字面 keyword、RRF、provider JSON rerank off/optional/required、SQL savepoint 与降级；HNSW/GIN/pg_trgm 迁移及离线 SQL。
+- [x] **RAG-F**（OPT-060）：YAML canonical/aliases/parents/related、多标签、exact/ancestor/descendant/related/semantic、bounded original/alias/LLM query expansion；LLM 独立 .st、Pydantic 与调用 Trace；API/React 对接。
+- 验证：新增 **65 条**，全量非集成 **486 passed / 8 deselected**；130 条相关回归 scoped coverage **95%**；22 文件 scoped mypy、修改代码格式/lint、前端 build 通过；head `rag_p1_def`。
+- 仍待：真实 schema/索引/计划/召回质量、供应商兼容性/价格/效果、浏览器端到端与 P2 G。不要把 SQLite reference 或 offline SQL 当作真实 PostgreSQL 证据。
+- 交付文档：`docs/现状文档/RAG-P1-DEF落地与验收.md`。
+
+
+## RAG 启动前修复与真实 PostgreSQL 验收（2026-10-05，OPT-061）
+
+- [x] backend/worker 全 RAG 配置透传与 Settings 空 optional-limit 兼容；实际 Compose 渲染验证非默认参数。
+- [x] 集成 fixture 实际 Alembic 升级和 head 检查；非零差异 mock 向量；不 create_all/stamp/清库。
+- [x] 复用已有 english-edit-ci-postgres：实际迁移至 rag_p1_def、13 项 PostgreSQL RAG 专项、5 项 pipeline、3 项跨进程恢复。
+- [x] 当前 506 非集成 + 21 集成 = 527 断言通过，新增33条；旧数据保留；修改代码格式/lint通过。
+- [ ] 全 app/CI覆盖率门禁：本地约77.45%未到80%，历史备份/损坏副本仍在工作区；未调整门槛。
+- [x] 原 Compose API/worker/frontend/Redis 运行验收与课程 PDF 实际资料预览（OPT-062）；教材导入、真实语义质量/P2运营与金标仍未完成。
+- 验收文档：`docs/现状文档/RAG-部署与PostgreSQL验收.md`。此节替代旧文档“Postgres从未测试”的当前口径，不抹去2026-10-04历史证据。
+
+
+## 原 Compose 运行态与课程资料预览（2026-10-05，OPT-062）
+
+- [x] 根.env本机启动项补齐、开发JWT占位替换（不展示密钥、不改现有管理员密码）；显式 --env-file .env。
+- [x] 原deploy_postgres-data复用、主库实际迁移rag_p1_def；Postgres/Redis/backend/worker/frontend运行，ready与Celery ping/空outbox实际任务回执。
+- [x] 浏览器实际发现并修复Nginx1MiB/后端10MiB限制不一致；无文字PDF indexable false、OCR提示、禁用索引/超限提示；后端在embedding前明确拒绝。
+- [x] 15份课程PDF341页全量预检：0文字页、12份超限；浏览器登录/8页PDF预览/MD正文预览/超限验证无pageerror。
+- [x] 新增6条回归；512非集成通过、21真实集成复跑通过，Python修改文件/知识服务scoped mypy、前端镜像构建/nginx-t通过。
+- [ ] 下一优先：扫描教材OCR和大文件页级批次导入；后续小量真实embedding+语义召回评测。资料尚未索引，不能把运行态ready当作知识库内容可用。
+- 交付：docs/现状文档/运行态与教材预览验收.md；运行界面localhost:3000。
+
+
+## 扫描教材本地 OCR 选型（2026-10-05，OPT-063）
+
+- [x] 原资料4文件12页统一1800px PNG，PaddleOCR PPStructureV3/MinerU basic ONNX/Docling指定CPU配置全部成功；36个源页复核锚点、12个同行关系统一重评分。
+- [x] 评测工具惰性依赖/失败可见/无付费或数据库调用；--score-only无需重新推理，gold hash可追溯；Paddle聚合重复修复回归。
+- [x] 新增9条测试，项目venv非集成521通过/21排除，修改文件格式/lint通过；原服务ready、旧业务计数保留，知识表0。
+- [x] 实测报告和RAG现状/计划/风险同步；条件选型优先MinerU，Docling章节阅读顺序/PaddleGPU未测/教材源错误/词边界盲区明确记录。
+- [x] OCR-1/2（OPT-064）：可复用本地解析adapter/逐页路由、结构桥接/父子切块联测及显式CLI已验收；不是网页自动OCR/生产部署。
+- [ ] OCR-3/4：后台页级批次/大文件可控导入/失败重试续跑，原页预览及跨页表格/词边界/源错误审核。
+- [ ] 后续真实教材embedding与知识点召回/引用金标、GPU与规模性能、许可证分发审查；未付费、未导入不标完成。
+- 报告：`docs\现状文档\OCR与文档解析选型实测.md`；私有样本/全文/模型保留于 `.local-eval/ocr-2026-10-05`，不做未经确认清场。
+
+
+## MinerU 本地解析接入 OCR-1/2（2026-10-05，OPT-064）
+
+- [x] 本地4.x V1 adapter/结构JSON校验、有界超时/失败/跨源/响应上限、无云回退。
+- [x] 文字/扫描/空页/混合/扫描文字层/Form图像路由，原文件hash/物理页/引擎bbox/native快照/观测；文字页不调用OCR。
+- [x] rowspan/colspan逻辑grid和源span/行映射、标题/章节页眉/脚注、答案角色与不连续页上下文；现有child/parent预览复用、partial入库前拒绝。
+- [x] 真实原PDF3页本地API+最终native重放、12项表格同行关系、12页缓存结构重放；新增52单测，全量594通过/非集成573通过、限定coverage89.15%、mypy/格式/lint/Compose通过。
+- [x] CLI可处理大文件中的少量页，无embedding/业务DB；原数据和服务不变，helper已关闭。当前主容器未重建、网页OCR仍不可用。
+- [x] OCR-3（OPT-065）：上述后台API/独立队列/租约检查点/受控上传已部署原环境，真实大文件/取消续跑/缓存通过；网页交互尚待OCR-4。
+- [ ] OCR-4：网页原页与结构预览/确认、跨页续表/题组/词边界/源疑点；随后真实embedding与召回/引用金标、GPU与许可审查。
+- 报告：`docs\现状文档\MinerU-OCR接入与验收.md`。普通HTTP入口仍不自动OCR，不把选页预览成功算作已入库。
+
+
+## OCR-3 后台解析与大文件（2026-10-05，OPT-065）
+
+- [x] 原主库/CI备份与实际新增表迁移rag_ocr_jobs，旧业务/知识记录不变。
+- [x] job/page持久化、scope/字节/路径校验、先提交后投递、周期补发/过期租约回收、每消息一页、旧owner fencing。
+- [x] 独立ocr-worker并发1与beat，API/worker共享spool、真实版本/代码/tenant/hash缓存、取消/保留成功页/损坏恢复/续跑。
+- [x] 本机已缓存MinerU服务隐藏启动/Bearer鉴权，Docker host访问；新后台上传代理129MiB/文件128MiB，旧10MiB入口不变。
+- [x] 最新镜像部署、真实名词页取消续跑、87.3MB动词PDF代理202→completed/缓存命中；3个OCR任务/4个检查点有意保留，无knowledge/embedding。
+- [x] 新增38项，632全量通过/含24真实集成，限定92.20% coverage、mypy/格式/lint/Compose/前端build/nginx-t/ready通过。
+- [x] OCR-4（OPT-066）：上述工作台/原页与块/人工排除/审核付费门控已部署；完整8页36真实向量+2parent、8条页级检索与真实界面通过。复杂全量/事实金标仍待。
+- [ ] 长期存储运营/完整故障演练/所有复杂布局与跨页表格/题组、GPU性能与许可分发仍待。
+- 报告：`docs\现状文档\OCR-3后台任务与大文件验收.md`。
+
+
+## OCR-4 与真实embedding（2026-10-05，OPT-066）
+
+- [x] 现有ERP知识库接OCR工作台，文件/路径提交、进度/取消续跑、原页PNG、识别表格/定位、告警/问题块排除恢复、知识点与备注。
+- [x] 审核/hash/config/费用/partial gate，稳定ID与知识+任务原子事务，失联付费不自动重试；source_reviewed不冒充事实认证。
+- [x] 原主库/CI新head rag_ocr_review，备份/实际镜像部署、PDFium+Pillow容器真验、API/proxy ready。
+- [x] 完整8页原并列句教材真实36×1024非零向量+2parent；1真实文档/38chunk保留；工作台审核→indexed→检索引用闭环，无pageerror。
+- [x] 真实14次embedding/3642报告tokens；模型价格/实际账单未核验，trace仅配置估算，不报真实币种金额。
+- [x] 单文档8条页级Hit@3=8/8/MRR1.0、canonical snapshot hashes/英文知识点alias scope通过，非全库事实质量证明。
+- [x] 新增17项，649全量通过/25真实集成，限定89.96%coverage、mypy/格式/lint/前端build通过；原task/content/user不变。
+- [ ] 其余教材批次及复杂跨页/题组/源冲突、全库检索金标、真实生成/judge/人工驳回率、批量/legacy重建与长期存储、许可/GPU验证仍待；OCR单文档重建/撤除已在OPT-067完成。
+- 报告：`docs\现状文档\OCR-4工作台与真实RAG验收.md`。
+
+
+## RAG P2：索引运营与多文档评测（2026-10-05，OPT-067）
+
+- [x] G1有限范围：OCR来源同ID显式重建/expected revision、全向量校验后原子替换、失败保留旧索引、未知付费不自动重试。
+- [x] 文档列表/资料撤除API及工作台、partial/stale/removed状态；禁止直接删parent，防删leaf后parent回注旧文，修复邻接链、并发/tenant校验及级联删除计数。
+- [x] 旧审核标签/备注/排除恢复；checkbox费用声明不继承。名词源疑点block:15保留排除，不私自改事实。
+- [x] 真实名词页2/16共12leaf、动词页1共4leaf；并列句完整8页同ID v1→v2/36leaf+2parent。主库3doc/54chunk=52真实向量+2parent，原业务计数不变。
+- [x] G4有限范围：冻结18条多PDF gold与rag_eval.py；真实hybrid/top3最终页Hit17/18、MRR0.916667、去重NDCG0.923941、hash全通过；连系动词无scope漏召回/verbs对照保留，不报100%。
+- [x] 本轮26次真实embedding、5146报告tokens；配置fallback估算0.010292/币种账单未验，无真实chat/judge/rerank。
+- [x] 新增10条回归，最终659全量通过/26真实集成；6模块scoped strict mypy、修改Python格式/lint、TS/Vite/原镜像部署/ready/nginx/只读UI通过。本轮未重新认证全app覆盖率门槛。
+- [x] 原无scope连系动词漏召回诊断及统一bigram策略A/B（OPT-068），原18条18命中；原失败保留历史。
+- [ ] 跨页续例top5遗漏、多教材冲突/四类格式/复杂表格题组完整gold、真实生成事实质量。
+- [ ] G1剩余：单租户有界批次/legacy与非OCR重建/历史回滚/长期存储；parser变化重OCR、规模性能/GPU/全面故障演练/分发许可。
+- 报告：`docs\现状文档\RAG-P2索引运营与多文档评测.md`；私有材料留.local-eval，不自动撤除真实资料或清场。
+
+
+## RAG P2：中文召回与结构化来源评测（2026-10-05，OPT-068）
+
+- [x] 诊断正确动词表在vector第4、keyword0；有界中文bigram补召回，legacy回退/长问题采样/32项(2–64)配置，原scope/FTS/RRF不变；API/各worker/示例环境同源。
+- [x] G3候选document/page/table身份与terms、不输出额外正文/密钥，rerank按实际ranked输出；v3页/精确块/同行/全部来源和逐单位失败，未知gold拒绝/run Trace限长/语料向量指纹漂移exit2。
+- [x] 原18条同gold真实A/B17→18、新16条实现前冻结精确块14→16/上下文齐备13→16；表格10case/13tuple两策略均通过，不称表格准确率提高。
+- [x] 两跨页探针检索前冻结：legacy0/2、bigram1/2上下文齐备；保留or选择/否则例句页3第11未进top5，修复partial命中被诊断为无失败的评测缺陷，原始报告保留/零付费离线重算。
+- [x] 实际前端无scope两查询命中正确表，bigram/32/aliases默认/rerankoff，pageerror0；92真实embedding/944报告tokens，配置估算0.001888/币种账单未验，无chat/judge/rerank。
+- [x] 新增23非集成+2真实PG，最终684通过/28集成；4模块scoped strict mypy、修改格式/lint、Compose透传/部署/ready通过；语料3doc/52向量+2parent及原业务计数不变/head不变。
+- [x] 全app80%本地门槛在OPT-069达到80.57%，保留原阈值/准确app分母；config既有3处strict注解问题已修复，13模块检查不替代全appstrict或远端CI。
+- [ ] 跨页复合问题的通用排序/上下文选择对照；独立专家/真实多教材冲突/四类格式完整集；单租户批次/legacy重建、存储/GPU/规模与真实生成事实质量。
+- 报告：`docs\现状文档\RAG-P2中文召回修复与结构评测.md`。私有全文/日志/截图保留.local-eval，不自动清场或提交。
+
+
+## RAG跨页/跨段/跨表/跨章方案（2026-10-05，STR-0）
+
+- [x] STR-0：13份官方文档/论文/源码线索核验，策略比较、源/结构/索引/返回三层窗口、四类边界与负例、成本/许可/模型接口边界明确；这是设计，不是新代码发布。
+- [x] 原主库只读拓扑审计：页2规则与页3续例直接邻接，但page/section不兼容；block:30 native header误提升heading使section丢失。本轮源/向量不变、embedding和DB写入0，未重跑684回归。
+- [x] STR-1（OPT-069）：审核后blocks的文档级结构、重复页眉/真实标题区分、跨连续页小节继承、缺页/排除屏障、source_segments/逻辑unit关系纯函数和免费preview。
+- [x] STR-2（OPT-069）：活动leaf上的accepted关系扩展/小块召回大块返回，seed与context预算/实际segment引用、API/前端/生成provenance/评测协议和旧路径回退；不能从原document正文回注已删内容。
+- [x] STR-3（OPT-070）：正文-表-表注、逻辑续表/跨页cell/合并cell及审核；先复用页检查点，必要才2/3页局部重OCR，版本/缓存/全局页映射明确。
+- [x] STR-4（OPT-070）：跨章explicit reference/概念导航和复合问题多证据覆盖，冲突来源分开；LLM子问题为后续有界选配，不自动扩大scope。
+- [x] STR-5（OPT-071）：结构感知leaf/parent与多页source_segments、原生/OCR显式layout及选择性原子重建已落地；并列句v2→v3。默认legacy；44→43排序回归另列待修，不默认全目录重嵌入。
+- [x] STR-6实验代码（OPT-071）：独立CLI/语义split/确定性及选配抽取式LLM上下文/真实token-pool本地适配器；三种真实embedding小实验完成且无收益，不接生产默认。
+- [ ] STR-6真实效果补验：Late真实本地token权重forward、LLM-context真实chat/来源及费用兼容；现有Late dry-run/mock不等于效果通过。
+- [ ] 拟建四类每类至少10条跨边界正/负例（40+不是已完成集），兼顾context_complete、FalseJoin/误扩率、provenance/表行映射、删除/权限0绕过、预算和性能。全app80%已在OPT-069通过，四类完整集与批量事实质量门槛仍待。
+- 方案：`docs\现状文档\RAG跨边界知识组织与检索优化方案.md`。STR-1起实际实现依仓库规范追加OPT记录并回归；本轮纯文档设计不占代码OPT编号，私有审计保留.local-eval。
+
+
+## STR-1/STR-2完整落地（OPT-069，2026-10-05 UTC）
+
+- [x] 纯结构重建/版本policy/重复页眉与章编号别名、真实新章/缺页/排除/独立题目答案/工作表屏障，未知邻接proposed而非自动合并；63新非集成正反例覆盖。
+- [x] 原文件/OCR免费结构预览、决定恢复/重置、计划hash费用前绑定；活动资料免费结构审核/角色tenant/expected revision/源签名与stale门控。
+- [x] 活动leaf accepted关系扩展/主要单元选择/有界组件去重，seed优先/表头表行保护/多页分段hash与真实offset/bbox精度；不从原document补已删文字、不自动重嵌入。
+- [x] v2 bundle/实际segments+v1回退、API/front/defaultrelation、生成参数副本/Trace/content provenance/人工审核逐段快照、v4实际引用评分同步。
+- [x] 真PG新增4条/全量751(32集成)、app80.57%本地80%门槛、13模块strict mypy/21修改文件格式lint/TSVite/原镜像ready/nginx通过。
+- [x] 36gold旧35/36→新36/36、新8未调参6/8→7/8；已带原页2+3续例，跨小节联合问题失败原样保留，不改gold或强制top_k。
+- [x] 实际UI免费审核/旧策略切换/源段展示、名词block:15排除保留/pageerror0；source/leaf/indexrev/原业务不变，仅结构meta review rev2。
+- [x] 181真实embedding/2037报告tokens，配置fallback估算0.004074/币种账单未验，无chat/judge/rerank/newOCR/index重嵌入。
+- [x] STR-3续表/cell审核/多页复核和STR-4多证据在OPT-070交付；原for/because+so联合问题修复。
+- [x] STR-5/STR-6实验代码在OPT-071后续交付（见末尾）；原始阶段未实施说明保留为历史。
+- [ ] 真实跨页表格新教材金标、全库事实质量与长期规模运营仍待；Late/LLM真实效果另列待验。
+- 报告：`docs\现状文档\RAG-STR1-STR2落地与验收.md`；私有现场.local-eval/str12有意保留，不自动提交或清场。
+
+
+## STR-3/STR-4完整落地（OPT-070；记录2026-10-05 UTC）
+
+- [x] 逻辑续表页序/几何frame/列数/确认表头/表号/原生hint多证据，未知proposed；逐cell列范围/spans审核、表先确认、不匹配rowspan保留unresolved、不自动整行merge。
+- [x] 派生logical table header去重/每cell原来源parts和view hash，所有正文来自已送活动leaf；v5 required_logical_rows重算原cell内容防假ID/值；预算未送view不给支持分。
+- [x] 新OcrBoundaryJob/独立队列任务+真实migration rag_str34_boundary；原主/CI已备份，2/3页连续范围/协议映射、缓存版本代码hash、fencing/取消续跑/租约回收/次数封顶、result鉴权hash源版本，原成功页/索引不写回。
+- [x] 真实原并列句页2/3与2/3/4本地MinerU4.0.10完成，前端声明门控/result/结构页可看/pageerror0；窗口无表格，不以此认证真实续表效果。
+- [x] 同文档明确章节引用有向定位、缺目标/多义unresolved、scope不能越界；rules互补问题/原query/alias概念导航、coverage seeds与公平预算、LLM选配.st/schema/Trace失败回规则，不默认chat。
+- [x] 原36+旧8gold同指纹off/rules对照：36始终全齐备、8从7→8；原for/because+so两小节失败实修，无新独立专家集/全库正确率声明。
+- [x] 新增56单测+4真PG，最终811/36集成、app7448/9124=81.63%/cov-fail-under80通过，20修改文件格式lint/14模块strict mypy/TSVite/原镜像ready/nginx。
+- [x] 178真实embedding/2140 reported tokens，fallback估算0.00428/币种账单未核验，无chat/judge/rerank/重嵌入；Doc3/52leaf向量+2parent及原业务不变，新增2复核任务有意保留。
+- [x] STR-5/STR-6实验代码已在OPT-071交付；详见下方最新记录。
+- [ ] 更多真实跨页表/cell/合并cell与双盲事实集、全格式压力/恢复/GPU/存储治理/真实生成人工驳回率。旧独立8本轮为回归不继续称新盲测。
+- 报告：`docs\现状文档\RAG-STR3-STR4落地与验收.md`；私有备份/原始全文/截图.local-eval/str34不提交、不自动清场。
+
+
+## STR-5结构切分与STR-6独立实验（OPT-071；2026-10-06 Asia/Shanghai）
+
+- [x] `rag-chunker-structure-v1`跨页/段落逻辑leaf，保护新章/缺页/排除/题组/表格/代码；表行超预算显式告警。父块段映射/overlap去重，不读回页眉。
+- [x] `source_segments`源/leaf坐标及hash逐段校验，非连续正文顶层range=None、envelope只导航；eligible正文覆盖分母/导航排除公开，不冒充整源每字符都嵌入。
+- [x] 原生upload/免费preview和OCRplan/approval/worker的layout透传与hash门控；失效计划付费前拒绝、原子失败保旧，前端选项与计划同步。
+- [x] 原环境/备份/真实显式重建：并列句同ID v2→v3，54leaf+1parent/2跨页leaf；其他来源未重嵌入，主库3资料/70非零1024维向量+1parent。原源/hash及task3/content4/user1、OCRjob4/page12/boundaryjob2未改，head仍rag_str34_boundary。
+- [x] 重建前冻结旧chunk gold到immutable physical source_block_ids，query/pages/terms不改；v6评测诊断身份与实际交付分开。真实44题来源齐备44→43，leaf/向量变化不称同向量A/B；误归召回的旧诊断离线重评分修正为context_or_top_k，零额外调用。
+- [x] STR-6 CLI默认dry-run/显式费用/输入与句数/token预算、同scope读源、仅报告和Trace不改索引；模型/源/gold/输入hash可追踪。
+- [x] 语义单prose实验/确定性上下文prefix/选配严格抽取式LLM独立prompt/schema/timeout/Trace；Late显式local-only safetensors/fast offset模型适配、token先forward后按精确源段pool，不模拟云API最终向量。
+- [x] 自编prose同源3探针真实embedding：structure2chunk/2批、semantic4chunk/8句/3批、contextual2chunk/2批，均3/3来源支持，**无已测改善**；Late仅dry-run。
+- [x] 最新全量871通过（新增57单元+3真PG；共39integration），app82.2946%门槛通过；26文件black/isort/flake8、18源文件scoped strict（follow-imports=silent）和前端tsc/Vite通过。展开依赖strict仍185处/25文件，不宣称全app通过。原环境部署/实际网页重建和最终查询/免费预览无pageerror。
+- [x] 本轮103真实embedding/5532 reported tokens，fallback估算0.011064，币种及账单未核验；无真实chat/judge/rerank、新OCR或全库重嵌入。
+- [x] `holdout-or-consequence`当前来源缺口已按用户预算决策在OPT-072交付：默认Top-5/可选8实际返回正确例句，44/44来源齐备。vector1/keyword13/RRF4未变，Top-3限制仍可复现；不称排序算法修复，默认layout保持legacy。
+- [ ] Late真实本地token模型质量/延迟/长文能力、LLM上下文真实兼容/来源/费用；无真实模型forward不得标效果完成。
+- [ ] 四类每类至少10条的新完整正反例/专家事实金标、跨页table/cell、全格式负载恢复及真实批量生成事实正确性。
+- 验收：`docs\现状文档\RAG-STR5-STR6落地与验收.md`；私有证据`.local-eval/str56`保留，不自动清库/提交/清场。
+
+
+## RAG返回与上下文预算（OPT-072；2026-10-06）
+
+- [x] 按用户要求默认Top-5、网页可选Top-8；Python/env.example/Compose及本机私有env同源，省略API参数时请求期继承当前配置，不冻结路由导入默认。生成前上下文也继承默认5。
+- [x] 按用户后续反馈将应用字符预算8192→32768；不是模型token窗口，不改模型名/档案。显式字节保护、来源/tenant/去重/segment/member/hop限制不放宽。网页显示实际请求/候选池/预算，reload默认5。
+- [x] v7 evaluator显式`--top-k`控制运行/评分预算，原gold bytes/query/source/pages/terms不改；历史41×top3+3×top5与统一3/5/8及最终32K结果分开报告。
+- [x] 同源/同向量/同lane及融合rank-score：统一top3=43/44，top5/top8在8192与最终32768预算均44/44来源齐备；正确Hurry up块仍融合4。扩大返回预算补回，不报算法优化。原44集最大4230字符，不能报扩大字符预算的质量收益。
+- [x] 895完整回归通过（新增21单元+3真PG；共42integration），app82.3050%门禁；8选定文件black/isort/flake8、4源文件scoped strict和前端构建通过，非全app strict/远端CI认证。长正文单测/PG验证超过8192且不越32768，显式字节保护仍生效。
+- [x] 原环境部署/最终网页API默认参数省略、Top-8选择/正确来源/预算诊断无pageerror；head仍rag_str34_boundary，主库3doc/70向量+1parent、业务及OCR计数不变，无重嵌入/OCR/迁移。
+- [x] 本轮268真实embedding/3262reported tokens，fallback估算0.006524/币种账单未核验，无真实chat/judge/rerank/Late forward。当前模型档案仍deepseek-v4-flash；官方窗口 metadata核对不等于转发端点实际1M请求验证。
+- [ ] Late真实本地token模型、LLM-context真实chat、完整新教材四类专家事实/表格cell金标、长上下文噪声与真实生成成本/质量、规模稳定性继续单列待验。当前原金标为回归，不冒充新盲测。
+- 验收：`docs\现状文档\RAG-Top5-Top8与上下文预算验收.md`；私有证据`.local-eval/str57`保留，不自动提交/清库/清场。
+
+
+## 主RAG链路切换与真实生成验收（OPT-073；2026-10-06）
+
+- [x] 默认链路切换：新入库默认`RAG_CHUNK_LAYOUT=structure`、`RAG_CONTEXT_MODE=relation`；Top-5默认/Top-8可选/32768字符；legacy显式回退保留，读取旧OCR索引优先使用其保存layout。
+- [x] 存量选择性迁移：名词同ID v1→v2，23leaf，仍第2/16页且`block:15`排除；动词同ID v1→v2，4leaf，仍第1页；并列句v3不动。3资料/82chunk=81非零leaf+1parent，源hash未变，无OCR/全书扩展。
+- [x] 三内置题型version2配置`rag.mode=required`+`require_human_verification=true`；无来源反例chat调用0并以`RAG_CONTEXT_REQUIRED`失败；正向来源实际注入generate Trace。
+- [x] 真实小批量：single_choice2/cloze2/reading2完成生成与自动QC，全部`pending_qc`；QC 87.70～91.75；1次JSON失败重试后成功；无人工通过/发布。
+- [x] 人工质检页显示真实segment/page/block，segment ID唯一；未勾选来源核验时通过按钮禁用，后端核验返回409；pending内容发布返回409；预览去除重复选项标签但不改payload。
+- [x] 开发复核发现完形样本正确项集中A/潜在多解，自动QC分不是发布许可；新增题型质量回归/人工金标待办。
+- [x] 911完整回归通过（42真PG），app82.34%；前端构建、部署、真实默认预览/迁移/UI质检通过。
+- [x] 118 Trace：99 embedding、7 generate（含1失败重试）、12 qc；47938 prompt+37200 completion tokens，估算0.170276未核账；无真实rerank/Late/LLM-context/OCR。
+- [ ] 6条人工决定通过/驳回/修改；每题型扩至20～30条真实金标，统计人工驳回率、来源一致性、答案唯一性、选项同质性、成本/延迟。
+- [ ] 完形候选质量规则/结构校验：避免正确项偏置、潜在多解、题干与选项不一致；不能仅靠LLM QC分数。
+- [ ] Late真实模型、LLM context真实调用、专家table/cell金标、长上下文噪声与无人值守发布门槛继续单列。
+- 验收：`docs\现状文档\RAG-主链路切换与真实生成验收.md`；证据`.local-eval/str58`保留，不自动清场/提交。
+
+
+## 维护者文档体系（2026-10-06；纯文档，不新增OPT编号）
+
+- [x] 在新目录`docs/现状文档2`完成可独立阅读的主文档：项目定位/全景架构/两条业务链路/页面API/数据状态/核心机制/部署维护/验证风险/扩展入口/源码与证据索引；本轮只读核对源码、运行态与测试收集，未重新生成或改业务代码。
+- [x] 标明实际45条integration、866非集成的收集口径，纠正历史摘要42条沿用计数；说明模型档案同模型、样本尚未自动few-shot、状态命名债、Trace截断、Outbox补偿及网页数量口径静态风险。
+- [x] 数量口径风险已在OPT-074修复：全链外层N/单item1、多输出拒绝；真页面拦截和真PG五项流程回归通过。
+- [x] OPT-074完成Outbox父/子周期投递、fencing/恢复、显式死信目标投递、Redis命名卷/AOF与SQL消息丢失对账。
+- [ ] 状态常量/worker/UI词汇统一、并发请求去重和题型质量仍待，不归入本次前三项修复。
+- [x] 专题：[01-内容生成与质量闭环](现状文档2/01-内容生成与质量闭环.md)；源码、契约、失败路径、维护/验证入口已展开，本轮纯文档不改业务。
+- [x] 专题：[02-文档处理与RAG](现状文档2/02-文档处理与RAG.md)；源码、契约、失败路径、维护/验证入口已展开，本轮纯文档不改业务。
+- [x] 专题：[03-数据模型与状态机](现状文档2/03-数据模型与状态机.md)；源码、契约、失败路径、维护/验证入口已展开，本轮纯文档不改业务。
+- [x] 专题：[04-任务执行与可靠性](现状文档2/04-任务执行与可靠性.md)；源码、契约、失败路径、维护/验证入口已展开，本轮纯文档不改业务。
+- [x] 专题：[05-部署运维与验证](现状文档2/05-部署运维与验证.md)；源码、契约、失败路径、维护/验证入口已展开，本轮纯文档不改业务。
+- 主文档：[英语内容生产工作台：当前实现与系统架构](现状文档2/英语内容生产工作台-当前实现与系统架构.md)。旧现状/验收和私有证据保留，不自动清场。
+
+- [x] 五专题与主文档互链、绝对源码/证据链接和Markdown结构校验；原报告与私有证据保留，不新增OPT，不跑真实模型或变更数据。
+
+
+### 历史与证据层（2026-10-06；纯文档，不新增OPT）
+
+- [x] [历史与证据索引](现状文档2/历史与证据/00-历史与证据索引.md)：按材料类型/阶段/问题导航，区分公开说明、受限底稿和未定位原始日志。
+- [x] [阶段演进与决策记录](现状文档2/历史与证据/01-阶段演进与决策记录.md)：OPT001～073原日期/源行索引、关键选择与后续变化；UTC/本机跨日日期并列，不倒签历史ADR。
+- [x] [验收矩阵与失败追踪](现状文档2/历史与证据/02-验收矩阵与失败追踪.md)：限定/app coverage、真实PG/mock/provider/人工范围分开；保留44→43、Top-K预算补回、JSON重试、坏题和计数更正。
+- [x] 证据资产清单（本机私有证据，不随公开仓库分发）：341原位文件（41仓库资料、300受限本机证据）及73OPT章节，路径/大小/SHA-256；未复制正文、未移动/删除旧文件、未重跑模型或业务。
+- [x] 主文档/运维专题/README已链接历史层；仅文件可用性/hash核对不等于重新验收。数量/Outbox/Redis/状态/专家质量等风险仍未修复。
+- [x] 历史层机械校验：73OPT源行、341文件SHA-256、现状文档2共9篇Markdown/388个绝对本地链接；交叉核对既有5阶段gate和44→43/Top-K/实验底稿，不重执行测试。
+
+
+## 10月6日紧急优化1—2—3（OPT-074）
+
+- [x] 顺序落地数量N/1与多对象输出防丢；父/子持久意图、PG有界并发领取/lease fencing、周期maintenance与显式死信投递；Redis无损命名卷迁移/AOF everysec及消息丢失SQL对账。
+- [x] 955全量/50真PG、app82.6211%，21文件lint/4源scoped strict，前端构建、页面拦截、周期worker/Redis重启/专用消息丢失演练通过；无真实模型费用、历史业务计数保持。
+- [x] main/CI迁移head opt074_delivery_leases，原卷/RDB与DB备份保留、未清真实队列、未重派历史失败；现役文档已同步。
+- [ ] 更大真实provider批次质量/故障全覆盖、并发请求防重、状态词与题型确定性/语义校验另项推进。
+- 验收：[1—2—3落地](现状文档/10-6优化1-2-3落地与验收.md)；原风险文档与历史hash保留，不自动commit/清场。
+
+
+### 10-6优化第四点（OPT-075，2026-10-06）
+
+- [x] 三题型v3 Schema＋配置驱动四选项/字母答案/选项非空不重复、完形索引与空数；Prompt/Skill区分篇数和空数。
+- [x] 生成有限重试/反馈/Trace失败费用；Graph兜底与有界invalid改版，QC缓存/落库/直接人工恢复不绕过。
+- [x] 人工通过/发布复查；独立JSONB诊断和API只读现役诊断、前端告警/硬失败按钮门禁，旧题不自动改写。
+- [x] 新增89非集成＋5真PG测试，1049全量/app83.1018% gate；前端build和5实页场景；现有环境迁移/增量部署/源码hash核对。
+- [x] 原6样本只读诊断、真实失败结构复现＋合成语义待核验反例；主库业务计数/旧正文状态分数指纹不变，0真实模型调用。
+- [ ] 6条语义人工裁决、每题型20～30条专家金标及人工驳回率（真实待办，不能由格式通过或模型高分替代）。
+- [ ] 镜像源403恢复后验证常规全新依赖安装构建；当前是复用现有依赖层的现役增量部署。
+- 验收：[10-6优化第四点落地与验收](现状文档/10-6优化第四点落地与验收.md)；证据`.local-eval/opt075`保留，不自动清场。
+
+
+### 第二轮P1与模型设置（OPT-076，2026-10-06）
+- [x] 共享状态映射/父聚合、未知Graph失败关闭、待人工不当终态/不重派、取消不复活；SQL/API状态契约与前端0～1进度正确展示。
+- [x] 活动request_hash SQL局部唯一，task＋Outbox事务，6真PG连接竞争只1成功，终态可重做、旧NULL兼容；重放同hash活动目标保护。
+- [x] 管理员模型设置页：自定义OpenAI兼容Provider/模型、按题型生成和Judge覆盖、ENV兼容；配置独立持久化不被YAML同步抹掉。
+- [x] 专用Fernet key/加密凭据只写不读，权限、审计/Trace安全身份、错误不回显；真实API/SDK MockTransport与UI拦截验证。
+- [x] 1124全量（1065非集成＋59真PG；新增71＋4），app83.8342% gate，23格式/lint、3源码scoped strict、frontend build；现有环境迁移/部署/key与码hash一致。
+- [ ] 用户配置真实独立模型/Judge候选后的同金标效果/成本比较（当前三档未自动替换）。
+- [ ] 第三批：受限完整Trace快照、样本few-shot；专家语义裁决仍真实待办，不由自动高分替代。
+- 验收：[第二轮与模型设置](现状文档/10-6优化第二轮与模型设置落地验收.md)，受限证据`.local-eval/opt076`保留，无自动commit/清场。
+
+
+### 第三轮工程能力（OPT-077，2026-10-06）
+- [x] 有界加密完整脱敏chat快照＋摘要分离，调用失败也封存，独立key/额度/TTL/scope/no-store/成功访问审计；旧Prompt不补造。
+- [x] 安全few-shot实际生成接入，整例、scope/human/current source/hash/规则/精确标签/目标批次保护，reserved参数防伪，输出逐字复制拒绝；样本页用途切换。
+- [x] 已配置模型plan与显式A/B CLI，共享输入、交替顺序、失败/费用/来源成本记录，不自动切模型/入库/伪造专家结论。
+- [x] 1154全量（1091非集成/63真PG；新增26＋4），app84.0498%门槛通过，24格式/lint/3 scoped strict/front build/实页；现有环境迁移/开关/key/码一致。
+- [x] 原计数/旧正文状态分数不变，当前model plan同实际模型未执行；准备3比较输入与10candidate/零人工标注。
+- [ ] 真实不同候选配置后的收费A/B及专家裁决；当前Provider/样本库仍0，不能拿工程通过当模型/示例收益。
+- [ ] 人工双标、争议仲裁、人工驳回率与few-shot真实收益，不自动代签human_attested。
+- 验收：[第三轮](现状文档/10-6优化第三轮落地与验收.md)，受限证据`.local-eval/opt077`保留。
+
+
+### 前端UI/UX首轮（OPT-078，2026-10-06）
+- [x] 单色工作台外壳/4组权限导航/当前位置/用户角色、手机抽屉/焦点/Escape；token变更/401与角色落点反馈。
+- [x] 登录与生成页重构：schema字段wire不变，中文/帮助/任务摘要/inline校验/加载/防重复，N/1契约保持。
+- [x] 任务页状态/百分比/当前页过滤/空态/骨架/活动5秒刷新暂停，接已有合作式取消确认，不假标终态；任务dialog键盘/焦点/滚动。
+- [x] tsc/Vite、14实页组/12移动路/0pageerror；请求写入mock，后端1091 passed/63 PG skipped。只frontend部署，原库和模型不变。
+- [ ] 按真实使用反馈进一步优化质检、内容库、知识/OCR、模型设置等复杂业务流程；首轮不宣称全页面深度重做或大规模性能认证。
+- 报告：[UIUX首轮](现状文档/10-6前端UIUX首轮优化与验收.md)；受限`.local-eval/opt078`保留，无自动commit/清场。
+
+
+### 公开发布与远端整合（OPT-079，2026-10-06）
+- [x] 公开候选排除env/独立密钥/备份/登录态/教材blobs与截图/私有资产清单，文档路径去个人化；真实凭据精确匹配与Gitleaks。
+- [x] 保留远端4提交，现役迁移与m3_04_task_user_id合流；旧契约测试迁移，不恢复退役接口/权限或泄露异常正文。
+- [x] 1173全量（1110非集成/63真PG）、app92.8945%发布口径、跟踪源码格式/lint/前端build；主库未迁移或部署。
+- [ ] GitHub远端推送后确认提交和CI状态；公开文档不包含本机完整证据。
+- [公开发布说明](公开发布-2026-10-06.md)，私有审计底稿留ignored目录。

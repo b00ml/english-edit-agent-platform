@@ -5,9 +5,11 @@ import os
 from typing import List
 
 import yaml
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.audit import record_config_change
+from app.engine.content_validation import load_content_rules
 from app.models import QuestionTemplate
 from app.versioning import template_hashes, template_snapshot
 
@@ -78,6 +80,22 @@ def _validate_template(data: dict) -> List[str]:
     run_config = data["run_config"]
     if not isinstance(run_config, dict) or "model_profile" not in run_config:
         errors.append("run_config 必须含 model_profile 字段")
+
+    if isinstance(run_config, dict):
+        try:
+            load_content_rules(run_config)
+        except ValidationError as exc:
+            errors.append(f"content_validation 配置非法: {exc}")
+
+    fewshot = run_config.get("fewshot", {}) if isinstance(run_config, dict) else {}
+    if not isinstance(fewshot, dict) or set(fewshot) - {"enabled", "max_examples", "max_chars"}:
+        errors.append("fewshot 配置格式不合法")
+    elif ("enabled" in fewshot and type(fewshot["enabled"]) is not bool) or any(
+        type(fewshot[key]) is not int or not low <= fewshot[key] <= high
+        for key, low, high in (("max_examples", 0, 5), ("max_chars", 256, 32768))
+        if key in fewshot
+    ):
+        errors.append("fewshot enabled/数量/字符预算不合法")
 
     # status 可选，若提供则必须在合法集合内
     if "status" in data and data["status"] not in _VALID_STATUS:

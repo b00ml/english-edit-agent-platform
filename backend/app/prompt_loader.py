@@ -38,6 +38,9 @@ def build_system_prompt(template: Any, params: Dict[str, Any], skill_md: str = "
 def build_user_prompt(template: Any, params: Dict[str, Any]) -> str:
     """构造 user prompt = user .st 渲染 + 可选 RAG 参考资料。"""
     user = render(load_prompt(template.gen_prompt["user"]), params)
+    examples = params.get("fewshot_context")
+    if examples:
+        user += "\n\n" + render(load_prompt("fewshot-instruction.st"), {"examples": examples})
     rag_context = params.get("rag_context")
     if rag_context:
         user = f"{user}\n\n参考资料（务必参考以增强内容的事实依据）：\n{rag_context}"

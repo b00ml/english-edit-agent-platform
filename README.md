@@ -1,5 +1,23 @@
 # 英语教研 AI 内容生成平台 2.0
 
+维护者主文档见 [当前实现与系统架构](docs/现状文档2/英语内容生产工作台-当前实现与系统架构.md)：主文档及五份专题按业务流程解释架构、数据/状态、RAG、生成质量、可靠性与部署维护。原现状文档及验收报告作为阶段证据保留。 历史追溯见 [历史与证据索引](docs/现状文档2/历史与证据/00-历史与证据索引.md)，包含演进、验收矩阵、失败记录和原位文件hash清单。
+
+当前代码、质量评测、任务恢复及已知风险见 [项目现状文档](docs/现状文档/系统现状.md)。
+
+最新OPT-074（2026-10-06）：批次N/单item1、父/子Outbox租约与周期恢复、Redis命名卷+AOF everysec已落地；955回归/50真PG/app82.62%，原4236 Redis值保留、原业务计数不变，无真实模型调用。见 [紧急1—2—3验收](docs/现状文档/10-6优化1-2-3落地与验收.md)。
+
+上轮OPT-073（2026-10-06）：structure/relation已成为主RAG链路；名词/动词存量已选择性迁移，三内置题型要求来源并人工核验。6条真实生成均保留待质检，发现完形质量风险不自动发布；见 [主链路切换与真实生成验收](docs/现状文档/RAG-主链路切换与真实生成验收.md)。
+
+上轮OPT-072（2026-10-06）：默认RAG返回Top-5/网页可选Top-8，总上下文预算32768字符；候选池30、融合和scope不变。最终两档真实44题均来源齐备，统一Top-3仍43/44，不冒充排序算法优化；895回归/42真PG/app82.31%，原环境已部署且无语料重嵌入。见 [Top-5/8与上下文预算验收](docs/现状文档/RAG-Top5-Top8与上下文预算验收.md)。
+
+上轮OPT-071（2026-10-06）：STR-5结构化跨页leaf/逐段来源/显式选择性重建与STR-6独立实验代码已部署；并列句同ID v2→v3，主库3资料/70真实leaf向量+1parent。871回归/39真PG、app82.29%；真实44题来源齐备44→43，已知RRF/top3回归保留，默认layout仍legacy、不全库推广。语义/确定性上下文真实小实验无增益，Late真实模型及LLM上下文效果仍待；见 [STR-5/6验收与限制](docs/现状文档/RAG-STR5-STR6落地与验收.md)。
+
+上一阶段OPT-070：STR-3逻辑表格/局部2或3页OCR复核、STR-4跨章引用/多问题证据检索已部署；811回归/36真PG、app81.63%，原36+8有限gold来源齐备。未重嵌入，复核不自动改原源，真实跨页表格全量质量仍待；见 [STR-3/4验收](docs/现状文档/RAG-STR3-STR4落地与验收.md)。
+
+上一阶段OPT-069：STR-1/2结构重建与关系感知small-to-big已部署，原36条齐备、新8条7齐备，751回归/32真PG，全app80.57%。旧页内模式可回退，不重嵌入；参见 [STR-1/2验收](docs/现状文档/RAG-STR1-STR2落地与验收.md)。
+
+历史OPT-068（2026-10-05）：OCR工作台、真实索引/单文档重建撤除、中文自由问句补召回已部署；3资料/52真实leaf向量+2parent。原18+新16条有限样本带齐标注来源，但另2跨页仅1条完整；全app覆盖率79.51%未过CI80%。仅选页不代表整书，来源命中不代表生成事实正确；最新证据见 [中文召回与结构评测](docs/现状文档/RAG-P2中文召回修复与结构评测.md)，索引运营见 [上一阶段报告](docs/现状文档/RAG-P2索引运营与多文档评测.md)。
+
 基于 LangGraph 编排的 AI 原生内容生产线，将大模型能力封装为**选题 → 生成 → 校验 → 质检 → 改版 → 入库 → 发布**的全链路，面向英语教研场景生成高可用的题目内容（单选 / 完形 / 阅读）。
 
 题型以 Schema 配置接入，**新增题型不改代码**；全链路可观测、成本可核算；支持个人维护，并为对外化预留扩展点。
@@ -11,14 +29,14 @@
 - **题型配置化**：单选 / 完形 / 阅读三类题型以 YAML 模板接入，新增题型只需新增 `templates/*.yaml` + `.st` prompt + SKILL.md
 - **LangGraph 状态机**：生成 → 校验 → 质检 → 改版 → 入库 全链路，checkpointer 断点续跑
 - **结构化输出服务端校验**：Pydantic v2 二次校验 + 重试降级，不直接信任模型返回
-- **模型路由降级**：按题型×难度分档路由，主 → 备 → 默认降级链
-- **LLM-as-judge 质检**：按 quality_rules 逐维度加权打分，rubric 结构化注入，多轮均值降抖动
+- **模型路由降级**：按题型×难度选择主模型档案，失败时尝试默认档案
+- **LLM-as-judge 质检**：按 quality_rules 逐维度加权打分，rubric 结构化注入；可配置多轮均值，默认 1 轮
 - **RAG 知识库**：教材 / 课标 / 真题分块入 pgvector，按知识点检索注入生成上下文；支持前端上传教研文档（txt/md/docx/pdf，如试卷、练习册）自动解析索引
 - **高质量样本数据回流**：人工通过 / 已发布内容沉淀为 few-shot / 微调语料，可检索、可 JSONL 导出
 - **深度成本报表**：token 细分（输入 / 输出）+ 生成 / 质检阶段拆分 + 题型 / 模型 / 任务多维聚合 + 单条调用下钻
 - **指标看板**：产出量、质检通过率、人工驳回率、生产周期、单条成本等 KPI
-- **质检权重反向校准**：用人工驳回样本反向校准 judge 维度权重，数据驱动质量闭环（假阳性→放水度→降权→更准）
-- **Trace 链路回放**：凭 trace_id 回放单次生成的完整调用链路（输入 / 输出 / 耗时 / 成本）
+- **质检权重反向校准**：用自动高分但人工驳回的样本调整 judge 维度权重；质量收益需用独立标注集验证
+- **Trace 链路回放**：凭 trace_id 查看已入库的调用与生命周期记录（输入 / 输出 / 耗时 / 成本）
 - **JWT 认证与权限**：多角色（admin/researcher/reviewer/viewer）+ 种子管理员 + 路由守卫
 - **任务队列**：Celery + Redis 批量生成、并发控制、进度与状态流转、站内通知
 
@@ -32,7 +50,7 @@
 | 后端 | Python 3.12 + FastAPI（异步 API） |
 | 结构化输出 | OpenAI 兼容客户端 + Pydantic v2 强制 JSON 二次校验 |
 | 任务队列 | Celery 5 + Redis |
-| 模型推理 | 云端 API（Qwen / DeepSeek / GLM，OpenAI 兼容），主→备→默认降级 |
+| 模型推理 | 云端 OpenAI 兼容 API，主模型档案失败时尝试默认档案 |
 | 数据库 | PostgreSQL 16 + pgvector（JSONB + 向量检索） |
 | RAG | 阿里云百炼 text-embedding-v3 + pgvector |
 | 可观测性 | 自研 TraceLog 表（trace_id / model / cost / token / latency），Langfuse 可选接入 |
@@ -79,7 +97,7 @@ english-edit/
 
 - Docker Desktop（含 Docker Compose）
 - 一个 OpenAI 兼容的云端 LLM API（如 DeepSeek / 通义 / GLM）
-- 可选：阿里云百炼 embedding API（RAG 知识库用）
+- Compose 启动需提供非占位 embedding API Key；实际 RAG 检索还需可用的 embedding 服务
 
 ### 2. 配置环境变量
 
@@ -102,7 +120,7 @@ ENVIRONMENT=production
 CHECKPOINTER_BACKEND=postgres
 ALLOW_MEMORY_CHECKPOINTER=false
 
-# 可选：RAG embedding（阿里云百炼 text-embedding-v3）
+# Compose 必填：RAG embedding（示例为阿里云百炼 text-embedding-v3）
 EMBEDDING_API_BASE=https://ws-xxx.maas.aliyuncs.com/compatible-mode/v1
 EMBEDDING_API_KEY=你的密钥
 
@@ -114,7 +132,7 @@ LANGFUSE_SECRET_KEY=
 ### 3. 启动全栈
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d --build
+docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 ```
 
 服务启动后：
@@ -133,16 +151,16 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 ```bash
 # 查看状态
-docker compose -f deploy/docker-compose.yml ps
+docker compose --env-file .env -f deploy/docker-compose.yml ps
 
 # 查看后端日志
-docker compose -f deploy/docker-compose.yml logs -f backend
+docker compose --env-file .env -f deploy/docker-compose.yml logs -f backend
 
 # 停止
-docker compose -f deploy/docker-compose.yml down
+docker compose --env-file .env -f deploy/docker-compose.yml down
 
 # 停止并清理数据卷（重置数据）
-docker compose -f deploy/docker-compose.yml down -v
+docker compose --env-file .env -f deploy/docker-compose.yml down -v
 ```
 
 ---
@@ -237,6 +255,7 @@ npm run build
 
 ## 文档
 
+- [项目现状](docs/现状文档/系统现状.md) · [质量与评测](docs/现状文档/质量与评测现状.md) · [验证与风险](docs/现状文档/验证状态与风险.md)
 - [需求文档（PRD）](docs/AI内容生成平台2.0-PRD.md)
 - [技术架构设计](docs/AI内容生成平台2.0-技术架构设计.md)
 - [开发任务清单](docs/tasks.md)
@@ -246,7 +265,7 @@ npm run build
 - [面试准备 - Agent 项目深度拷打与踩坑复盘](docs/面试准备-Agent项目深度拷打与踩坑复盘.md)
 - [GitHub 开源发布检查清单](docs/开源发布检查清单.md)
 
-## 已验证的工程证据
+## 历史验证记录（本次未复验）
 
 - 非集成测试：`240 passed, 5 deselected`。
 - Docker PostgreSQL/Redis 健康检查、Langfuse 独立数据库初始化、`alembic upgrade head`、`pg_dump/pg_restore` 独立恢复库已验证。
@@ -279,3 +298,57 @@ npm run build
 ## License
 
 MIT License，见 [LICENSE](LICENSE)。
+
+
+### 扫描 PDF 的显式本地 OCR（2026-10-05，OPT-064）
+
+本地 MinerU 4.x V1 → 逐页路由 → 结构化表格/标题/来源 → 父子切块预览已实现；使用 `backend\scripts\ocr_preview.py`，配置 `RAG_OCR_ENGINE=mineru` 和本地 `RAG_OCR_URL`。不安装 OCR 权重到 API/worker、不调用付费 embedding、不写知识表。
+
+普通网页预览/上传仍不自动 OCR，10MiB 上传限制未变；本地显式 CLI 默认最多3页/原PDF128MiB。部分选页 indexable=false 且不可正式入库。后台批次、进度与网页操作待下一阶段，不应把代码工具交付当作生产页面已部署。
+
+配置、启动和真实教材证据见 `docs\现状文档\MinerU-OCR接入与验收.md`。
+
+
+### 后台 OCR API 与大文件（2026-10-05，OPT-065）
+
+原环境已提供鉴权的OCR job/page API、独立ocr队列/worker与scheduler。启动使用原Compose的 `--profile ocr`，宿主缓存MinerU由 `deploy\start-local-ocr.ps1` 隐藏启动并要求私有Bearer key；Docker需能到达配置端点。
+
+`POST /api/knowledge/ocr/jobs/upload` 是独立的128MiB后台接收路径；原知识上传/同步预览仍10MiB。API支持根目录内批次导入、进度、取消、续跑及JSON预览，没有自动embedding/索引。网页工作台的OCR操作界面仍待下一阶段，不因后台API已部署就称页面已实现。
+
+实际大文件/检查点/缓存与恢复证据见 `docs\现状文档\OCR-3后台任务与大文件验收.md`；旧OPT-064“主镜像未更新”是当时记录。
+
+
+### OCR工作台、审核与真实索引（2026-10-05，OPT-066）
+
+知识库页面现已提供完整OCR工作台：原页/识别表格/告警核对、问题块排除与恢复、审核后后台真实embedding入库。费用声明与预览/hash/config绑定、partial选择范围、幂等和不确定费用手动重试由后端强制；原文已核对不代表事实已认证。
+
+完整8页真实教材已形成36个1024维非零向量+2父块，单文档8条页级检索命中通过。不要把小样本当全库/生成质量100%；其余教材未自动索引。费用Trace当前为未核验的全局fallback估算，实际账单以供应商为准。
+
+当前运行态与验证以 `docs\现状文档\OCR-4工作台与真实RAG验收.md` 为准；前面“界面待下一阶段”段为历史记录。
+
+
+## 管理员模型设置（OPT-076）
+
+工作台左侧“模型设置”（`/model-settings`）可配置OpenAI兼容Provider地址/API Key、模型档案、默认生成降级档案及各题型生成/Judge覆盖。先Provider→档案→题型路由；未绑定/留空保留ENV/YAML，重启不清用户route，不自动替换现有模型。
+
+密钥只写不读，保存需服务端独立`PROVIDER_SECRET_KEY`（Fernet key），各Python服务保持一致并与DB备份配套保留；不能用JWT key替代。编辑留空保留密钥，非管理员API/页面无管理权限。Embedding/OCR仍原环境配置；模型价格仍后端单价估算，探测/models不代表生成/专家质量验收。详细说明见[第二轮与模型设置验收](docs/现状文档/10-6优化第二轮与模型设置落地验收.md)。
+
+
+## 受限回放与few-shot（OPT-077）
+
+链路展开可主动查看新chat的受限脱敏请求/响应；默认1MiB/密文总128MiB/7天，独立TRACE_SNAPSHOT_SECRET_KEY，与Provider/JWT key分离，读取须ops/归属且审计。旧Trace不能补出全文，Embedding/lifecycle仍摘要，模型重跑不保证一致。
+
+样本页可将人审通过样本标为fewshot；生成按同tenant/题型/规范化知识点、真实人审/源当前状态/hash/规则/来源核验选最多2个完整示例。8192为额外示例字符预算，不是总LLM窗口。当前样本库空，启用消费不宣称真实质量收益。
+
+模型比较工具`backend/scripts/model_compare.py`默认plan-only，--execute才调用已配置的不同候选；同端点/模型拒执行，产物不自动入库或变金标。真实不同候选和人工裁决仍需要用户。详见[第三轮验收](docs/现状文档/10-6优化第三轮落地与验收.md)。
+
+
+## Current release baseline (2026-10-06)
+
+The current public baseline includes the RAG structure/relation retrieval pipeline, OCR task/review workflow, durable generation delivery, deterministic question-output validation, state-contract and concurrency safeguards, admin-configurable OpenAI-compatible providers/models, bounded encrypted Trace snapshots, guarded human-reviewed few-shot consumption, and the first responsive workspace UI pass.
+
+The current engineering gate is **1,173 tests passed** in the merged local/remote working tree; this includes the latest repository/CI contract tests and the existing project regression suite. The public repository does not include real `.env` files, API keys, database dumps, course-material blobs, login sessions, `.local-eval` evidence, or private screenshots.
+
+This is still a personal development and learning project. Automated scores, valid schemas, Trace snapshots, few-shot wiring, and model-comparison tooling do not prove expert answer correctness, unique answers, independent-model quality gains, or unattended production readiness. Configure your own provider credentials from `.env.example` or the administrator model-settings page before using external models.
+
+For the exact current implementation and known boundaries, start with [the maintainer architecture document](docs/现状文档2/英语内容生产工作台-当前实现与系统架构.md) and [the public release audit](docs/公开发布-2026-10-06.md).

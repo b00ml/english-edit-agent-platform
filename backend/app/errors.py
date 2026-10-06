@@ -1,7 +1,10 @@
 # app/errors.py —— 平台自定义异常
 # 统一异常体系：业务异常继承 PlatformError，携带 status_code 与错误码 code，
 # 由 main.py 的全局异常处理器映射为结构化 HTTP 响应，供前端按 code 分支。
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
+
+if TYPE_CHECKING:
+    from app.engine.content_validation import ValidationReport
 
 
 class PlatformError(Exception):
@@ -92,3 +95,78 @@ class NotFoundError(PlatformError):
 
     status_code = 404
     code = "NOT_FOUND"
+
+
+class CheckpointerUnavailableError(PlatformError):
+    """持久化断点不可用时禁止生产任务静默降级执行。"""
+
+    status_code = 503
+    code = "CHECKPOINTER_UNAVAILABLE"
+
+
+class InvalidKnowledgeError(PlatformError):
+    status_code = 400
+    code = "INVALID_KNOWLEDGE"
+
+
+class KnowledgeNoIndexableTextError(InvalidKnowledgeError):
+    """An accepted file has no usable text; never invoke embedding for it."""
+
+    code = "KNOWLEDGE_NO_INDEXABLE_TEXT"
+
+
+class KnowledgeUploadTooLargeError(PlatformError):
+    status_code = 413
+    code = "KNOWLEDGE_TOO_LARGE"
+
+
+class RagContextRequiredError(PlatformError):
+    status_code = 422
+    code = "RAG_CONTEXT_REQUIRED"
+
+
+class TracePersistenceError(PlatformError):
+    status_code = 503
+    code = "TRACE_PERSISTENCE_FAILED"
+
+
+class DocumentParseError(ValueError):
+    """Recognized input cannot be parsed within the configured safety limits."""
+
+
+class ChunkingError(ValueError):
+    """No chunking strategy could preserve content within the configured budget."""
+
+
+class RagRerankRequiredError(RagContextRequiredError):
+    """Required reranking was unavailable or returned an invalid response."""
+
+
+class RagProviderError(ValueError):
+    """A RAG auxiliary provider response violates its structured contract."""
+
+
+class ContentValidationError(PlatformError):
+    """Deterministic content guards failed; not a claim about semantic correctness."""
+
+    status_code = 422
+    code = "CONTENT_VALIDATION_FAILED"
+
+    def __init__(self, report: "ValidationReport") -> None:
+        self.report = report
+        super().__init__("; ".join(f"{e.path}: {e.message}" for e in report.errors))
+
+
+class InvalidGenerationStateError(PlatformError):
+    status_code = 409
+    code = "INVALID_GENERATION_STATE"
+
+
+class ProviderConfigurationError(PlatformError):
+    status_code = 422
+    code = "PROVIDER_CONFIGURATION_INVALID"
+
+
+class TraceSnapshotError(PlatformError):
+    status_code = 409
+    code = "TRACE_SNAPSHOT_UNAVAILABLE"

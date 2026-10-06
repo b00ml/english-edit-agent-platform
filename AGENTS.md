@@ -19,7 +19,7 @@
 - 后端：Python 3.12 + FastAPI（异步 API）
 - 结构化输出：OpenAI 兼容客户端 + Pydantic v2 强制 JSON 二次校验（等效 Outlines 约束解码）
 - 任务队列：Celery 5 + Redis（并发/重试/断点续跑）
-- 模型推理：云 API（Qwen/DeepSeek/GLM，OpenAI 兼容），主→备→默认降级
+- 模型推理：云 API（Qwen/DeepSeek/GLM，OpenAI 兼容），主模型档案→默认模型档案降级
 - 数据库：PostgreSQL 16 + pgvector（JSONB 字段 + 向量检索）
 - RAG：阿里云百炼 text-embedding-v3 + pgvector 向量检索
 - 可观测性：自研 TraceLog 表（trace_id/model/cost/latency 入库），Langfuse 可选接入
@@ -79,7 +79,7 @@ english-edit/
 - 禁止不经测试合并改动 —— 涉及工作流/结构化输出/质检逻辑的改动需单测。
 
 ## 成功指标
-- 新增题型不改代码，仅需新增一个 YAML 模板即接入流水线。
+- 新增题型不改核心代码，需新增 YAML 模板及对应 .st Prompt、SKILL.md。
 - 单次生成凭 `trace_id` 可完整回放（输入/输出/质检分/成本）。
 - 自动质检通过率稳定，人工驳回率可控（P2 目标 ≤5%）。
 - 后端单测覆盖率 ≥80%（重点：结构化输出、质检加权、路由降级、状态机）。

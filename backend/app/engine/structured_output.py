@@ -6,17 +6,28 @@
 import json
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import jsonschema
-from openai import OpenAI
+from fastapi import HTTPException
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, ValidationError, create_model
 
 from app.config import settings
-from app.engine.trace import compute_cost, elapsed_ms, record_trace, token_breakdown
-from app.errors import StructuredOutputError
+from app.engine.content_validation import ValidationIssue, ValidationReport, enforce_content
+from app.engine.providers import client_for_profile, profile_identity
+from app.engine.trace import (
+    compute_cost,
+    elapsed_ms,
+    record_trace,
+    token_breakdown,
+    usage_is_reported,
+)
+from app.errors import ContentValidationError, StructuredOutputError
 from app.prompt_loader import build_system_prompt, build_user_prompt, load_prompt, render
 from app.skill_registry import get_skill_md
+from app.versioning import hash_value
 
 logger = logging.getLogger("app.engine.structured_output")
 
@@ -189,16 +200,17 @@ def _normalize_flat(schema: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, A
     if not isinstance(data, dict):
         return data
     required = set(schema.get("required", []) or [])
-    if required and not required.issubset(data.keys()):
+    if required and not required.issubset(data.keys()) and len(data) == 1:
         for key, value in data.items():
             if isinstance(value, dict) and required.issubset(value.keys()):
                 return value
             # 数组包装：模型偶发返回 {"questions":[{...}]} 或 {"items":[...]}，
-            # 取首个满足全部必填字段的子对象，避免无谓重试导致的失败/耗时。
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and required.issubset(item.keys()):
-                        return item
+            # Only unwrap a singleton. Multiple generated items must fail validation,
+            # not silently discard paid output from an accidental second batch.
+            if isinstance(value, list) and len(value) == 1:
+                item = value[0]
+                if isinstance(item, dict) and required.issubset(item.keys()):
+                    return item
     return data
 
 
@@ -233,6 +245,11 @@ def _summarize_validation_error(exc: Exception) -> str:
         if extra > 0:
             lines.append(f"- ……另有 {extra} 条错误未列出")
         return "\n".join(lines)
+    if isinstance(exc, ContentValidationError):
+        return "\n".join(f"- 字段 {e.path} [{e.code}]: {e.message}" for e in exc.report.errors[:10])
+    if isinstance(exc, jsonschema.ValidationError):
+        path = ".".join(str(part) for part in exc.absolute_path) or "<顶层>"
+        return f"- 字段 {path} [JSON Schema {exc.validator}]: {exc.message[:500]}"
     if isinstance(exc, json.JSONDecodeError):
         return f"输出不是合法 JSON：{exc}（请检查引号、逗号与括号是否配对）"
     if isinstance(exc, KeyError):
@@ -279,11 +296,16 @@ def generate_structured(
       字段级错误摘要（STRUCTURED_RETRY_FEEDBACK 控制），耗尽抛异常；
     - 每次调用（含失败尝试）记录 TraceLog（耗时/成本/attempt/success）与结构化日志。
     """
+    trace_id = trace_id or f"generate:{uuid.uuid4()}"
     run_config = template.run_config or {}
     max_retry = int(run_config.get("max_retry", 3))
 
     model_name = (model_profile.model_name if model_profile else None) or settings.LLM_MODEL_NAME
-    client = _get_openai_client()
+    client = (
+        client_for_profile(model_profile)
+        if getattr(model_profile, "provider_id", None)
+        else _get_openai_client()
+    )
 
     schema = template.output_schema
     output_model = _build_pydantic_from_schema(schema)
@@ -313,18 +335,80 @@ def generate_structured(
     attempt_summaries: List[str] = []
     for attempt in range(1, max_retry + 1):
         try:
-            text, latency_ms, usage = _call_openai_json(client, model_name, messages)
+            try:
+                text, latency_ms, usage = _call_openai_json(client, model_name, messages)
+            except OpenAIError as exc:
+                if trace_id:
+                    record_trace(
+                        snapshot_data={
+                            "messages": messages,
+                            "response_text": None,
+                            "model": model_name,
+                            "temperature": settings.LLM_TEMPERATURE,
+                            "response_format": {"type": "json_object"},
+                            "transport_error_type": type(exc).__name__,
+                        },
+                        trace_id=trace_id,
+                        task_id=task_id,
+                        template_id=template_id,
+                        tenant_id=tenant_id,
+                        model=model_name,
+                        latency_ms=0.0,
+                        cost=0.0,
+                        input_data={
+                            "params": params,
+                            "model_profile": (
+                                profile_identity(model_profile)
+                                if model_profile is not None
+                                and hasattr(model_profile, "provider_id")
+                                else {"binding": "environment"}
+                            ),
+                        },
+                        output_data={"error_type": type(exc).__name__},
+                        stage="generate",
+                        attempt=attempt,
+                        success=False,
+                        usage_reported=False,
+                    )
+                if getattr(model_profile, "provider_id", None):
+                    status_code = getattr(exc, "status_code", 503)
+                    raise HTTPException(
+                        status_code=status_code, detail=f"Provider调用失败: {type(exc).__name__}"
+                    ) from None
+                raise
             raw = json.loads(text)
             # 兜底展平偶发嵌套包装后再做 Pydantic 二次校验
-            validated = output_model.model_validate(_normalize_flat(schema, raw))
+            normalized = _normalize_flat(schema, raw)
+            jsonschema.validate(normalized, schema)  # do not silently coerce index/answer types
+            validated = output_model.model_validate(normalized)
             # 第二道校验：用 jsonschema 兜底无法转为 Pydantic 的约束
             validated_dict = validated.model_dump()
-            try:
-                jsonschema.validate(validated_dict, schema)
-            except jsonschema.ValidationError as json_exc:
-                # jsonschema 校验失败，触发重试
-                raise json_exc
-        except (ValidationError, json.JSONDecodeError, KeyError) as exc:
+            jsonschema.validate(validated_dict, schema)
+            validation_report = enforce_content(validated_dict, schema, template.run_config)
+            copied_hashes = {
+                example.get("payload_hash")
+                for example in (params.get("fewshot_provenance") or {}).get("selected", [])
+            }
+            if hash_value(validated_dict) in copied_hashes:
+                raise ContentValidationError(
+                    ValidationReport(
+                        valid=False,
+                        errors=[
+                            ValidationIssue(
+                                code="fewshot_exact_copy",
+                                path="$",
+                                message="新题不得逐字复用few-shot样本；请重新命题而不是复制示例",
+                            )
+                        ],
+                    )
+                )
+        except (
+            ValidationError,
+            jsonschema.ValidationError,
+            json.JSONDecodeError,
+            KeyError,
+            ContentValidationError,
+        ) as exc:
             summary = _summarize_validation_error(exc)
             attempt_summaries.append(f"第{attempt}次: {summary}")
             last_error = exc
@@ -340,11 +424,28 @@ def generate_structured(
                     cost=cost,
                     prompt_version=template.version,
                     tenant_id=tenant_id,
-                    input_data={"params": params},
+                    input_data={
+                        "params": params,
+                        "model_profile": (
+                            profile_identity(model_profile)
+                            if model_profile is not None and hasattr(model_profile, "provider_id")
+                            else {"binding": "environment"}
+                        ),
+                    },
                     output_data={"error_summary": summary},
+                    snapshot_data={
+                        "messages": messages,
+                        "response_text": text,
+                        "model": model_name,
+                        "temperature": settings.LLM_TEMPERATURE,
+                        "response_format": {"type": "json_object"},
+                    },
                     stage="generate",
                     prompt_tokens=tokens["prompt_tokens"],
                     completion_tokens=tokens["completion_tokens"],
+                    usage_reported=usage_is_reported(usage, "generate"),
+                    prompt_cost=tokens["prompt_cost"],
+                    completion_cost=tokens["completion_cost"],
                     attempt=attempt,
                     success=False,
                 )
@@ -360,7 +461,9 @@ def generate_structured(
             if attempt >= max_retry:
                 break
             if settings.STRUCTURED_RETRY_FEEDBACK:
-                if isinstance(exc, ValidationError):
+                if isinstance(
+                    exc, (ValidationError, jsonschema.ValidationError, ContentValidationError)
+                ):
                     # 回注上次原始输出（已解析的结构），供模型对照修正；
                     # JSONDecodeError 路径无可用结构化输出，仅回注错误说明
                     messages.append(
@@ -391,11 +494,29 @@ def generate_structured(
                 cost=cost,
                 prompt_version=template.version,
                 tenant_id=tenant_id,
-                input_data={"params": params},
+                input_data={
+                    "params": params,
+                    "content_validation": validation_report.model_dump(),
+                    "model_profile": (
+                        profile_identity(model_profile)
+                        if model_profile is not None and hasattr(model_profile, "provider_id")
+                        else {"binding": "environment"}
+                    ),
+                },
                 output_data=validated.model_dump(),
+                snapshot_data={
+                    "messages": messages,
+                    "response_text": text,
+                    "model": model_name,
+                    "temperature": settings.LLM_TEMPERATURE,
+                    "response_format": {"type": "json_object"},
+                },
                 stage="generate",
                 prompt_tokens=tokens["prompt_tokens"],
                 completion_tokens=tokens["completion_tokens"],
+                usage_reported=usage_is_reported(usage, "generate"),
+                prompt_cost=tokens["prompt_cost"],
+                completion_cost=tokens["completion_cost"],
                 attempt=attempt,
                 success=True,
             )
@@ -410,6 +531,6 @@ def generate_structured(
         return validated.model_dump()
 
     raise StructuredOutputError(
-        f"结构化生成失败：经过 {max_retry} 次重试仍未通过 Pydantic 校验。"
+        f"结构化生成失败：经过 {max_retry} 次重试仍未通过 Pydantic/JSON Schema/题目确定性校验。"
         f"各次错误: {'; '.join(attempt_summaries)}；最后一次错误: {last_error}"
     )

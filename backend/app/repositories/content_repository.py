@@ -28,6 +28,15 @@ class ContentRepository(BaseRepository[ContentItem]):
             .all()
         )
 
+    def count_by_task(self, task_id: str) -> int:
+        """Count all content rows for the requested task, matching Service contract."""
+        return int(
+            self.db.query(func.count(ContentItem.id))
+            .filter(ContentItem.task_id == task_id)
+            .scalar()
+            or 0
+        )
+
     def list_by_status(self, status: str, skip: int = 0, limit: int = 100) -> List[ContentItem]:
         """按状态查询内容。"""
         return (

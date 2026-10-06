@@ -14,12 +14,14 @@ export function getToken(): string {
 export function saveAuth(token: string, user: UserInfo): void {
   localStorage.setItem(TOKEN_KEY, token)
   localStorage.setItem(USER_KEY, JSON.stringify(user))
+  window.dispatchEvent(new Event('english-edit-auth'))
 }
 
 /** 清除登录态（登出） */
 export function clearAuth(): void {
   localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(USER_KEY)
+  window.dispatchEvent(new Event('english-edit-auth'))
 }
 
 /** 当前是否已登录 */
@@ -41,8 +43,11 @@ export function getCurrentUser(): UserInfo | null {
 /** 判断当前用户是否拥有某权限点（与后端 ROLE_PERMISSIONS 对齐，供前端 UX 控制） */
 const PERMISSIONS: Record<string, string[]> = {
   'user:manage': ['admin'],
+  'model:manage': ['admin'],
   'template:manage': ['admin'],
   'generate:create': ['admin', 'researcher'],
+  'task:read': ['admin', 'researcher'],
+  'generate:cancel': ['admin', 'researcher'],
   'content:read': ['admin', 'researcher', 'reviewer', 'viewer'],
   'quality:review': ['admin', 'researcher', 'reviewer'],
   'content:publish': ['admin', 'researcher'],

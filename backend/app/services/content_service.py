@@ -10,10 +10,13 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.domain.status import can_transition_content
+from app.engine.content_validation import inspect_content
 from app.errors import ContentStateConflictError
-from app.models import ContentItem, User
+from app.models import ContentItem, QuestionTemplate, User
 from app.repositories import ContentRepository
 from app.schemas import ContentListOut, ContentOut
+from app.services.content_guard import require_valid_content
+from app.tenancy import require_scope, scope_query
 
 
 class ContentService:
@@ -40,9 +43,9 @@ class ContentService:
         if item is None:
             raise HTTPException(status_code=404, detail="内容不存在")
 
-        # 租户隔离：viewer 仅能查看自己租户的内容
-        if current_user.role == "viewer" and item.tenant_id != current_user.tenant_id:
-            raise HTTPException(status_code=403, detail="无权访问此内容")
+        require_scope(item, current_user)
+        if current_user.role == "viewer" and item.status != "published":
+            raise HTTPException(status_code=403, detail="查看者仅能读取已发布内容")
 
         return item
 
@@ -63,34 +66,54 @@ class ContentService:
             page: 页码（从 1 开始）
             page_size: 每页数量
         """
-        skip = (page - 1) * page_size
-        tenant_id = current_user.tenant_id if current_user.role == "viewer" else None
-
-        # 构建查询
-        if template_id and status:
-            items = self.content_repo.list_by_template_and_status(
-                template_id, status, tenant_id, skip, page_size
-            )
-            total = self.content_repo.count_by_template_and_status(template_id, status, tenant_id)
-        elif template_id:
-            items = self.content_repo.list_by_template(template_id, tenant_id, skip, page_size)
-            total = self.content_repo.count_by_template(template_id, tenant_id)
-        elif status:
-            items = self.content_repo.list_by_status(status, tenant_id, skip, page_size)
-            total = self.content_repo.count_by_status(status, tenant_id)
-        elif tenant_id:
-            items = self.content_repo.list_by_tenant(tenant_id, skip, page_size)
-            total = self.content_repo.count_by_tenant(tenant_id)
-        else:
-            items = self.content_repo.list_all(skip, page_size)
-            total = self.content_repo.count()
-
+        query = scope_query(self.db.query(ContentItem), ContentItem, current_user)
+        if current_user.role == "viewer":
+            query = query.filter(ContentItem.status == "published")
+        if template_id:
+            query = query.filter(ContentItem.template_id == template_id)
+        if status:
+            query = query.filter(ContentItem.status == status)
+        total = query.count()
+        items = (
+            query.order_by(ContentItem.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        templates = (
+            {
+                t.type_id: t
+                for t in self.db.query(QuestionTemplate)
+                .filter(QuestionTemplate.type_id.in_({item.template_id for item in items}))
+                .all()
+            }
+            if items
+            else {}
+        )
         return ContentListOut(
             total=total,
             page=page,
             page_size=page_size,
-            items=[ContentOut.model_validate(i) for i in items],
+            items=[self._content_out(item, templates.get(item.template_id)) for item in items],
         )
+
+    @staticmethod
+    def _content_out(item: ContentItem, template: QuestionTemplate | None) -> ContentOut:
+        result = ContentOut.model_validate(item)
+        if template is not None:
+            result.validation_report = inspect_content(
+                item.payload, template.output_schema, template.run_config
+            ).model_dump()
+        return result
+
+    def content_out(self, item: ContentItem) -> ContentOut:
+        """Current-rule read-only diagnostics; stored reports remain audit snapshots."""
+        template = (
+            self.db.query(QuestionTemplate)
+            .filter(QuestionTemplate.type_id == item.template_id)
+            .first()
+        )
+        return self._content_out(item, template)
 
     def publish_content(self, content_id: str, current_user: User) -> ContentItem:
         """发布内容（状态校验：仅 passed 可发布）。
@@ -110,11 +133,19 @@ class ContentService:
         if item is None:
             raise HTTPException(status_code=404, detail="内容不存在")
 
+        require_scope(item, current_user)
+        provenance = item.provenance or {}
+        if provenance.get("require_review") and not (provenance.get("reference_review") or {}).get(
+            "verified"
+        ):
+            raise ContentStateConflictError("发布前必须完成人工参考来源核验")
         # 状态前置检查：仅 passed 可发布
         if not can_transition_content(item.status, "published"):
             raise ContentStateConflictError(
                 f"内容状态 {item.status} 无法发布，仅 passed 状态可发布"
             )
+
+        require_valid_content(self.db, item)
 
         # 更新状态与发布信息
         self.content_repo.update(

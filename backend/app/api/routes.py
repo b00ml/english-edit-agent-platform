@@ -1,31 +1,31 @@
 # app/api/routes.py —— FastAPI 业务接口
 import json
 from datetime import datetime
-from pathlib import Path
-from typing import List
+from typing import Any, List, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
-from sqlalchemy import case, func
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import record_config_change
 from app.config import settings
 from app.database import get_db
 from app.engine.metrics import compute_structured_stats
+from app.engine.quality_metrics import quality_pipeline_stats
 from app.health import dependency_report, readiness_report
 from app.models import (
     ConfigAuditEvent,
     ContentItem,
     GenerationTask,
     ModelProfile,
+    QualityEvaluation,
     QualityRecord,
     QuestionTemplate,
     TraceLog,
     User,
 )
-from app.rag.indexer import index_document
-from app.rag.parser import UnsupportedFileTypeError, parse_file
 from app.sample_pool import (
     list_samples,
 )
@@ -94,6 +94,8 @@ from app.services import (
     QualityService,
     SampleService,
 )
+from app.services.knowledge_service import StructureReview
+from app.tenancy import require_scope, scope_query
 from app.versioning import ensure_model_profile_hash, hash_value
 from app.worker.celery_app import celery_app
 
@@ -132,7 +134,8 @@ def list_users(
 ):
     """用户列表（分页），仅管理员可访问。"""
     service = AuthService(db)
-    return service.list_users(page, page_size)
+    users, total = service.list_users(skip=(page - 1) * page_size, limit=page_size)
+    return UserListOut(items=users, total=total)
 
 
 @router.post("/api/users", response_model=UserOut)
@@ -143,7 +146,7 @@ def create_user(
 ):
     """创建用户（管理员）。用户名唯一，密码 bcrypt 哈希入库。"""
     service = AuthService(db)
-    return service.create_user(req)
+    return service.create_user(req, current_user.id, tenant_id=req.tenant_id)
 
 
 @router.patch("/api/users/{user_id}", response_model=UserOut)
@@ -182,11 +185,11 @@ def create_generate_task(
 def get_task(
     task_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_permission("content:read")),
+    current_user: User = Depends(require_permission("task:read")),
 ):
     """查询单个任务详情与进度。"""
     service = GenerationService(db)
-    return service.get_task(task_id)
+    return service.get_task(task_id, current_user)
 
 
 @router.post("/api/tasks/{task_id}/cancel", response_model=CancelTaskResponse)
@@ -206,8 +209,11 @@ def cancel_task(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    # 验证状态：仅 pending/dispatched/running 可取消
-    if task.status not in ["pending", "dispatched", "running"]:
+    require_scope(task, current_user)
+    # Waiting human review is protected from delivery cancellation.
+    from app.domain.status import DELIVERY_TASK_STATUSES
+
+    if task.status not in DELIVERY_TASK_STATUSES:
         raise HTTPException(
             status_code=400,
             detail=f"任务状态为 {task.status}，不可取消（仅 pending/dispatched/running 可取消）",
@@ -229,11 +235,11 @@ def list_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_permission("content:read")),
+    current_user: User = Depends(require_permission("task:read")),
 ):
     """任务列表（分页）。"""
     service = GenerationService(db)
-    return service.list_tasks(page, page_size)
+    return service.list_tasks(page, page_size, current_user=current_user)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +273,7 @@ def get_content(
 ):
     """内容详情（P0-3 租户隔离）。"""
     service = ContentService(db)
-    return service.get_content(content_id, current_user)
+    return service.content_out(service.get_content(content_id, current_user))
 
 
 @router.post("/api/contents/{content_id}/publish", response_model=ContentOut)
@@ -316,7 +322,7 @@ def calibrate_quality(
     样本不足时写入"样本不足"记录但不改变默认权重。
     """
     service = QualityService(db)
-    return service.calibrate(req)
+    return service.calibrate_quality(req, current_user)
 
 
 @router.get("/api/quality/calibration", response_model=list[CalibrationOut])
@@ -327,7 +333,7 @@ def get_calibrations(
 ):
     """查询校准记录列表（可按模板过滤），按时间倒序。"""
     service = QualityService(db)
-    return service.list_calibrations(template_id)
+    return service.list_calibrations(template_id, current_user=current_user)
 
 
 @router.get("/api/quality/stats", response_model=QualityStatsOut)
@@ -343,9 +349,9 @@ def quality_stats(
 ):
     """按模板版本/租户/时间窗口统计质量闭环，避免混用不同配置快照。"""
     scoped_tenant = current_user.tenant_id if current_user.role != "admin" else tenant_id
-    query = db.query(QualityRecord, ContentItem.template_id).join(
-        ContentItem, ContentItem.id == QualityRecord.item_id
-    )
+    query = scope_query(
+        db.query(QualityRecord, ContentItem.template_id), QualityRecord, current_user
+    ).join(ContentItem, ContentItem.id == QualityRecord.item_id)
     if template_id:
         query = query.filter(ContentItem.template_id == template_id)
     if template_version is not None:
@@ -380,7 +386,9 @@ def quality_stats(
                 "reviewer": record.reviewer,
                 "config_hash": hash_value(snapshot),
                 "effective_threshold": float(
-                    snapshot.get("threshold") or settings.QUALITY_THRESHOLD
+                    snapshot["threshold"]
+                    if snapshot.get("threshold") is not None
+                    else settings.QUALITY_THRESHOLD
                 ),
                 "total": 0,
                 "passed": 0,
@@ -434,9 +442,9 @@ def cost_aggregation(
     可选 template_id 过滤。未关联到题型/任务的调用归入 unknown 维度。
     """
     # 统一先关联内容条目（仅用于 template_id 过滤）
-    base = db.query(TraceLog, ContentItem.template_id.label("tpl_id")).outerjoin(
-        ContentItem, ContentItem.id == TraceLog.item_id
-    )
+    base = scope_query(
+        db.query(TraceLog, ContentItem.template_id.label("tpl_id")), TraceLog, current_user
+    ).outerjoin(ContentItem, ContentItem.id == TraceLog.item_id)
     if template_id:
         base = base.filter(
             (ContentItem.template_id == template_id) | (TraceLog.template_id == template_id)
@@ -479,16 +487,29 @@ def cost_aggregation(
 # ---------------------------------------------------------------------------
 # 深度成本报表（P3 / K2）
 # ---------------------------------------------------------------------------
-def _cost_by_key(db: Session, key_col, unknown: str) -> list:
+def _cost_by_key(
+    db: Session,
+    key_col,
+    unknown: str,
+    current_user: User | None = None,
+    template_id: str | None = None,
+    task_id: str | None = None,
+) -> list:
     """按指定列聚合成本与 token（coalesce 归入 unknown 维度）。"""
     rows = (
-        db.query(
-            func.coalesce(key_col, unknown).label("name"),
-            func.count(TraceLog.id).label("count"),
-            func.coalesce(func.sum(TraceLog.cost), 0.0).label("total_cost"),
-            func.coalesce(func.sum(TraceLog.prompt_tokens), 0).label("prompt_tokens"),
-            func.coalesce(func.sum(TraceLog.completion_tokens), 0).label("completion_tokens"),
+        scope_query(
+            db.query(
+                func.coalesce(key_col, unknown).label("name"),
+                func.count(TraceLog.id).label("count"),
+                func.coalesce(func.sum(TraceLog.cost), 0.0).label("total_cost"),
+                func.coalesce(func.sum(TraceLog.prompt_tokens), 0).label("prompt_tokens"),
+                func.coalesce(func.sum(TraceLog.completion_tokens), 0).label("completion_tokens"),
+            ),
+            TraceLog,
+            current_user,
         )
+        .filter(*([TraceLog.template_id == template_id] if template_id is not None else []))
+        .filter(*([TraceLog.task_id == task_id] if task_id is not None else []))
         .group_by(key_col)
         .order_by(func.sum(TraceLog.cost).desc())
         .all()
@@ -521,7 +542,7 @@ def cost_deep_report(
     - 多维聚合：按 题型/模型/任务 归并成本与 token（unknown 兜底）；
     - 单条下钻：列出最近 N 条 LLM 调用明细（token/成本/耗时），可下钻到单条。
     """
-    base = db.query(TraceLog)
+    base = scope_query(db.query(TraceLog), TraceLog, current_user)
     if template_id:
         base = base.filter(TraceLog.template_id == template_id)
     if task_id:
@@ -549,6 +570,8 @@ def cost_deep_report(
             func.coalesce(func.sum(TraceLog.cost), 0.0),
             func.coalesce(func.sum(TraceLog.prompt_tokens), 0),
             func.coalesce(func.sum(TraceLog.completion_tokens), 0),
+            func.coalesce(func.sum(TraceLog.prompt_cost), 0.0),
+            func.coalesce(func.sum(TraceLog.completion_cost), 0.0),
         )
         .group_by(TraceLog.stage)
         .all()
@@ -561,15 +584,17 @@ def cost_deep_report(
             prompt_tokens=int(r[3]),
             completion_tokens=int(r[4]),
             total_tokens=int(r[3]) + int(r[4]),
-            prompt_cost=round(int(r[3]) / 1000.0 * settings.COST_PER_1K_TOKENS, 6),
-            completion_cost=round(int(r[4]) / 1000.0 * settings.COST_PER_1K_TOKENS, 6),
+            prompt_cost=round(float(r[5] or 0.0), 6),
+            completion_cost=round(float(r[6] or 0.0), 6),
         )
         for r in stage_rows
     ]
 
-    by_template = _cost_by_key(db, TraceLog.template_id, "unknown")
-    by_model = _cost_by_key(db, TraceLog.model, "unknown")
-    by_task = _cost_by_key(db, TraceLog.task_id, "unknown")
+    by_template = _cost_by_key(
+        db, TraceLog.template_id, "unknown", current_user, template_id, task_id
+    )
+    by_model = _cost_by_key(db, TraceLog.model, "unknown", current_user, template_id, task_id)
+    by_task = _cost_by_key(db, TraceLog.task_id, "unknown", current_user, template_id, task_id)
 
     # 单条下钻（最近 N 条）
     trace_rows = base.order_by(TraceLog.created_at.desc()).limit(limit).all()
@@ -592,6 +617,13 @@ def cost_deep_report(
 
     return CostDeepOut(
         total_cost=total_cost,
+        unknown_usage_calls=base.filter(
+            TraceLog.usage_reported.is_not(True),
+            TraceLog.stage.in_(["generate", "qc", "embedding"]),
+        ).count(),
+        unknown_pricing_calls=base.filter(
+            TraceLog.prompt_cost.is_(None), TraceLog.stage.in_(["generate", "qc", "embedding"])
+        ).count(),
         total_count=total_count,
         total_prompt_tokens=total_prompt,
         total_completion_tokens=total_completion,
@@ -616,43 +648,44 @@ def dashboard(
 
     口径（对齐 PRD 15.1）：
     - 内容产出量：content_item 总数
-    - 质检通过率：自动质检（source=auto）score >= QUALITY_THRESHOLD 占比
+    - 首过/最终通过率：独立评分事件，按各事件有效阈值，排除未完成最终轮
     - 人工驳回率：人工质检（source=manual_review）score=0 占比
     - 生产周期：generation_task created_at→updated_at 平均/最近时长
     - 单条成本：内容条目平均生成成本
     - 发布量：status=published 计数
     """
     # 内容总量与状态分布
-    total_items = db.query(func.count(ContentItem.id)).scalar() or 0
+    total_items = (
+        scope_query(db.query(func.count(ContentItem.id)), ContentItem, current_user).scalar() or 0
+    )
     published = (
-        db.query(func.count(ContentItem.id)).filter(ContentItem.status == "published").scalar() or 0
-    )
-    avg_cost_row = db.query(func.avg(ContentItem.cost)).scalar()
-    avg_cost = float(avg_cost_row) if avg_cost_row is not None else 0.0
-    total_cost = db.query(func.coalesce(func.sum(ContentItem.cost), 0.0)).scalar()
-
-    # 自动质检通过率（source=auto，score>=threshold）
-    auto_total = (
-        db.query(func.count(QualityRecord.id)).filter(QualityRecord.source == "auto").scalar() or 0
-    )
-    auto_passed = (
-        db.query(func.count(QualityRecord.id))
-        .filter(QualityRecord.source == "auto")
-        .filter(QualityRecord.score >= settings.QUALITY_THRESHOLD)
+        scope_query(db.query(func.count(ContentItem.id)), ContentItem, current_user)
+        .filter(ContentItem.status == "published")
         .scalar()
         or 0
     )
-    qc_pass_rate = auto_passed / auto_total if auto_total else 0.0
+    total_cost = (
+        scope_query(
+            db.query(func.coalesce(func.sum(TraceLog.cost), 0.0)), TraceLog, current_user
+        ).scalar()
+        or 0.0
+    )
+    avg_cost = float(total_cost) / total_items if total_items else 0.0
+
+    # 新口径仅使用改造后的事件表，历史入库数据不能反推首过/淘汰分母。
+    events = scope_query(db.query(QualityEvaluation), QualityEvaluation, current_user).all()
+    pipeline_stats = quality_pipeline_stats(events)
+    qc_pass_rate = pipeline_stats["final_pass_rate"]
 
     # 人工驳回率（source=manual_review，score=0 即驳回）
     manual_total = (
-        db.query(func.count(QualityRecord.id))
+        scope_query(db.query(func.count(QualityRecord.id)), QualityRecord, current_user)
         .filter(QualityRecord.source == "manual_review")
         .scalar()
         or 0
     )
     manual_rejected = (
-        db.query(func.count(QualityRecord.id))
+        scope_query(db.query(func.count(QualityRecord.id)), QualityRecord, current_user)
         .filter(QualityRecord.source == "manual_review")
         .filter(QualityRecord.score == 0)
         .scalar()
@@ -661,20 +694,26 @@ def dashboard(
     manual_reject_rate = manual_rejected / manual_total if manual_total else 0.0
 
     # 生产周期：任务平均时长（秒）
-    avg_latency_row = db.query(
-        func.avg(func.extract("epoch", GenerationTask.updated_at - GenerationTask.created_at))
+    avg_latency_row = scope_query(
+        db.query(
+            func.avg(func.extract("epoch", GenerationTask.updated_at - GenerationTask.created_at))
+        ),
+        GenerationTask,
+        current_user,
     ).scalar()
     avg_latency = float(avg_latency_row) if avg_latency_row is not None else 0.0
 
     # 按题型质检通过率明细
-    by_template = _dashboard_by_template(db)
+    by_template = _dashboard_by_template(db, current_user)
 
     # 近 N 条已完成任务的生产周期明细
     task_latency = _dashboard_task_latency(db, limit=10)
 
     # 结构化输出符合率指标（P0-2：generate 阶段逐调用行 -> thread 级统计）
     gen_rows = (
-        db.query(TraceLog.trace_id, TraceLog.attempt, TraceLog.success)
+        scope_query(
+            db.query(TraceLog.trace_id, TraceLog.attempt, TraceLog.success), TraceLog, current_user
+        )
         .filter(TraceLog.stage == "generate")
         .all()
     )
@@ -691,7 +730,10 @@ def dashboard(
 
     # 改版触发率：入库条目中经历过自动改版的占比
     revised_items = (
-        db.query(func.count(ContentItem.id)).filter(ContentItem.revise_count >= 1).scalar() or 0
+        scope_query(db.query(func.count(ContentItem.id)), ContentItem, current_user)
+        .filter(ContentItem.revise_count >= 1)
+        .scalar()
+        or 0
     )
     revise_trigger_rate = revised_items / total_items if total_items else 0.0
 
@@ -713,9 +755,31 @@ def dashboard(
             goal="higher_better",
         ),
         DashboardKpi(
+            key="qc_first_pass_rate",
+            label="自动质检首过率",
+            value=(
+                round(pipeline_stats["first_pass_rate"] * 100, 2)
+                if pipeline_stats["first_pass_rate"] is not None
+                else None
+            ),
+            unit="%",
+            goal="higher_better",
+        ),
+        DashboardKpi(
+            key="judge_failure_rate",
+            label="Judge 最终失败率",
+            value=(
+                round(pipeline_stats["quality_failure_rate"] * 100, 2)
+                if pipeline_stats["quality_failure_rate"] is not None
+                else None
+            ),
+            unit="%",
+            goal="lower_better",
+        ),
+        DashboardKpi(
             key="qc_pass_rate",
-            label="质检通过率",
-            value=round(qc_pass_rate * 100, 2),
+            label="自动质检最终通过率",
+            value=round(qc_pass_rate * 100, 2) if qc_pass_rate is not None else None,
             unit="%",
             target=90.0,
             goal="higher_better",
@@ -784,6 +848,7 @@ def dashboard(
 
     return DashboardOut(
         kpis=kpis,
+        quality_pipeline=pipeline_stats,
         by_template=by_template,
         task_latency=task_latency,
         total_cost=float(total_cost or 0.0),
@@ -792,54 +857,44 @@ def dashboard(
     )
 
 
-def _dashboard_by_template(db: Session) -> List[dict]:
-    """按题型聚合：产出量 / 自动质检通过率。
-
-    通过率与全局 KPI 同口径：基于 QualityRecord（source=auto 且 score>=threshold），
-    而非 ContentItem.status（自动质检后状态仍为 pending_qc，仅人工复核/发布才变化）。
-    """
-    threshold = settings.QUALITY_THRESHOLD
-    rows = (
-        db.query(
-            ContentItem.template_id,
-            func.count(ContentItem.id).label("total"),
-            func.sum(
-                case(
-                    (
-                        (QualityRecord.source == "auto") & (QualityRecord.score >= threshold),
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label("passed"),
-        )
-        .outerjoin(QualityRecord, QualityRecord.item_id == ContentItem.id)
-        .group_by(ContentItem.template_id)
-        .all()
-    )
+def _dashboard_by_template(db: Session, current_user: User | None = None) -> List[dict]:
+    """按题型统计唯一评分 thread，避免审核记录 join 放大分母。"""
+    events = scope_query(db.query(QualityEvaluation), QualityEvaluation, current_user).all()
+    templates = sorted({event.template_id for event in events})
     result = []
-    for r in rows:
-        total = int(r.total)
-        pass_cnt = int(r.passed or 0)
+    for template_id in templates:
+        stats = quality_pipeline_stats(
+            event for event in events if event.template_id == template_id
+        )
         result.append(
             {
-                "template_id": r.template_id,
-                "generated": total,
-                "pass_rate": round(pass_cnt / total * 100, 2) if total else 0.0,
+                "template_id": template_id,
+                "generated": stats["threads"],
+                "pass_rate": (
+                    round(stats["final_pass_rate"] * 100, 2)
+                    if stats["final_pass_rate"] is not None
+                    else None
+                ),
             }
         )
     return result
 
 
-def _dashboard_task_latency(db: Session, limit: int = 10) -> List[dict]:
+def _dashboard_task_latency(
+    db: Session, limit: int = 10, current_user: User | None = None
+) -> List[dict]:
     """近 N 条任务的生产周期明细（秒）。"""
     rows = (
-        db.query(
-            GenerationTask.id,
-            GenerationTask.template_id,
-            GenerationTask.status,
-            GenerationTask.created_at,
-            GenerationTask.updated_at,
+        scope_query(
+            db.query(
+                GenerationTask.id,
+                GenerationTask.template_id,
+                GenerationTask.status,
+                GenerationTask.created_at,
+                GenerationTask.updated_at,
+            ),
+            GenerationTask,
+            current_user,
         )
         .order_by(GenerationTask.created_at.desc())
         .limit(limit)
@@ -875,17 +930,26 @@ def list_traces(
 
     每条含调用次数、累计成本、累计耗时与时间范围，便于在列表中选择链路回放。
     """
-    total = db.query(func.count(func.distinct(TraceLog.trace_id))).scalar() or 0
+    total = (
+        scope_query(
+            db.query(func.count(func.distinct(TraceLog.trace_id))), TraceLog, current_user
+        ).scalar()
+        or 0
+    )
     rows = (
-        db.query(
-            TraceLog.trace_id,
-            func.max(TraceLog.task_id).label("task_id"),
-            func.max(TraceLog.template_id).label("template_id"),
-            func.count(TraceLog.id).label("call_count"),
-            func.coalesce(func.sum(TraceLog.cost), 0.0).label("total_cost"),
-            func.coalesce(func.sum(TraceLog.latency_ms), 0.0).label("total_latency_ms"),
-            func.min(TraceLog.created_at).label("first_at"),
-            func.max(TraceLog.created_at).label("last_at"),
+        scope_query(
+            db.query(
+                TraceLog.trace_id,
+                func.max(TraceLog.task_id).label("task_id"),
+                func.max(TraceLog.template_id).label("template_id"),
+                func.count(TraceLog.id).label("call_count"),
+                func.coalesce(func.sum(TraceLog.cost), 0.0).label("total_cost"),
+                func.coalesce(func.sum(TraceLog.latency_ms), 0.0).label("total_latency_ms"),
+                func.min(TraceLog.created_at).label("first_at"),
+                func.max(TraceLog.created_at).label("last_at"),
+            ),
+            TraceLog,
+            current_user,
         )
         .group_by(TraceLog.trace_id)
         .order_by(func.max(TraceLog.created_at).desc())
@@ -923,9 +987,9 @@ def structured_stats(
     generate 阶段每次调用一行（含校验失败尝试，attempt/success 落库），
     按 thread（trace_id）聚合出首过率 / 平均尝试次数 / 最终失败率。
     """
-    q = db.query(TraceLog.trace_id, TraceLog.attempt, TraceLog.success).filter(
-        TraceLog.stage == "generate"
-    )
+    q = scope_query(
+        db.query(TraceLog.trace_id, TraceLog.attempt, TraceLog.success), TraceLog, current_user
+    ).filter(TraceLog.stage == "generate")
     if template_id:
         q = q.filter(TraceLog.template_id == template_id)
     if task_id:
@@ -944,6 +1008,38 @@ def structured_stats(
     return StructuredStatsOut(**stats)
 
 
+@router.get("/api/traces/records/{row_id}/snapshot")
+def get_trace_snapshot(
+    row_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:read")),
+):
+    from app.engine.trace_snapshots import read_snapshot
+
+    row = require_scope(db.get(TraceLog, row_id), current_user)
+    snapshot, data = read_snapshot(db, row.id)
+    record_config_change(
+        db,
+        entity_type="trace_snapshot_access",
+        entity_id=row.id,
+        action="read",
+        actor_id=current_user.id,
+        tenant_id=row.tenant_id,
+        before=None,
+        after={"snapshot_hash": snapshot.content_hash, "replay_level": snapshot.replay_level},
+    )
+    db.commit()
+    return JSONResponse(
+        content={
+            "row_id": row.id,
+            "content_hash": snapshot.content_hash,
+            "replay_level": snapshot.replay_level,
+            "data": data,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/api/traces/{trace_id}", response_model=list[TraceOut])
 def get_trace(
     trace_id: str,
@@ -956,7 +1052,7 @@ def get_trace(
     事件；仅对历史 stage 为空的记录按旧规则推断 generate/qc。
     """
     rows = (
-        db.query(TraceLog)
+        scope_query(db.query(TraceLog), TraceLog, current_user)
         .filter(TraceLog.trace_id == trace_id)
         .order_by(TraceLog.created_at.asc())
         .all()
@@ -983,7 +1079,11 @@ def list_templates(
     current_user: User = Depends(require_permission("content:read")),
 ):
     """题型模板列表。"""
-    return db.query(QuestionTemplate).order_by(QuestionTemplate.type_id).all()
+    return (
+        scope_query(db.query(QuestionTemplate), QuestionTemplate, current_user, shared=True)
+        .order_by(QuestionTemplate.type_id)
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -993,15 +1093,34 @@ def list_templates(
 def create_model_profile(
     req: ModelProfileIn,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_permission("template:manage")),
+    current_user: User = Depends(require_permission("model:manage")),
 ):
     """按名称创建或更新模型档案；配置变化写入不可变审计事件。"""
+    from app.models import ModelRoute
+
+    if (
+        req.status == "disabled"
+        and db.query(ModelRoute)
+        .filter(
+            (ModelRoute.generation_profile == req.name) | (ModelRoute.judge_profile == req.name)
+        )
+        .first()
+    ):
+        raise HTTPException(409, "档案仍被题型路由引用，请先清除路由覆盖再禁用")
+    if req.is_default and req.status != "enabled":
+        raise HTTPException(422, "默认模型必须启用")
+    from app.models import ModelProvider
+
+    bound = db.get(ModelProvider, req.provider_id) if req.provider_id else None
+    if req.provider_id and (bound is None or bound.status != "enabled"):
+        raise HTTPException(422, "所选Provider不存在或已禁用")
+    db.flush()
     before_profile = db.query(ModelProfile).filter(ModelProfile.name == req.name).first()
     before = _model_profile_snapshot(before_profile) if before_profile else None
     if req.is_default:
-        db.query(ModelProfile).filter(ModelProfile.name != req.name).update(
-            {ModelProfile.is_default: False}, synchronize_session=False
-        )
+        db.query(ModelProfile).filter(
+            ModelProfile.name != req.name, ModelProfile.tenant_id == req.tenant_id
+        ).update({ModelProfile.is_default: False}, synchronize_session="fetch")
     if before_profile is None:
         profile = ModelProfile(**req.model_dump())
         db.add(profile)
@@ -1011,19 +1130,28 @@ def create_model_profile(
         for key, value in req.model_dump().items():
             setattr(profile, key, value)
         action = "update"
+    if bound is not None:
+        profile.provider = bound.name
+        profile.provider_config_hash = bound.config_hash
+    else:
+        profile.provider_config_hash = None
     ensure_model_profile_hash(profile)
-    db.flush()
-    record_config_change(
-        db,
-        entity_type="model_profile",
-        entity_id=profile.id,
-        action=action,
-        actor_id=current_user.id,
-        tenant_id=profile.tenant_id or current_user.tenant_id,
-        before=before,
-        after=_model_profile_snapshot(profile),
-    )
-    db.commit()
+    try:
+        db.flush()
+        record_config_change(
+            db,
+            entity_type="model_profile",
+            entity_id=profile.id,
+            action=action,
+            actor_id=current_user.id,
+            tenant_id=profile.tenant_id or current_user.tenant_id,
+            before=before,
+            after=_model_profile_snapshot(profile),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "模型名称、默认档案或Provider关联冲突，请刷新后重试") from exc
     db.refresh(profile)
     return profile
 
@@ -1034,7 +1162,11 @@ def list_model_profiles(
     current_user: User = Depends(require_permission("content:read")),
 ):
     """模型档案列表。"""
-    return db.query(ModelProfile).order_by(ModelProfile.name).all()
+    return (
+        scope_query(db.query(ModelProfile), ModelProfile, current_user, shared=True)
+        .order_by(ModelProfile.name)
+        .all()
+    )
 
 
 def _model_profile_snapshot(profile: ModelProfile | None) -> dict | None:
@@ -1044,6 +1176,8 @@ def _model_profile_snapshot(profile: ModelProfile | None) -> dict | None:
     return {
         "name": profile.name,
         "provider": profile.provider,
+        "provider_id": profile.provider_id,
+        "provider_config_hash": profile.provider_config_hash,
         "model_name": profile.model_name,
         "model_hash": profile.model_hash,
         "cost_tier": profile.cost_tier,
@@ -1068,7 +1202,7 @@ def list_config_audit(
 ):
     """查询模板/模型配置变更；非管理员只能查看自身租户事件。"""
     scoped_tenant = current_user.tenant_id if current_user.role != "admin" else tenant_id
-    query = db.query(ConfigAuditEvent)
+    query = scope_query(db.query(ConfigAuditEvent), ConfigAuditEvent, current_user)
     if entity_type:
         query = query.filter(ConfigAuditEvent.entity_type == entity_type)
     if entity_id:
@@ -1096,7 +1230,9 @@ def list_notifications(
     """站内通知列表（分页），可只看未读，返回未读总数。"""
     service = NotificationService(db)
     skip = (page - 1) * page_size
-    result = service.list_notifications(current_user, skip=skip, limit=page_size)
+    result = service.list_notifications(
+        current_user, skip=skip, limit=page_size, unread_only=unread_only
+    )
     unread = service.get_unread_count(current_user)
     return NotificationListOut(total=result["total"], unread=unread, items=result["items"])
 
@@ -1153,6 +1289,8 @@ def upload_knowledge(
         knowledge_point=req.knowledge_point,
         meta=req.meta,
         user=current_user,
+        knowledge_points=req.knowledge_points,
+        chunk_layout=req.chunk_layout,
     )
     return KnowledgeUploadOut(**result)
 
@@ -1166,47 +1304,72 @@ def upload_knowledge_file(
     file: UploadFile = File(...),
     source_type: str = Form("真题"),
     knowledge_point: str | None = Form(None),
+    knowledge_points: str = Form("[]"),
+    chunk_layout: Literal["legacy", "structure"] | None = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission("ops:write")),
 ):
-    """上传教研文档（txt/md/docx/pdf）并解析、分块向量化入库。
+    """上传教研文档（txt/md/docx/pdf/html/xlsx/csv）并解析、分块向量化入库。
 
     文件名自动作为 source_name（去扩展名），便于按资料追溯。
     """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="文件名不能为空")
-    content = file.file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="文件内容为空")
-    if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="文件过大（上限 10MB）")
-
+    service = KnowledgeService(db)
+    # Read at most the limit + 1 before rejecting, not an unbounded read.
+    content = file.file.read(_MAX_UPLOAD_BYTES + 1)
     try:
-        text = parse_file(file.filename, content)
-    except UnsupportedFileTypeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-    source_name = Path(file.filename).stem
-    chunks = index_document(
-        db,
-        source_type=source_type,
-        source_name=source_name,
-        text=text,
-        knowledge_point=knowledge_point,
-        meta={"filename": file.filename},
-    )
-    if chunks == 0:
+        tags = json.loads(knowledge_points)
+        if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+            raise ValueError("标签必须是字符串列表")
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
-            status_code=400, detail="解析后无可索引文本，文件可能为空或为纯图片 PDF"
-        )
-    return KnowledgeUploadOut(
-        chunks=chunks,
-        source_type=source_type,
-        source_name=source_name,
-        knowledge_point=knowledge_point,
+            status_code=422, detail="knowledge_points 必须是 JSON 字符串列表"
+        ) from exc
+    result = service.upload_file(
+        file.filename or "", content, source_type, knowledge_point, current_user, tags, chunk_layout
     )
+    return KnowledgeUploadOut(**result)
+
+
+@router.get("/api/knowledge/points")
+def knowledge_points_catalog(
+    current_user: User = Depends(require_permission("ops:read")),
+) -> dict[str, Any]:
+    from app.rag.knowledge_points import load_catalog
+
+    catalog = load_catalog()
+    return {
+        "catalog_hash": catalog.hash,
+        "defaults": {
+            "top_k": settings.RAG_TOP_K,
+            "chunk_layout": settings.RAG_CHUNK_LAYOUT,
+            "context_mode": settings.RAG_CONTEXT_MODE,
+            "context_max_chars": settings.RAG_CONTEXT_MAX_CHARS,
+            "scope_mode": settings.RAG_KNOWLEDGE_SCOPE,
+            "method": settings.RAG_RETRIEVAL_METHOD,
+        },
+        "items": [p.model_dump() for p in catalog.points.values() if p.status == "enabled"],
+    }
+
+
+@router.post("/api/knowledge/preview")
+def preview_knowledge_file(
+    file: UploadFile = File(...),
+    chunk_layout: Literal["legacy", "structure"] | None = Form(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:write")),
+) -> dict[str, Any]:
+    """Preview blocks/chunks/warnings without embedding or database writes."""
+    content = file.file.read(_MAX_UPLOAD_BYTES + 1)
+    return KnowledgeService(db).preview_file(file.filename or "", content, chunk_layout)
+
+
+@router.get("/api/knowledge/{chunk_id}/diagnostics")
+def knowledge_chunk_diagnostics(
+    chunk_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:read")),
+) -> dict[str, Any]:
+    return KnowledgeService(db).chunk_diagnostics(chunk_id, current_user)
 
 
 @router.get("/api/knowledge", response_model=KnowledgeListOut)
@@ -1231,6 +1394,46 @@ def list_knowledge(
     )
 
 
+@router.get("/api/knowledge/documents")
+def knowledge_documents(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:read")),
+):
+    return KnowledgeService(db).list_documents(page, page_size, current_user)
+
+
+@router.get("/api/knowledge/documents/{document_id}/structure")
+def knowledge_document_structure(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:read")),
+):
+    """Free source/structure preview; no embedding or index mutation."""
+    return KnowledgeService(db).structure_preview(document_id, current_user)
+
+
+@router.post("/api/knowledge/documents/{document_id}/structure-review")
+def review_knowledge_document_structure(
+    document_id: str,
+    body: StructureReview,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:write")),
+):
+    """Free source-bound edge review. Reject stale indexes and unknown edges."""
+    return KnowledgeService(db).review_structure(document_id, body, current_user)
+
+
+@router.delete("/api/knowledge/documents/{document_id}")
+def remove_knowledge_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:write")),
+):
+    return KnowledgeService(db).delete_document(document_id, current_user)
+
+
 @router.delete("/api/knowledge/{chunk_id}")
 def delete_knowledge(
     chunk_id: str,
@@ -1245,19 +1448,29 @@ def delete_knowledge(
 
 @router.get("/api/knowledge/retrieve", response_model=KnowledgeRetrieveOut)
 def retrieve_knowledge(
-    query: str,
+    query: str = Query(..., min_length=1, max_length=512),
     knowledge_point: str | None = None,
-    top_k: int = Query(3, ge=1, le=10),
+    top_k: int | None = Query(None, ge=1, le=10),
+    scope_mode: Literal["exact", "ancestor", "descendant", "related", "semantic"] | None = None,
+    document_ids: List[str] | None = Query(None),
+    source_name: str | None = None,
+    section_path: List[str] | None = Query(None),
+    context_mode: Literal["legacy", "relation"] | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission("ops:read")),
 ):
-    """向量检索最相关的知识分块，供调试与人工查看。"""
+    """知识点范围内混合检索、融合与上下文扩展，返回各阶段诊断。"""
     service = KnowledgeService(db)
     result = service.retrieve_knowledge(
         query=query,
         knowledge_point=knowledge_point,
         top_k=top_k,
         user=current_user,
+        scope_mode=scope_mode,
+        document_ids=document_ids,
+        source_name=source_name,
+        section_path=section_path,
+        context_mode=context_mode,
     )
     return KnowledgeRetrieveOut(**result)
 
@@ -1330,6 +1543,7 @@ def export_samples(
     """导出回流样本为 JSONL（few-shot/微调语料，每行一条样本）。"""
     rows, _ = list_samples(
         db,
+        user=current_user,
         template_id=template_id,
         knowledge_point=knowledge_point,
         purpose=purpose,
@@ -1356,6 +1570,35 @@ def export_samples(
     )
 
 
+@router.patch("/api/samples/{sample_id}/purpose")
+def set_sample_purpose(
+    sample_id: str,
+    purpose: Literal["sft", "fewshot"],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("ops:write")),
+):
+    from app.models import SamplePool
+
+    row = require_scope(db.get(SamplePool, sample_id), current_user)
+    item = require_scope(db.get(ContentItem, row.item_id), current_user)
+    if item.status not in {"passed", "published"}:
+        raise HTTPException(409, "源内容当前未通过，不能改变样本用途")
+    before = {"purpose": row.purpose}
+    row.purpose = purpose
+    record_config_change(
+        db,
+        entity_type="sample_pool",
+        entity_id=row.id,
+        action="purpose",
+        actor_id=current_user.id,
+        tenant_id=row.tenant_id,
+        before=before,
+        after={"purpose": purpose},
+    )
+    db.commit()
+    return {"id": row.id, "purpose": row.purpose}
+
+
 @router.delete("/api/samples/{sample_id}")
 def delete_sample(
     sample_id: str,
@@ -1371,6 +1614,13 @@ def delete_sample(
 # ---------------------------------------------------------------------------
 # 健康检查
 # ---------------------------------------------------------------------------
+@router.get("/api/trace-health")
+def trace_health(current_user: User = Depends(require_permission("ops:read"))):
+    from app.engine.trace_recovery import trace_diagnostics
+
+    return trace_diagnostics()
+
+
 @router.get("/api/health", response_model=HealthOut)
 def health_check():
     """健康检查。"""

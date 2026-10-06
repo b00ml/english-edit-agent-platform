@@ -113,7 +113,8 @@ class TestLangfuseSink:
     def test_noop_without_keys(self, monkeypatch):
         monkeypatch.setattr(settings, "LANGFUSE_PUBLIC_KEY", "")
         sink = LangfuseSink()
-        sink.emit({"trace_id": "t1"})  # 不配置密钥：no-op，不抛错、无网络请求
+        with pytest.raises(RuntimeError, match="not been configured"):
+            sink.emit({"trace_id": "t1"})  # 未配置不得伪装导出成功；无网络请求
         assert sink._get_client() is None
 
     def test_emit_with_client_builds_generation(self, monkeypatch):

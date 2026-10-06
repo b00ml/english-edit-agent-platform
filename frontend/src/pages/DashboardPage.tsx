@@ -13,6 +13,7 @@ import type { CalibrationRecord, DashboardResult, DashboardKpi, Template } from 
 
 function formatValue(kpi: DashboardKpi): string {
   const { value, unit } = kpi
+  if (value == null) return "暂无样本"
   if (unit === '%') return `${value}%`
   if (unit === '¥') return `¥${value.toFixed(4)}`
   if (unit === 's') {
@@ -25,7 +26,7 @@ function formatValue(kpi: DashboardKpi): string {
 }
 
 function isMet(kpi: DashboardKpi): boolean | null {
-  if (kpi.target == null) return null
+  if (kpi.target == null || kpi.value == null) return null
   return kpi.goal === 'lower_better' ? kpi.value <= kpi.target : kpi.value >= kpi.target
 }
 
@@ -148,7 +149,7 @@ export default function DashboardPage() {
                     <tr key={t.template_id}>
                       <td className="mono">{t.template_id}</td>
                       <td>{t.generated}</td>
-                      <td>{t.pass_rate}%</td>
+                      <td>{t.pass_rate == null ? "暂无终态样本" : `${t.pass_rate}%`}</td>
                     </tr>
                   ))}
                   {data.by_template.length === 0 && (

@@ -1,114 +1,65 @@
-"""
-AppNotification Service Layer
-负责站内通知的业务逻辑
-"""
+"""Notifications are tenant broadcasts; the model does not contain a user_id."""
 
-from sqlalchemy import func
+from __future__ import annotations
+
+from typing import TypedDict
+
 from sqlalchemy.orm import Session
 
-from app.errors import NotFoundError
 from app.models import AppNotification, User
+from app.tenancy import require_scope, scope_query
+
+
+class NotificationList(TypedDict):
+    items: list[AppNotification]
+    total: int
 
 
 class NotificationService:
-    """通知服务"""
-
-    def __init__(self, db: Session):
+    def __init__(self, db: Session) -> None:
         self.db = db
 
-    def list_notifications(self, user: User, skip: int = 0, limit: int = 50) -> dict:
-        """
-        列出用户的通知
-
-        权限：仅返回 user_id 匹配的通知
-        """
-        notifications = (
-            self.db.query(AppNotification)
-            .filter(AppNotification.user_id == user.id)
-            .order_by(AppNotification.created_at.desc())
+    def list_notifications(
+        self, user: User, skip: int = 0, limit: int = 50, unread_only: bool = False
+    ) -> NotificationList:
+        query = scope_query(self.db.query(AppNotification), AppNotification, user)
+        if unread_only:
+            query = query.filter(AppNotification.is_read.is_(False))
+        return {
+            "items": query.order_by(AppNotification.created_at.desc())
             .offset(skip)
             .limit(limit)
-            .all()
-        )
-
-        total = (
-            self.db.query(func.count(AppNotification.id))
-            .filter(AppNotification.user_id == user.id)
-            .scalar()
-            or 0
-        )
-
-        items = []
-        for notif in notifications:
-            items.append(
-                {
-                    "id": notif.id,
-                    "type": notif.type,
-                    "title": notif.title,
-                    "content": notif.content,
-                    "is_read": notif.is_read,
-                    "created_at": notif.created_at.isoformat(),
-                }
-            )
-
-        return {"items": items, "total": total, "skip": skip, "limit": limit}
+            .all(),
+            "total": query.count(),
+        }
 
     def get_unread_count(self, user: User) -> int:
-        """
-        获取未读通知数
-
-        权限：仅统计 user_id 匹配的通知
-        """
         return (
-            self.db.query(func.count(AppNotification.id))
-            .filter(AppNotification.user_id == user.id)
+            scope_query(self.db.query(AppNotification), AppNotification, user)
             .filter(AppNotification.is_read.is_(False))
-            .scalar()
-            or 0
+            .count()
         )
 
-    def mark_as_read(self, notification_id: str, user: User) -> dict:
-        """
-        标记通知为已读
-
-        权限：验证通知所属 user_id
-        """
-        notif = self.db.query(AppNotification).filter(AppNotification.id == notification_id).first()
-
-        if not notif:
-            raise NotFoundError(f"AppNotification not found: {notification_id}")
-
-        # 权限校验
-        if notif.user_id != user.id:
-            from app.errors import TenantScopeDeniedError
-
-            raise TenantScopeDeniedError("Cannot access AppNotification of another user")
-
-        notif.is_read = True
+    def mark_as_read(self, notification_id: str, user: User) -> dict[str, object]:
+        row = require_scope(self.db.get(AppNotification, notification_id), user)
+        row.is_read = True
         self.db.commit()
-        self.db.refresh(notif)
-
+        self.db.refresh(row)
         return {
-            "id": notif.id,
-            "type": notif.type,
-            "title": notif.title,
-            "content": notif.content,
-            "is_read": notif.is_read,
-            "created_at": notif.created_at.isoformat(),
+            "id": row.id,
+            "type": row.type,
+            "title": row.title,
+            "content": row.content,
+            "related_id": row.related_id,
+            "is_read": row.is_read,
+            "created_at": row.created_at,
         }
 
     def mark_all_as_read(self, user: User) -> int:
-        """
-        标记所有未读通知为已读
-
-        权限：仅操作 user_id 匹配的通知
-        """
-        updated = (
-            self.db.query(AppNotification)
-            .filter(AppNotification.user_id == user.id)
+        count = (
+            scope_query(self.db.query(AppNotification), AppNotification, user)
             .filter(AppNotification.is_read.is_(False))
             .update({"is_read": True}, synchronize_session=False)
         )
         self.db.commit()
-
-        return updated
+        return count

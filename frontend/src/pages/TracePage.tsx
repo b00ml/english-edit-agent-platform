@@ -1,6 +1,6 @@
 // TracePage.tsx —— 链路回放：按 trace_id 查看完整生成链路（生成→质检各步 LLM 调用）
 import { useEffect, useState } from 'react'
-import { getApiErrorMessage, getTrace, listTraces } from '../api/client'
+import { getApiErrorMessage, getTrace, getTraceSnapshot, listTraces } from '../api/client'
 import type { TraceStep, TraceSummary } from '../api/types'
 
 function formatCost(v: number | null | undefined): string {
@@ -25,6 +25,8 @@ export default function TracePage() {
   const [loadingList, setLoadingList] = useState(false)
   const [loadingSteps, setLoadingSteps] = useState(false)
   const [error, setError] = useState('')
+  const [snapshot, setSnapshot] = useState<Record<string, unknown> | null>(null)
+  const [snapshotBusy, setSnapshotBusy] = useState(false)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   const loadList = () => {
@@ -166,6 +168,12 @@ export default function TracePage() {
                     </div>
                     {expanded[step.id] && (
                       <div className="trace-step-body">
+                        <p>受限快照：{step.snapshot_status ?? 'legacy_unavailable'}（摘要仍脱敏/截断；快照读取会审计，旧记录不能补出完整Prompt）</p>
+                        <button className="btn btn-ghost" disabled={snapshotBusy || step.snapshot_status !== 'available'} onClick={async () => {
+                          setSnapshotBusy(true); setError('')
+                          try {setSnapshot(await getTraceSnapshot(step.id))} catch(e) {setError(getApiErrorMessage(e, '快照不可用'))} finally {setSnapshotBusy(false)}
+                        }}>查看受限请求／响应快照</button>
+
                         {step.input_data && (
                           <div className="trace-step-section">
                             <div className="form-label">输入</div>
@@ -191,6 +199,7 @@ export default function TracePage() {
           )}
         </div>
       </div>
+      {snapshot && <div className="modal-mask" onClick={() => setSnapshot(null)}><div className="modal" onClick={e => e.stopPropagation()}><div className="modal-header"><h3>受限脱敏快照</h3><button className="btn btn-ghost" onClick={() => setSnapshot(null)}>关闭快照</button></div><div className="modal-body"><p>只能回放保存时的脱敏请求／响应，不保证模型重跑结果一致。超过预算、过期或旧调用不可补造。</p><pre className="pre">{JSON.stringify(snapshot,null,2)}</pre></div></div></div>}
     </div>
   )
 }

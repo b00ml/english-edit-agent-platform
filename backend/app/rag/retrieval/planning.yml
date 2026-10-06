@@ -1,0 +1,2 @@
+version: question-plan-v1
+separators: '(?:以及|同时(?:还)?|另外|此外|[；;]|\band also\b)'

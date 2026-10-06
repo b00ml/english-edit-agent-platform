@@ -1,0 +1,51 @@
+# Shared taxonomy, NOT shared knowledge documents or authorization rules.
+version: 1
+points:
+  - id: grammar
+    canonical_name: 英语语法
+    aliases: [grammar, english grammar]
+    subject: English
+    stage: general
+    status: enabled
+  - id: tenses
+    canonical_name: 时态
+    aliases: [tense, tenses]
+    parent_id: grammar
+    status: enabled
+  - id: present_simple
+    canonical_name: 一般现在时
+    aliases: [现在时, present simple, simple present]
+    parent_id: tenses
+    related: [subject_verb_agreement]
+    status: enabled
+  - id: present_continuous
+    canonical_name: 现在进行时
+    aliases: [present continuous, present progressive]
+    parent_id: tenses
+    status: enabled
+  - id: past_simple
+    canonical_name: 一般过去时
+    aliases: [past simple, simple past]
+    parent_id: tenses
+    status: enabled
+  - id: subject_verb_agreement
+    canonical_name: 主谓一致
+    aliases: [subject verb agreement, subject-verb agreement, 第三人称单数]
+    parent_id: grammar
+    related: [present_simple]
+    status: enabled
+  - id: compound_sentence
+    canonical_name: 并列句
+    aliases: [compound sentence, compound sentences, 并列复合句]
+    parent_id: grammar
+    status: enabled
+  - id: noun
+    canonical_name: 名词
+    aliases: [noun, nouns, 名词分类]
+    parent_id: grammar
+    status: enabled
+  - id: verb
+    canonical_name: 动词
+    aliases: [verb, verbs, 动词分类]
+    parent_id: grammar
+    status: enabled

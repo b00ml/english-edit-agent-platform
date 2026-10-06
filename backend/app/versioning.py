@@ -96,6 +96,10 @@ def quality_snapshot(
     snapshot.update(
         {
             "model_name": model_name,
+            "judge_prompt_hash": _prompt_hash(
+                {"system": "judge-system.st", "user": "judge-user.st"}
+            ),
+            "judge_skill_hash": _skill_hash("judge"),
             "threshold": threshold,
             "weights": weights,
         }
@@ -114,6 +118,8 @@ def model_profile_hash(profile: Any) -> str:
         {
             "name": profile.name,
             "provider": profile.provider,
+            "provider_id": getattr(profile, "provider_id", None),
+            "provider_config_hash": getattr(profile, "provider_config_hash", None),
             "model_name": profile.model_name,
             "cost_tier": profile.cost_tier,
             "is_default": profile.is_default,
@@ -138,6 +144,8 @@ def task_version_snapshot_with_model(template: Any, profile: Any | None = None) 
         snapshot["model"] = {
             "name": profile.name,
             "provider": profile.provider,
+            "provider_id": getattr(profile, "provider_id", None),
+            "provider_config_hash": getattr(profile, "provider_config_hash", None),
             "model_name": profile.model_name,
             "model_hash": getattr(profile, "model_hash", None) or model_profile_hash(profile),
         }

@@ -7,9 +7,12 @@
 import logging
 import re
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
+from app.engine.trace_recovery import note_durability, note_sink, spool_trace
+from app.errors import TracePersistenceError
 
 logger = logging.getLogger("app.engine.trace")
 
@@ -30,6 +33,12 @@ _SENSITIVE_VALUE_PATTERN = re.compile(
     r"(\s*[:=]\s*)([^\s,;]+)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)(bearer\s+)([^\s,;]+)")
+_QUOTED_SECRET_PATTERN = re.compile(
+    r'("(?:[\w-]+_)?(?:api[_-]?key|authorization|password|secret|'
+    r'access[_-]?token|refresh[_-]?token|token)"\s*:\s*)'
+    r'("(?:\\.|[^"\\])*")',
+    re.IGNORECASE,
+)
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -55,6 +64,7 @@ def _sanitize_string(value: str, max_string_length: int) -> str:
     """脱敏字符串值中的常见 key=value 和 Bearer 凭据。"""
     # 先处理 Bearer，避免 ``Authorization: Bearer <token>`` 被 key=value
     # 规则截断为只脱敏 ``Bearer``，从而把真正凭据留在字符串中。
+    value = _QUOTED_SECRET_PATTERN.sub(lambda match: match.group(1) + '"[REDACTED]"', value)
     sanitized = _BEARER_PATTERN.sub(r"\1[REDACTED]", value)
     sanitized = _SENSITIVE_VALUE_PATTERN.sub(r"\1\2[REDACTED]", sanitized)
     if len(sanitized) > max_string_length:
@@ -146,6 +156,16 @@ def token_breakdown(usage: Optional[Any], model: str) -> Dict[str, Any]:
     }
 
 
+def usage_is_reported(usage: object, stage: str) -> bool:
+    fields = ("prompt_tokens",) if stage == "embedding" else ("prompt_tokens", "completion_tokens")
+    return all(
+        isinstance(getattr(usage, name, None), int)
+        and not isinstance(getattr(usage, name, None), bool)
+        and getattr(usage, name) >= 0
+        for name in fields
+    )
+
+
 def _token_usage(usage: Optional[Any]) -> tuple[int, int]:
     """提取 usage 中的输入/输出 token 数（缺失按 0 计）。"""
     if usage is None:
@@ -173,6 +193,10 @@ def record_trace(
     completion_tokens: Optional[int] = None,
     attempt: int = 1,
     success: bool = True,
+    usage_reported: bool | None = None,
+    prompt_cost: float | None = None,
+    completion_cost: float | None = None,
+    snapshot_data: Dict[str, Any] | None = None,
 ) -> None:
     """组装一条 trace 并分发到所有配置的 Sink（失败尝试同样记录）。
 
@@ -180,7 +204,16 @@ def record_trace(
     （含校验失败的尝试）各写一行，失败行 output_data 为 {"error_summary": ...}。
     单个 Sink 失败仅告警，不中断其余 Sink 与生成主流程。
     """
+    from app.engine.observability import TraceLogSink
+    from app.engine.trace_snapshots import prepare_snapshot
+
+    prepared = prepare_snapshot(snapshot_data)
     trace: Dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "snapshot_status": prepared.status,
+        "usage_reported": usage_reported,
+        "prompt_cost": prompt_cost,
+        "completion_cost": completion_cost,
         "trace_id": trace_id,
         "task_id": task_id,
         "template_id": template_id,
@@ -198,11 +231,33 @@ def record_trace(
         "attempt": attempt,
         "success": success,
     }
+    database_written = False
     for sink in _get_sinks():
+        name = getattr(sink, "name", type(sink).__name__)
         try:
-            sink.emit(trace)
-        except Exception:  # noqa: BLE001 —— 可观测性写入失败不应中断生成主流程
-            logger.warning("trace sink 写入失败 sink=%s", type(sink).__name__, exc_info=True)
+            if isinstance(sink, TraceLogSink) and hasattr(sink, "emit_with_snapshot"):
+                sink.emit_with_snapshot(trace, prepared)
+            else:
+                sink.emit(trace)
+            note_sink(name, True)
+            database_written = database_written or name == "db"
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - preserve other sinks, never log raw credentials/SQL values
+            note_sink(name, False, type(exc).__name__)
+            logger.warning("trace sink 写入失败 sink=%s error_type=%s", name, type(exc).__name__)
+    if not database_written and trace["snapshot_status"] == "available":
+        trace["snapshot_status"] = "capture_failed"
+    durable = database_written
+    if not durable and settings.TRACE_FAILURE_SPOOL_DIR:
+        try:
+            durable = spool_trace(trace)
+        except OSError as exc:
+            note_sink("spool", False, type(exc).__name__)
+            logger.error("trace spool 写入失败 error_type=%s", type(exc).__name__)
+    note_durability(durable)
+    if not durable and settings.TRACE_REQUIRE_DURABILITY:
+        raise TracePersistenceError("Trace 无法写入数据库或持久化补偿目录，拒绝静默丢失")
 
 
 def record_lifecycle_event(
