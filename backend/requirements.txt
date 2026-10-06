@@ -25,7 +25,7 @@ python-docx
 pypdf
 PyJWT
 passlib[bcrypt]
-bcrypt==4.2.1
+bcrypt==5.0.0
 openpyxl>=3.1.5
 
 # Small PDFium renderer for authenticated original-page QA; no OCR model weights.
