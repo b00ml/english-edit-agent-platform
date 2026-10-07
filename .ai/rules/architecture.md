@@ -1,5 +1,7 @@
 # .ai/rules/architecture.md —— 架构设计
 
+
+> 文档分发：当前实现入口为 `docs/docs_public/英语内容生产工作台-当前实现与系统架构.md`；下文旧现状/验收文档仅在维护者本机保留，不随公开clone提供，源码仍为核验实现的依据。
 ## 分层架构
 ```
 React 工作台 ──REST──> FastAPI 薄接口 ──入队──> Celery Worker

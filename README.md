@@ -1,22 +1,8 @@
 # 英语教研 AI 内容生成平台 2.0
 
-维护者主文档见 [当前实现与系统架构](docs/现状文档2/英语内容生产工作台-当前实现与系统架构.md)：主文档及五份专题按业务流程解释架构、数据/状态、RAG、生成质量、可靠性与部署维护。原现状文档及验收报告作为阶段证据保留。 历史追溯见 [历史与证据索引](docs/现状文档2/历史与证据/00-历史与证据索引.md)，包含演进、验收矩阵、失败记录和原位文件hash清单。
+维护者文档见 [当前实现与系统架构](docs/docs_public/英语内容生产工作台-当前实现与系统架构.md)，覆盖系统架构、两条业务链路、前后端能力、RAG、任务可靠性、部署维护与验证边界。
 
-当前代码、质量评测、任务恢复及已知风险见 [项目现状文档](docs/现状文档/系统现状.md)。
-
-最新OPT-074（2026-10-06）：批次N/单item1、父/子Outbox租约与周期恢复、Redis命名卷+AOF everysec已落地；955回归/50真PG/app82.62%，原4236 Redis值保留、原业务计数不变，无真实模型调用。见 [紧急1—2—3验收](docs/现状文档/10-6优化1-2-3落地与验收.md)。
-
-上轮OPT-073（2026-10-06）：structure/relation已成为主RAG链路；名词/动词存量已选择性迁移，三内置题型要求来源并人工核验。6条真实生成均保留待质检，发现完形质量风险不自动发布；见 [主链路切换与真实生成验收](docs/现状文档/RAG-主链路切换与真实生成验收.md)。
-
-上轮OPT-072（2026-10-06）：默认RAG返回Top-5/网页可选Top-8，总上下文预算32768字符；候选池30、融合和scope不变。最终两档真实44题均来源齐备，统一Top-3仍43/44，不冒充排序算法优化；895回归/42真PG/app82.31%，原环境已部署且无语料重嵌入。见 [Top-5/8与上下文预算验收](docs/现状文档/RAG-Top5-Top8与上下文预算验收.md)。
-
-上轮OPT-071（2026-10-06）：STR-5结构化跨页leaf/逐段来源/显式选择性重建与STR-6独立实验代码已部署；并列句同ID v2→v3，主库3资料/70真实leaf向量+1parent。871回归/39真PG、app82.29%；真实44题来源齐备44→43，已知RRF/top3回归保留，默认layout仍legacy、不全库推广。语义/确定性上下文真实小实验无增益，Late真实模型及LLM上下文效果仍待；见 [STR-5/6验收与限制](docs/现状文档/RAG-STR5-STR6落地与验收.md)。
-
-上一阶段OPT-070：STR-3逻辑表格/局部2或3页OCR复核、STR-4跨章引用/多问题证据检索已部署；811回归/36真PG、app81.63%，原36+8有限gold来源齐备。未重嵌入，复核不自动改原源，真实跨页表格全量质量仍待；见 [STR-3/4验收](docs/现状文档/RAG-STR3-STR4落地与验收.md)。
-
-上一阶段OPT-069：STR-1/2结构重建与关系感知small-to-big已部署，原36条齐备、新8条7齐备，751回归/32真PG，全app80.57%。旧页内模式可回退，不重嵌入；参见 [STR-1/2验收](docs/现状文档/RAG-STR1-STR2落地与验收.md)。
-
-历史OPT-068（2026-10-05）：OCR工作台、真实索引/单文档重建撤除、中文自由问句补召回已部署；3资料/52真实leaf向量+2parent。原18+新16条有限样本带齐标注来源，但另2跨页仅1条完整；全app覆盖率79.51%未过CI80%。仅选页不代表整书，来源命中不代表生成事实正确；最新证据见 [中文召回与结构评测](docs/现状文档/RAG-P2中文召回修复与结构评测.md)，索引运营见 [上一阶段报告](docs/现状文档/RAG-P2索引运营与多文档评测.md)。
+公开仓库的 `docs/` 只分发 `docs_public/`。其余设计稿、专题、优化记录、历史验收报告和私有证据仅在维护者本机保留，不随公开版本上传。
 
 基于 LangGraph 编排的 AI 原生内容生产线，将大模型能力封装为**选题 → 生成 → 校验 → 质检 → 改版 → 入库 → 发布**的全链路，面向英语教研场景生成高可用的题目内容（单选 / 完形 / 阅读）。
 
@@ -86,7 +72,7 @@ english-edit/
 ├── frontend/               # React 工作台（生成/任务/质检/内容库/样本库/看板/成本/链路/知识库/消息/用户管理/登录）
 ├── deploy/
 │   └── docker-compose.yml  # 全栈编排
-└── docs/                   # PRD / 技术架构 / 任务清单 / 优化记录
+└── docs/docs_public/       # 公开维护者文档（其他 docs 仅本机保留）
 ```
 
 ---
@@ -255,24 +241,11 @@ npm run build
 
 ## 文档
 
-- [项目现状](docs/现状文档/系统现状.md) · [质量与评测](docs/现状文档/质量与评测现状.md) · [验证与风险](docs/现状文档/验证状态与风险.md)
-- [需求文档（PRD）](docs/AI内容生成平台2.0-PRD.md)
-- [技术架构设计](docs/AI内容生成平台2.0-技术架构设计.md)
-- [开发任务清单](docs/tasks.md)
-- [优化记录与成果追踪](docs/优化记录.md)
-- [P1-5 部署、迁移和恢复演练](docs/P1-5-部署迁移恢复演练.md)
-- [优化技术设计 3.0](docs/优化技术设计3.0.md)
-- [面试准备 - Agent 项目深度拷打与踩坑复盘](docs/面试准备-Agent项目深度拷打与踩坑复盘.md)
-- [GitHub 开源发布检查清单](docs/开源发布检查清单.md)
+- [当前实现与系统架构](docs/docs_public/英语内容生产工作台-当前实现与系统架构.md)：项目定位、架构、生成/RAG链路、数据状态、维护入口与已知限制。
+- [工程约束](AGENTS.md)、[行为准则](CLAUDE.md)、[详细规则](.ai/rules)：开发时的权威规范。
+- [贡献说明](CONTRIBUTING.md)、[安全说明](SECURITY.md)、[第三方声明](THIRD_PARTY_NOTICES.md)。
 
-## 历史验证记录（本次未复验）
-
-- 非集成测试：`240 passed, 5 deselected`。
-- Docker PostgreSQL/Redis 健康检查、Langfuse 独立数据库初始化、`alembic upgrade head`、`pg_dump/pg_restore` 独立恢复库已验证。
-- 迁移当前 revision 与 head 均为 `m3_03_model_hash`；恢复库未覆盖源库。
-- 恢复演练入口：`python scripts/recovery_drill.py --phase checkpoint-start|checkpoint-resume|outbox`（详见 P1-5 文档）。
-- 模型路由具备 fallback、cooldown、失败计数和任务预算限制；任务通过 `trace_id` 关联 LLM、embedding、workflow、queue 生命周期。
-- 尚未宣称的边界：运行中 worker kill/restart 后的真实 PostgresSaver checkpoint 恢复，以及 Celery dead outbox 在线重放，需在带 worker/checkpointer 的部署环境执行。
+公开文档不包含完整历史资料或本机原始证据；历史验证数字按发生日期和范围引用，不能当成所有环境均已通过的承诺。
 
 ---
 
@@ -282,7 +255,7 @@ npm run build
 - 题型扩展通过新增 `templates/*.yaml` + `.st` prompt + SKILL.md，不改代码
 - 模型输出必须经 Pydantic 二次校验，不直接信任模型返回
 - 每次 LLM 调用带 `trace_id`，记录模型 / 输入输出 / 耗时 / 成本 / token
-- 每次代码改动在 `docs/优化记录.md` 追加 `OPT-0XX` 记录，并同步 `docs/tasks.md`
+- 维护者本机仍在 `docs/优化记录.md` 与 `docs/tasks.md` 追踪变更（不公开分发）；公开贡献请在提交/PR中记录动机、改动和验证结果，见 [贡献说明](CONTRIBUTING.md)。
 
 ## 开源边界
 
@@ -293,62 +266,19 @@ npm run build
 ## 已知发布前风险
 
 - 前端依赖已升级至 Vite 8.2.2、React Router 7.18.3 和 Node 22 构建链；npm audit 结果为 0 vulnerabilities。
-- 任务投递、request_hash 并发唯一性和全量多租户 scope 仍有边界，详见 Agent 项目深度拷打与踩坑复盘。
+- 任务投递补偿与活动 request_hash SQL 唯一约束已实现；云调用不保证 exactly-once，专家答案质量、长期规模和权限范围仍须按场景核验。详见 [当前实现与系统架构](docs/docs_public/英语内容生产工作台-当前实现与系统架构.md)。
 
 ## License
 
 MIT License，见 [LICENSE](LICENSE)。
 
 
-### 扫描 PDF 的显式本地 OCR（2026-10-05，OPT-064）
+## 当前能力与验证边界
 
-本地 MinerU 4.x V1 → 逐页路由 → 结构化表格/标题/来源 → 父子切块预览已实现；使用 `backend\scripts\ocr_preview.py`，配置 `RAG_OCR_ENGINE=mineru` 和本地 `RAG_OCR_URL`。不安装 OCR 权重到 API/worker、不调用付费 embedding、不写知识表。
+- **OCR与RAG**：提供后台OCR任务、逐页/表格审核、显式付费确认、真实embedding索引、结构感知跨边界切分及关系感知small-to-big返回；默认Top-5，可选Top-8，RAG总上下文预算32768字符。OCR需另外配置服务，审核/来源命中不等于内容事实正确。
+- **模型设置**：管理员可配置OpenAI兼容Provider、只写不读的加密API Key、模型档案和题型生成/Judge路由。需要独立 `PROVIDER_SECRET_KEY`；Embedding/OCR继续使用各自环境配置，探测模型列表不等于生成质量验收。
+- **Trace与样本**：新chat可使用独立密钥的受限脱敏快照（默认1MiB/总密文128MiB/7天），不能补造旧Trace全文。few-shot只消费同范围、来源有效且真实人审通过的样本，最多2例/8192额外字符；工具接通不代表已有真实效果收益。
+- **工程验证**：2026-10-06合流版本全量1173条通过（含63条真实PG）；2026-10-07依赖/CI修复后本地1113条通过、63条PG跳过（Docker未运行），前端安装、安全审计和构建通过。不同窗口的数字不合并为新的全量验收。
+- **生产边界**：这是个人开发、学习与小批量人工审核项目。自动高分、合法Schema、来源和回放不能证明答案唯一/正确、独立模型收益或无人值守生产能力。源码发布不等于本机业务服务已升级。
 
-普通网页预览/上传仍不自动 OCR，10MiB 上传限制未变；本地显式 CLI 默认最多3页/原PDF128MiB。部分选页 indexable=false 且不可正式入库。后台批次、进度与网页操作待下一阶段，不应把代码工具交付当作生产页面已部署。
-
-配置、启动和真实教材证据见 `docs\现状文档\MinerU-OCR接入与验收.md`。
-
-
-### 后台 OCR API 与大文件（2026-10-05，OPT-065）
-
-原环境已提供鉴权的OCR job/page API、独立ocr队列/worker与scheduler。启动使用原Compose的 `--profile ocr`，宿主缓存MinerU由 `deploy\start-local-ocr.ps1` 隐藏启动并要求私有Bearer key；Docker需能到达配置端点。
-
-`POST /api/knowledge/ocr/jobs/upload` 是独立的128MiB后台接收路径；原知识上传/同步预览仍10MiB。API支持根目录内批次导入、进度、取消、续跑及JSON预览，没有自动embedding/索引。网页工作台的OCR操作界面仍待下一阶段，不因后台API已部署就称页面已实现。
-
-实际大文件/检查点/缓存与恢复证据见 `docs\现状文档\OCR-3后台任务与大文件验收.md`；旧OPT-064“主镜像未更新”是当时记录。
-
-
-### OCR工作台、审核与真实索引（2026-10-05，OPT-066）
-
-知识库页面现已提供完整OCR工作台：原页/识别表格/告警核对、问题块排除与恢复、审核后后台真实embedding入库。费用声明与预览/hash/config绑定、partial选择范围、幂等和不确定费用手动重试由后端强制；原文已核对不代表事实已认证。
-
-完整8页真实教材已形成36个1024维非零向量+2父块，单文档8条页级检索命中通过。不要把小样本当全库/生成质量100%；其余教材未自动索引。费用Trace当前为未核验的全局fallback估算，实际账单以供应商为准。
-
-当前运行态与验证以 `docs\现状文档\OCR-4工作台与真实RAG验收.md` 为准；前面“界面待下一阶段”段为历史记录。
-
-
-## 管理员模型设置（OPT-076）
-
-工作台左侧“模型设置”（`/model-settings`）可配置OpenAI兼容Provider地址/API Key、模型档案、默认生成降级档案及各题型生成/Judge覆盖。先Provider→档案→题型路由；未绑定/留空保留ENV/YAML，重启不清用户route，不自动替换现有模型。
-
-密钥只写不读，保存需服务端独立`PROVIDER_SECRET_KEY`（Fernet key），各Python服务保持一致并与DB备份配套保留；不能用JWT key替代。编辑留空保留密钥，非管理员API/页面无管理权限。Embedding/OCR仍原环境配置；模型价格仍后端单价估算，探测/models不代表生成/专家质量验收。详细说明见[第二轮与模型设置验收](docs/现状文档/10-6优化第二轮与模型设置落地验收.md)。
-
-
-## 受限回放与few-shot（OPT-077）
-
-链路展开可主动查看新chat的受限脱敏请求/响应；默认1MiB/密文总128MiB/7天，独立TRACE_SNAPSHOT_SECRET_KEY，与Provider/JWT key分离，读取须ops/归属且审计。旧Trace不能补出全文，Embedding/lifecycle仍摘要，模型重跑不保证一致。
-
-样本页可将人审通过样本标为fewshot；生成按同tenant/题型/规范化知识点、真实人审/源当前状态/hash/规则/来源核验选最多2个完整示例。8192为额外示例字符预算，不是总LLM窗口。当前样本库空，启用消费不宣称真实质量收益。
-
-模型比较工具`backend/scripts/model_compare.py`默认plan-only，--execute才调用已配置的不同候选；同端点/模型拒执行，产物不自动入库或变金标。真实不同候选和人工裁决仍需要用户。详见[第三轮验收](docs/现状文档/10-6优化第三轮落地与验收.md)。
-
-
-## Current release baseline (2026-10-06)
-
-The current public baseline includes the RAG structure/relation retrieval pipeline, OCR task/review workflow, durable generation delivery, deterministic question-output validation, state-contract and concurrency safeguards, admin-configurable OpenAI-compatible providers/models, bounded encrypted Trace snapshots, guarded human-reviewed few-shot consumption, and the first responsive workspace UI pass.
-
-The current engineering gate is **1,173 tests passed** in the merged local/remote working tree; this includes the latest repository/CI contract tests and the existing project regression suite. The public repository does not include real `.env` files, API keys, database dumps, course-material blobs, login sessions, `.local-eval` evidence, or private screenshots.
-
-This is still a personal development and learning project. Automated scores, valid schemas, Trace snapshots, few-shot wiring, and model-comparison tooling do not prove expert answer correctness, unique answers, independent-model quality gains, or unattended production readiness. Configure your own provider credentials from `.env.example` or the administrator model-settings page before using external models.
-
-For the exact current implementation and known boundaries, start with [the maintainer architecture document](docs/现状文档2/英语内容生产工作台-当前实现与系统架构.md) and [the public release audit](docs/公开发布-2026-10-06.md).
+详细机制和带日期的历史运行快照见 [当前实现与系统架构](docs/docs_public/英语内容生产工作台-当前实现与系统架构.md)。真实 `.env`、API Key、教材、dump、登录态、私有截图和 `.local-eval` 底稿不进入公开仓库。

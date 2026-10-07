@@ -81,3 +81,7 @@ docs/现状文档2/历史与证据/现役证据补充清单.json
 *.rdb
 *.aof
 *.private.*
+
+# Public documentation allowlist; all other docs remain local-only
+/docs/*
+!/docs/docs_public/

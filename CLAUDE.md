@@ -3,7 +3,7 @@
 ## Think Before Coding
 - 动手前先确认改动会影响哪一层（api / workflow / engine / rag / worker / frontend）。
 - 涉及生成、质检、路由、状态机逻辑的改动，先想清楚重试、降级、失败路径。
-- 不确定现有行为时先读 `docs/AI内容生成平台2.0-技术架构设计.md` 与对应模块源码，不凭猜测改。
+- 不确定现有行为时先读 `docs/docs_public/英语内容生产工作台-当前实现与系统架构.md` 与对应模块源码，不凭猜测改。
 
 ## Simplicity First
 - 只做被要求的事，不做无关「优化」或超前抽象。

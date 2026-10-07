@@ -56,7 +56,7 @@ english-edit/
 │   └── alembic/            # 数据库迁移
 ├── frontend/               # React 工作台（生成/任务/质检/内容库/样本库/看板/成本/链路/知识库/消息/用户管理/登录）
 ├── deploy/                 # docker-compose 编排
-└── docs/                   # PRD/技术架构/任务清单/优化记录
+└── docs/docs_public/       # 公开维护者主文档；其他 docs 仅本机保留
 ```
 
 ## 核心规范
@@ -83,6 +83,9 @@ english-edit/
 - 单次生成凭 `trace_id` 可完整回放（输入/输出/质检分/成本）。
 - 自动质检通过率稳定，人工驳回率可控（P2 目标 ≤5%）。
 - 后端单测覆盖率 ≥80%（重点：结构化输出、质检加权、路由降级、状态机）。
+
+## 文档分发边界
+公开仓库的 `docs/` 只分发 `docs_public/`。`docs/优化记录.md`、`docs/tasks.md`、旧设计与验收报告在维护者本机保留，不随公开clone提供；本机变更追踪要求不取消。公开贡献用提交/PR记录同样的动机、改动与验证，参见 `CONTRIBUTING.md`；当前实现以公开主文档及源码核对。
 
 ## 详细规范
 见 `.ai/rules/coding.md`（编码规范）与 `.ai/rules/architecture.md`（架构设计），按需加载。
