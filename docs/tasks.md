@@ -738,5 +738,5 @@ P3: P2 ──→ K1→K2→K3→K4→K5
 - [x] 复现Audit步骤axios/source-map-js两项high，最低声明与lock修到1.20.0/1.2.2，不force或降低audit级别。
 - [x] 官方checkout/setup-node/setup-python v6=node24核对，项目Node22/Python3.12/安全与覆盖率门槛保持。
 - [x] 干净npm ci、audit0漏洞、tsc/Vite、四新bundle浏览器mock、三新增契约测试；本地1113通过/63 PG跳过（Docker未运行）。
-- [ ] 推送后核对GitHub本提交的实际四任务结果，不用本地build宣称远端audit已通过。
+- [x] 修复提交dcf57a1的GitHub运行37580664127实际四任务全部success：Lint、Frontend install/audit/build、Unit、真实PG覆盖率；Node20弃用告警消失，仅保留ubuntu-latest于2026-10-19迁移的notice。
 - 本轮不提交env/密钥/教材/本机证据、不启动或迁移部署、不调用真实provider。
