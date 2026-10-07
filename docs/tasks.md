@@ -732,3 +732,11 @@ P3: P2 ──→ K1→K2→K3→K4→K5
 - [x] 1173全量（1110非集成/63真PG）、app92.8945%发布口径、跟踪源码格式/lint/前端build；主库未迁移或部署。
 - [ ] GitHub远端推送后确认提交和CI状态；公开文档不包含本机完整证据。
 - [公开发布说明](公开发布-2026-10-06.md)，私有审计底稿留ignored目录。
+
+
+### 前端CI安全审计修复（OPT-080，2026-10-07）
+- [x] 复现Audit步骤axios/source-map-js两项high，最低声明与lock修到1.20.0/1.2.2，不force或降低audit级别。
+- [x] 官方checkout/setup-node/setup-python v6=node24核对，项目Node22/Python3.12/安全与覆盖率门槛保持。
+- [x] 干净npm ci、audit0漏洞、tsc/Vite、四新bundle浏览器mock、三新增契约测试；本地1113通过/63 PG跳过（Docker未运行）。
+- [ ] 推送后核对GitHub本提交的实际四任务结果，不用本地build宣称远端audit已通过。
+- 本轮不提交env/密钥/教材/本机证据、不启动或迁移部署、不调用真实provider。
