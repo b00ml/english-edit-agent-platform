@@ -24,7 +24,7 @@ from app.engine.trace import (
 )
 from app.errors import ProviderConfigurationError, QualityCheckError
 from app.models import ModelProfile
-from app.prompt_loader import load_prompt, render
+from app.prompt_loader import load_prompt, render, teaching_constraints
 from app.skill_registry import get_skill_by_id
 
 logger = logging.getLogger("app.engine.quality")
@@ -161,6 +161,7 @@ def _build_judge_prompt(
     constraints = {
         key: value for key, value in (generation_params or {}).items() if key in properties
     }
+    constraints.update(teaching_constraints(generation_params or {}))
     # 渲染 user prompt：分别注入生成约束、rubric 与待质检 payload
     user_prompt = render(
         load_prompt("judge-user.st"),
@@ -268,6 +269,7 @@ def run_quality_check(
         for key, value in (generation_params or {}).items()
         if key in (getattr(template, "input_schema", None) or {}).get("properties", {})
     }
+    constraints.update(teaching_constraints(generation_params or {}))
     round_scores: List[Dict[str, float]] = []
     messages = [
         {"role": "system", "content": system_prompt},

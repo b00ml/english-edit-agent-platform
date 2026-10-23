@@ -16,6 +16,7 @@ from app.engine.real_confirmation import (
 )
 from app.engine.real_experiment import _account_calls, _counts, build_evidence_report
 from app.engine.real_reference import run_reference_review
+from app.engine.reference_review import model_agreement
 from app.engine.trace import record_trace
 
 # Frozen manifests and provider factories are the existing dynamic artifact/schema boundaries.
@@ -81,7 +82,6 @@ def _definition(run: dict[str, Any]) -> dict[str, Any]:
             "protocol",
             "execution_plan",
             "generation_results",
-            "reference_teaching_context",
         )
     }
 
@@ -127,11 +127,6 @@ def freeze_rereview(original: dict[str, Any], *, run_id: str, seed: int) -> dict
         member = entry["memberships"][0]
         source = manifests[member["run_key"]]
         path = member["path"]
-        case = next(
-            case
-            for case in source["frozen"]["dataset"]["sets"][path["set_name"]]
-            if case["case_id"] == path["case_id"]
-        )
         run = {
             "run_id": f"{run_id}:{entry['content_id']}",
             "frozen": copy.deepcopy(source["frozen"]),
@@ -144,28 +139,7 @@ def freeze_rereview(original: dict[str, Any], *, run_id: str, seed: int) -> dict
                     )
                 }
             },
-            "reference_teaching_context": {
-                key: case[key]
-                for key in ("teaching_goal", "scope", "judgment_basis")
-                if key in case
-            },
         }
-        run["reference_teaching_context"].update(
-            {
-                key: case["params"][key]
-                for key in (
-                    "grade",
-                    "difficulty",
-                    "knowledge_point",
-                    "topic",
-                    "constraints",
-                    "quantity",
-                    "blank_count",
-                    "question_count",
-                )
-                if key in case["params"]
-            }
-        )
         # Each selected pair gets one two-phase review, at most two format repairs per phase.
         for stage in ("reference_solve", "reference_review"):
             run["protocol"]["call_limits"][stage] = {
@@ -243,31 +217,6 @@ def run_rereview(
     return bundle
 
 
-def _agreement(pairs: list[tuple[bool, bool]], planned: int) -> dict[str, Any]:
-    n = len(pairs)
-    observed = sum(left == right for left, right in pairs) / n if n else None
-    kappa = None
-    status = "unavailable_no_confirmed_comparisons"
-    if n:
-        left_yes = sum(left for left, _ in pairs) / n
-        right_yes = sum(right for _, right in pairs) / n
-        if len({left for left, _ in pairs}) < 2 or len({right for _, right in pairs}) < 2:
-            status = "unavailable_degenerate_marginals"
-        else:
-            expected = left_yes * right_yes + (1 - left_yes) * (1 - right_yes)
-            assert observed is not None
-            kappa = (observed - expected) / (1 - expected)
-            status = "available"
-    return {
-        "planned": planned,
-        "paired": n,
-        "unresolved_or_missing": planned - n,
-        "agreement": observed,
-        "kappa": kappa,
-        "kappa_status": status,
-    }
-
-
 def _comparisons(bundle: dict[str, Any]) -> dict[str, Any]:
     manifests = _manifests(bundle["original"])
     pairs: dict[str, list[tuple[bool, bool]]] = {
@@ -296,7 +245,7 @@ def _comparisons(bundle: dict[str, Any]) -> dict[str, Any]:
                     and type(right.get(right_label)) is bool
                 ):
                     pairs[name].append((left[left_label], right[right_label]))
-    return {name: _agreement(values, planned) for name, values in pairs.items()}
+    return {name: model_agreement(values, planned) for name, values in pairs.items()}
 
 
 def _public_account(account: dict[str, Any]) -> dict[str, Any]:

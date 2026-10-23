@@ -4,13 +4,38 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.prompt_loader import load_prompt
 
 REFERENCE_RUBRIC_VERSION = "english-content-review-v1"
+
+
+def model_agreement(pairs: list[tuple[bool, bool]], planned: int) -> dict[str, Any]:
+    n = len(pairs)
+    observed = sum(left == right for left, right in pairs) / n if n else None
+    kappa = None
+    status = "unavailable_no_confirmed_comparisons"
+    if n:
+        left_yes = sum(left for left, _ in pairs) / n
+        right_yes = sum(right for _, right in pairs) / n
+        if len({left for left, _ in pairs}) < 2 or len({right for _, right in pairs}) < 2:
+            status = "unavailable_degenerate_marginals"
+        else:
+            expected = left_yes * right_yes + (1 - left_yes) * (1 - right_yes)
+            assert observed is not None
+            kappa = (observed - expected) / (1 - expected)
+            status = "available"
+    return {
+        "planned": planned,
+        "paired": n,
+        "unresolved_or_missing": planned - n,
+        "agreement": observed,
+        "kappa": kappa,
+        "kappa_status": status,
+    }
 
 
 class RubricDimension(BaseModel):

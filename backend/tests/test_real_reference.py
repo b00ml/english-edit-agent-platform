@@ -142,7 +142,7 @@ def test_allowlist_counts_and_any_subquestion_failure_fails_document(tmp_path, t
 
 
 @pytest.mark.parametrize("phase", ["solve", "review"])
-def test_format_repairs_capped_per_phase_and_failed_calls_traced(tmp_path, phase):
+def test_format_repairs_capped_per_phase_remain_unresolved_and_traced(tmp_path, phase):
     manifest = manifest_fixture()
     responses = [{}, {}, {}] if phase == "solve" else [solve(), {}, {}, {}]
     client = FakeClient(responses)
@@ -152,7 +152,8 @@ def test_format_repairs_capped_per_phase_and_failed_calls_traced(tmp_path, phase
     )
     assert len(client.requests) == (3 if phase == "solve" else 4)
     assert sum(row["success"] is False for row in traces) == 3
-    assert all(row["state"] == "failed" for row in manifest["reference_results"].values())
+    assert all(row["state"] == "unresolved" for row in manifest["reference_results"].values())
+    assert all(len(row["format_errors"]) == 3 for row in manifest["reference_results"].values())
     assert manifest["reference_accounting"]["pairwise"]["denominator"] == 0
 
 
