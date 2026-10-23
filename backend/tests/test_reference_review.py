@@ -124,6 +124,46 @@ def test_degenerate_model_judge_marginals_make_kappa_unavailable():
     )
 
 
+def test_reviewed_assessment_cannot_treat_missing_judge_label_as_disagreement():
+    record = {
+        "review_id": "missing-judge-label",
+        "status": "reviewed",
+        "reference_model": "reviewer-v1",
+        "rubric_version": "rubric-v1",
+        "rubric": _rubric(),
+        "solved_answer": "walked",
+        "solve_reason": "Past-time marker.",
+        "reference_pass": True,
+        "judge_pass": None,
+        "judge_model": "judge-v1",
+        "judge_rubric_version": "judge-rubric-v1",
+        "disagreement_reason": "Judge label missing from source data.",
+    }
+
+    with pytest.raises(ValidationError, match="judge_pass"):
+        summarize_reference_reviews([record])
+
+
+def test_unresolved_assessment_may_omit_judge_label():
+    record = {
+        "review_id": "unresolved-without-judge-label",
+        "status": "unresolved",
+        "reference_model": "reviewer-v1",
+        "rubric_version": "rubric-v1",
+        "rubric": _rubric(unresolved=True),
+        "reference_pass": None,
+        "judge_model": "judge-v1",
+        "judge_rubric_version": "judge-rubric-v1",
+        "unresolved_reason": "Insufficient source evidence.",
+    }
+
+    report = summarize_reference_reviews([record])
+
+    assert report["judge_pass_rate"] == {"numerator": 0, "denominator": 0, "rate": None}
+    assert report["model_judge_comparison"]["denominator"] == 0
+    assert report["unresolved_cases"] == ["unresolved-without-judge-label"]
+
+
 def test_cli_imports_reference_assessments_and_keeps_blind_packet_separate(tmp_path):
     backend = Path(__file__).parents[1]
     source = tmp_path / "evaluation.json"

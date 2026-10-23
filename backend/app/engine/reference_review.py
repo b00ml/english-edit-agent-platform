@@ -46,7 +46,7 @@ class ReferenceAssessment(BaseModel):
     solved_answer: str | list[str] | None = None
     solve_reason: str | None = None
     reference_pass: bool | None
-    judge_pass: bool | None
+    judge_pass: bool | None = None
     judge_model: str = Field(min_length=1)
     judge_rubric_version: str = Field(min_length=1)
     disagreement_reason: str | None = None
@@ -75,6 +75,8 @@ class ReferenceAssessment(BaseModel):
                 "overall status/reference_pass must follow the itemized rubric verdicts"
             )
         if self.status == "reviewed":
+            if self.judge_pass is None:
+                raise ValueError("已确认参考评审必须包含非空 judge_pass 标签")
             if self.reference_pass is None or self.solved_answer is None or not self.solve_reason:
                 raise ValueError("已完成参考评审必须包含独立答案、理由和通过判定")
             if self.unresolved_reason is not None:
