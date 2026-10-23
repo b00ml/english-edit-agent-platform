@@ -103,7 +103,11 @@ def review_packet_id(case_id: str, payload: dict[str, object]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
 
 
-def build_review_packets(arms: dict[str, dict[str, object]]) -> list[dict[str, object]]:
+def build_review_packets(
+    arms: dict[str, dict[str, object]],
+    *,
+    case_contexts: dict[str, dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     """Return deduplicated content-only packets, with arm/config/Judge data withheld."""
     candidates: dict[str, dict[str, object]] = {}
     instructions = load_prompt("reference-review-instructions.st")
@@ -129,6 +133,23 @@ def build_review_packets(arms: dict[str, dict[str, object]]) -> list[dict[str, o
                 "instructions": instructions,
                 "rubric_version": REFERENCE_RUBRIC_VERSION,
             }
+            if case_contexts is not None:
+                context = case_contexts[case_id]
+                candidates[review_id]["generation_constraints"] = {
+                    key: value
+                    for key, value in context.items()
+                    if key
+                    in {
+                        "grade",
+                        "knowledge_point",
+                        "difficulty",
+                        "quantity",
+                        "constraints",
+                        "blank_count",
+                        "question_count",
+                        "topic",
+                    }
+                }
     return [candidates[key] for key in sorted(candidates)]
 
 

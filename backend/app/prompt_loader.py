@@ -1,6 +1,7 @@
 # app/prompt_loader.py —— 独立 prompt 加载与渲染
 # prompt 以 .st 文件独立存放（backend/prompts/），system/user 分离，便于版本控制与调试。
 # 生成时按题型加载对应 skill 规范注入 system prompt，作为「出题技能」约束。
+import json
 import os
 from typing import Any, Dict
 
@@ -38,6 +39,16 @@ def build_system_prompt(template: Any, params: Dict[str, Any], skill_md: str = "
 def build_user_prompt(template: Any, params: Dict[str, Any]) -> str:
     """构造 user prompt = user .st 渲染 + 可选 RAG 参考资料。"""
     user = render(load_prompt(template.gen_prompt["user"]), params)
+    teaching = {
+        key: params[key]
+        for key in ("grade", "constraints", "blank_count", "question_count")
+        if key in params
+    }
+    if teaching:
+        user += "\n\n" + render(
+            load_prompt("teaching-constraints.st"),
+            {"teaching_constraints": json.dumps(teaching, ensure_ascii=False)},
+        )
     examples = params.get("fewshot_context")
     if examples:
         user += "\n\n" + render(load_prompt("fewshot-instruction.st"), {"examples": examples})
