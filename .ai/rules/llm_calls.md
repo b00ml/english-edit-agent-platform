@@ -286,3 +286,10 @@ P1 补充：独立生成/Judge 调用缺少 trace_id 时自动创建 ID；DB 失
 - 新chat调用把实际messages、请求参数与应用收到的响应文本通过snapshot_data封存；摘要保持脱敏/截断，密文留独立受限存储。不得记录API Key/Authorization headers、原始敏感错误正文，缺失/超限/旧记录不伪称完整回放。
 - few-shot为服务器选择的人审整例，独立于RAG事实和Judge目标；scope/源状态/实际人审/hash/现役规则/整例预算必须代码强制。客户端与checkpoint不可伪造示例上下文，复制整个示例输出不得直接通过。
 - 模型比较只有显式execute才收费，必须保留相同输入/source身份与失败费用，不暗换默认模型、不代签人工标签、不将自动分数宣称专家结论。
+
+## 真实质量评估调用（OPT-084 / #22）
+- `structured_retry_eval.py execute-generation` 显式执行已冻结输入；先核验冻结资产及实际 Provider/Profile 配置身份，再创建绑定客户端。冻结、resume 校验及测试不调用供应商。
+- `EvaluationLedger` 在每次物理发送前后保存本地 manifest，SDK retry 固定 0；只有明确 accepted=False、completed=False 且 transient=True 的输运证据允许额外最多 2 次发送。不从 HTTP 状态或 timeout 猜测未受理；未知受理/计费与中断 in_flight 保留 unresolved，不自动重付。
+- 三臂共用首稿，`StructuredResponse.source_call_id/replayed` 使每臂仍经真实确定性校验，但每个物理调用只写一次 Trace。Trace 写入中断可能已提交，不再写第二次，覆盖率必须显示未解决；已保存响应可只在本地重验。
+- manifest 保留实际 messages、原文、模型、延迟、usage/成本完整性与验证结果；缺 usage 或未核验价格保持 unknown。物理费用只计一次，各臂独立运行逻辑估计另列，不能混为供应商实付。
+- 评估入口仅传教学参数，固定完形 5 空/阅读 3 问，无 RAG/fewshot/fallback/Judge 改写；不放宽生产模板来源要求。官方数据集保持空骨架，未经授权不得收费试跑或把自动评估当人审标签。
