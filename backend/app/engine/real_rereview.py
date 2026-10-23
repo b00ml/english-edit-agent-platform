@@ -105,7 +105,7 @@ def _identity(bundle: dict[str, Any]) -> str:
 
 
 def freeze_rereview(original: dict[str, Any], *, run_id: str, seed: int) -> dict[str, Any]:
-    """Include all decisive disagreements, then up to six other unique context/content pairs."""
+    """Union all decisive disagreements with up to six random context/content pairs."""
     manifests = _manifests(original)
     if not run_id.strip() or run_id in {row["run_id"] for row in manifests.values()} | {
         original["run_id"]
@@ -113,13 +113,15 @@ def freeze_rereview(original: dict[str, Any], *, run_id: str, seed: int) -> dict
         raise ValueError("Rereview requires a fresh nonempty run identifier")
     pool = _pool(original)
     disagreements = [row for row in pool if row["disagreement"]]
-    remaining = [row for row in pool if not row["disagreement"]]
-    random_rows = random.Random(seed).sample(remaining, min(6, len(remaining)))
-    selected = [
-        {**copy.deepcopy(row), "reasons": [reason]}
-        for reason, rows in (("disagreement", disagreements), ("random", random_rows))
-        for row in rows
-    ]
+    random_rows = random.Random(seed).sample(pool, min(6, len(pool)))
+    selected_by_id: dict[str, dict[str, Any]] = {}
+    for reason, rows in (("disagreement", disagreements), ("random", random_rows)):
+        for row in rows:
+            entry = selected_by_id.setdefault(
+                row["content_id"], {**copy.deepcopy(row), "reasons": []}
+            )
+            entry["reasons"].append(reason)
+    selected = list(selected_by_id.values())
     reviews = {}
     for entry in selected:
         member = entry["memberships"][0]
@@ -351,6 +353,9 @@ def build_evidence_package(bundle: dict[str, Any]) -> dict[str, Any]:
         "selected": len(bundle["selection"]),
         "disagreements": sum("disagreement" in row["reasons"] for row in bundle["selection"]),
         "random": sum("random" in row["reasons"] for row in bundle["selection"]),
+        "overlap": sum(
+            {"disagreement", "random"}.issubset(row["reasons"]) for row in bundle["selection"]
+        ),
         "selected_path_memberships": sum(len(row["memberships"]) for row in bundle["selection"]),
     }
     stages = []
@@ -405,7 +410,7 @@ def build_evidence_package(bundle: dict[str, Any]) -> dict[str, Any]:
     public = {
         "version": "real-quality-public-candidate-v1",
         "publication": "requires_separate_approval",
-        "method": "all_decisive_disagreements_plus_seeded_up_to_six_other_context_unique_contents",
+        "method": "union_all_decisive_disagreements_and_seeded_up_to_six_context_unique_contents",
         "review": "one_fresh_blind_independent_solve_then_five_rubric_review",
         "config_hashes": sorted(
             {canonical_hash(run["frozen"]["config"]) for run in manifests.values()}
@@ -458,7 +463,8 @@ def _summary(local: dict[str, Any]) -> str:
         "# 真实质量闭环证据（仅本地）",
         "",
         f"去重候选 {sampling['eligible_unique_contents']} 个，复核 {sampling['selected']} 个："
-        f"全部分歧 {sampling['disagreements']} 个，随机补充 {sampling['random']} 个；"
+        f"全部分歧 {sampling['disagreements']} 个，随机入选 {sampling['random']} 个，"
+        f"重叠 {sampling['overlap']} 个只复核一次；"
         f"保留 {sampling['selected_path_memberships']} 个原路径成员关系。",
         "",
         "| 阶段 | 计划 | 已提交 | 已完成 | 成功 | 失败 | 取消 | 缺失 | 未决 | 待复核 |",

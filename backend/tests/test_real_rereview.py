@@ -53,9 +53,11 @@ def test_selection_all_disagreements_random_six_context_dedup_and_immutable_no_c
     bundle = freeze_rereview(no_change, run_id="fresh", seed=27)
     assert len(bundle["pool"]) == 10  # Same payload, ten different teaching contexts.
     selected = bundle["selection"]
-    assert len(selected) == 8
+    assert len(selected) == 7
     assert sum("disagreement" in row["reasons"] for row in selected) == 2
     assert sum("random" in row["reasons"] for row in selected) == 6
+    assert sum(set(row["reasons"]) == {"disagreement", "random"} for row in selected) == 1
+    assert len(bundle["reviews"]) == len({row["content_id"] for row in selected}) == 7
     assert all(len(row["memberships"]) == 3 for row in selected)
     assert bundle == freeze_rereview(no_change, run_id="fresh", seed=27)
     assert source == original
@@ -77,7 +79,7 @@ def test_fresh_two_phase_once_preserves_originals_and_unknown_after_cold_resume(
     original = copy.deepcopy(source)
     bundle = freeze_rereview(source, run_id="fresh", seed=27)
     client = FakeClient(
-        [TimeoutError(), *[response for _ in range(7) for response in (solve(), review())]]
+        [TimeoutError(), *[response for _ in range(6) for response in (solve(), review())]]
     )
     artifact = tmp_path / "fresh.json"
     traces = []
@@ -87,7 +89,7 @@ def test_fresh_two_phase_once_preserves_originals_and_unknown_after_cold_resume(
         clients=lambda run: {"reference": client},
         trace_sink=lambda **row: traces.append(row),
     )
-    assert len(client.requests) == 15
+    assert len(client.requests) == 13
     assert source == original == bundle["original"]
     serialized = json.dumps(client.requests)
     for forbidden in (
@@ -116,8 +118,8 @@ def test_fresh_two_phase_once_preserves_originals_and_unknown_after_cold_resume(
     }
     assert "answer" not in json.dumps(first_solve)
     assert "explanation" not in json.dumps(first_solve)
-    assert len({row["call_id"] for row in bundle["provider_calls"]}) == 15
-    assert len(traces) == 15
+    assert len({row["call_id"] for row in bundle["provider_calls"]}) == 13
+    assert len(traces) == 13
     saved = json.loads(artifact.read_text("utf-8"))
     assert all("provider_calls" not in run for run in saved["reviews"].values())
     before = copy.deepcopy(saved)
@@ -125,7 +127,7 @@ def test_fresh_two_phase_once_preserves_originals_and_unknown_after_cold_resume(
     assert saved["provider_calls"] == before["provider_calls"]
     outcomes = [next(iter(run["reference_results"].values())) for run in saved["reviews"].values()]
     assert sum(row["state"] == "unresolved" for row in outcomes) == 1
-    assert sum(row["state"] == "completed" for row in outcomes) == 7
+    assert sum(row["state"] == "completed" for row in outcomes) == 6
 
 
 def test_evidence_all_states_honest_model_agreement_whitelist_and_zero_change(source, tmp_path):
@@ -143,8 +145,9 @@ def test_evidence_all_states_honest_model_agreement_whitelist_and_zero_change(so
     bundle = freeze_rereview(original, run_id="fresh", seed=27)
     initial = build_evidence_package(bundle)
     assert initial["local"]["confirmation"]["planned_main_paths"] == 0
-    assert initial["local"]["sampling"]["selected"] == 8
-    assert initial["local"]["rereview_states"]["missing"] == 8
+    assert initial["local"]["sampling"]["selected"] == 7
+    assert initial["local"]["sampling"]["overlap"] == 1
+    assert initial["local"]["rereview_states"]["missing"] == 7
     assert initial["public_candidate"]["publication"] == "requires_separate_approval"
     assert marker in json.dumps(initial["local"])
     assert marker not in json.dumps(initial["public_candidate"])
@@ -152,7 +155,7 @@ def test_evidence_all_states_honest_model_agreement_whitelist_and_zero_change(so
     assert "用户决策" in initial["summary_zh"] and "AI 实现" in initial["summary_zh"]
     assert "自动化执行" in initial["summary_zh"] and "模型判断" in initial["summary_zh"]
     client = FakeClient(
-        [TimeoutError(), *[response for _ in range(7) for response in (solve(), review())]]
+        [TimeoutError(), *[response for _ in range(6) for response in (solve(), review())]]
     )
     run_rereview(
         tmp_path / "fresh.json",
@@ -163,9 +166,9 @@ def test_evidence_all_states_honest_model_agreement_whitelist_and_zero_change(so
     report = build_evidence_package(bundle)
     assert report["local"]["rereview_states"]["unresolved"] == 1
     assert report["local"]["rereview_physical"]["cost"]["total"] is None
-    assert report["local"]["rereview_physical"]["cost"]["denominator"] == 15
+    assert report["local"]["rereview_physical"]["cost"]["denominator"] == 13
     agreement = report["local"]["comparisons"]["judge_rereview"]
-    assert agreement["paired"] == 21 and agreement["planned"] == 24
+    assert agreement["paired"] == 18 and agreement["planned"] == 21
     assert agreement["kappa"] is None
     assert agreement["kappa_status"] == "unavailable_degenerate_marginals"
     assert marker not in json.dumps(report["public_candidate"])
@@ -217,7 +220,7 @@ def test_cli_freezes_executes_fake_reference_and_exports_local_files(source, tmp
         def __exit__(self, *args):
             return False
 
-    client = FakeClient([response for _ in range(8) for response in (solve(), review())])
+    client = FakeClient([response for _ in range(7) for response in (solve(), review())])
     monkeypatch.setattr(database, "SessionLocal", FakeSession)
     monkeypatch.setattr(cli, "verified_clients", lambda *_: {"reference": client})
     monkeypatch.setattr(real_experiment, "require_reviewed_smoke", lambda *_: None)
@@ -231,9 +234,9 @@ def test_cli_freezes_executes_fake_reference_and_exports_local_files(source, tmp
         lambda *args, **kwargs: actual(*args, **kwargs, trace_sink=lambda **_: True),
     )
     assert command("execute-rereview", "--manifest", manifest, "--reviewed-smoke", smoke) == 0
-    assert len(client.requests) == 16
+    assert len(client.requests) == 14
     assert command("evidence-package", "--manifest", manifest, "--output", report) == 0
-    assert json.loads(report.read_text("utf-8"))["rereview_states"]["completed"] == 8
+    assert json.loads(report.read_text("utf-8"))["rereview_states"]["completed"] == 7
     assert "模型判断" in report.with_suffix(".md").read_text("utf-8")
     public = json.loads(report.with_name("evidence.public-candidate.json").read_text("utf-8"))
     assert public["publication"] == "requires_separate_approval"
