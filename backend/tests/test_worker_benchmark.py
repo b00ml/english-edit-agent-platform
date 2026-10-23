@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -31,7 +31,11 @@ def test_summary_keeps_failures_in_denominator_and_reports_success_throughput():
         "submitted": 2,
         "succeeded": 1,
         "failed": 1,
+        "unresolved": 0,
         "failure_rate": 0.5,
+        "failure_rate_denominator": 2,
+        "unresolved_rate": 0.0,
+        "unresolved_rate_denominator": 2,
         "successful_throughput_per_hour": 900.0,
         "queue_latency_sample_count": 2,
         "queue_latency_p95_seconds": 2.0,
@@ -90,7 +94,7 @@ def test_runner_reports_infrastructure_only_and_keeps_task_failures(monkeypatch)
     assert report["configuration"]["worker_concurrency"] == 2
 
 
-def test_runner_keeps_timed_out_submissions_in_failure_denominator(monkeypatch):
+def test_runner_keeps_timed_out_submissions_unresolved_in_submitted_denominator(monkeypatch):
     class Result:
         id = "task-timeout"
 
@@ -119,8 +123,25 @@ def test_runner_keeps_timed_out_submissions_in_failure_denominator(monkeypatch):
 
     assert report["samples"][0]["status"] == "timed_out"
     assert report["metrics"]["submitted"] == 1
-    assert report["metrics"]["failed"] == 1
-    assert report["metrics"]["failure_rate"] == 1.0
+    assert report["metrics"]["failed"] == 0
+    assert report["metrics"]["unresolved"] == 1
+    assert report["metrics"]["failure_rate"] == 0.0
+    assert report["metrics"]["failure_rate_denominator"] == 1
+    assert report["metrics"]["unresolved_rate"] == 1.0
+    assert report["metrics"]["unresolved_rate_denominator"] == 1
+
+
+def test_stub_cli_returns_incomplete_when_work_is_unresolved(monkeypatch):
+    monkeypatch.setattr(
+        worker_benchmark, "parse_args", lambda: SimpleNamespace(arm="stub", output=None)
+    )
+    monkeypatch.setattr(
+        worker_benchmark,
+        "run_benchmark",
+        lambda _: {"metrics": summarize_samples([{"status": "timed_out"}], 1.0)},
+    )
+
+    assert worker_benchmark.main() == 1
 
 
 def test_real_arm_requires_explicit_fixed_profile_configuration(monkeypatch):
@@ -465,12 +486,35 @@ def test_real_cost_excludes_lifecycle_but_keeps_unknown_rag_call(monkeypatch, st
     assert metrics["estimated_per_item_cost"] == (pytest.approx(0.05) if complete else None)
 
 
-def _real_report_with_snapshot(monkeypatch, *, task_status, statuses, quantity, traces):
+@pytest.mark.parametrize("naive_timestamps", [False, True])
+def test_real_completion_duration_starts_before_http_submission(monkeypatch, naive_timestamps):
+    report = _real_report_with_snapshot(
+        monkeypatch,
+        task_status="succeeded",
+        statuses=["succeeded"],
+        quantity=1,
+        traces=[],
+        naive_timestamps=naive_timestamps,
+    )
+
+    assert report["samples"][0]["submit_to_completion_seconds"] == 5.0
+    assert report["metrics"]["submit_to_completion_p95_seconds"] == 5.0
+
+
+def _real_report_with_snapshot(
+    monkeypatch, *, task_status, statuses, quantity, traces, naive_timestamps=False
+):
     from app.models import GenerationTaskItem
 
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 10, 23, 1, tzinfo=timezone.utc)
+    task_time = now.replace(tzinfo=None) if naive_timestamps else now
     task = (
-        SimpleNamespace(id="task-1", status=task_status, created_at=now, updated_at=now)
+        SimpleNamespace(
+            id="task-1",
+            status=task_status,
+            created_at=task_time,
+            updated_at=task_time + timedelta(seconds=3),
+        )
         if task_status
         else None
     )
@@ -518,6 +562,11 @@ def _real_report_with_snapshot(monkeypatch, *, task_status, statuses, quantity, 
             pass
 
     ticks = iter([0.0, 0.0, 0.0, 2.0, 2.0])
+    monkeypatch.setattr(
+        worker_benchmark,
+        "datetime",
+        SimpleNamespace(now=lambda tz: now - timedelta(seconds=2)),
+    )
     monkeypatch.setattr("app.database.SessionLocal", Database)
     monkeypatch.setattr(worker_benchmark, "preflight_real_profile", lambda *args: None)
     monkeypatch.setattr(

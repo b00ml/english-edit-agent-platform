@@ -142,6 +142,7 @@ def real_benchmark_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "profile_preflight": "database route exact match",
         "api_base_url": args.real_api_base_url.rstrip("/"),
         "api_enqueue_measurement": "authenticated HTTP POST /api/generate round-trip",
+        "submit_to_completion_measurement": "UTC request start to terminal task updated_at",
     }
 
 
@@ -180,6 +181,7 @@ def run_real_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         total_started = time.monotonic()
         with httpx.Client(timeout=args.timeout_seconds) as client:
             for _ in range(args.real_runs):
+                enqueue_started_at = datetime.now(timezone.utc)
                 enqueue_finished_at = None
                 try:
                     task_id, enqueue_seconds = enqueue_real_task(
@@ -259,10 +261,10 @@ def run_real_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 failed_items = sum(item.status == "failed" for item in items)
                 cancelled_items = sum(item.status == "cancelled" for item in items)
                 completed_at = task.updated_at if terminal else None
+                if completed_at is not None and completed_at.tzinfo is None:
+                    completed_at = completed_at.replace(tzinfo=timezone.utc)
                 completion_seconds = (
-                    (completed_at - task.created_at).total_seconds()
-                    if completed_at and task.created_at
-                    else None
+                    (completed_at - enqueue_started_at).total_seconds() if completed_at else None
                 )
                 run_samples.append(
                     {
@@ -456,9 +458,9 @@ def main() -> int:
     print(encoded)
     print(f"Redis configured: {'yes' if settings.REDIS_URL else 'no'}", file=sys.stderr)
     failed = report["metrics"].get("failed", report["metrics"].get("failed_items", 0))
-    incomplete = report["metrics"].get("unresolved_items", 0) + report["metrics"].get(
-        "cancelled_items", 0
-    )
+    incomplete = report["metrics"].get(
+        "unresolved_items", report["metrics"].get("unresolved", 0)
+    ) + report["metrics"].get("cancelled_items", 0)
     return 0 if failed == 0 and incomplete == 0 else 1
 
 
