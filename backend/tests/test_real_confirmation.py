@@ -1,5 +1,6 @@
 """Confirmation contracts exercise real services with temporary data only."""
 
+import copy
 import json
 from pathlib import Path
 
@@ -130,10 +131,26 @@ def test_changed_generation_prompt_is_executed_from_snapshot_with_independent_dr
         bundle["runs"][row["run_key"]]["generation_results"][row["path_id"]]["payload"] == VALID
         for row in rows
     )
+    cancelled = next(
+        row for row in bundle["runs"]["old:1"]["execution_plan"] if row["state"] == "planned"
+    )
+    cancelled["state"] = "cancelled"
+    no_send = FakeClient([])
+    run_generation(
+        tmp_path / "unused.json",
+        bundle["runs"]["old:1"],
+        client=no_send,
+        path_ids={cancelled["path_id"]},
+        persist=lambda: None,
+        trace_sink=lambda **_: None,
+    )
+    assert cancelled["state"] == "cancelled"
+    assert no_send.requests == []
 
 
-def test_threshold_reuses_raw_scores_zero_calls_and_keeps_missing_repeated_observations(
-    tmp_path, exploration
+@pytest.mark.parametrize("factor", ["judge_threshold", "judge_weights"])
+def test_policy_reuses_raw_scores_zero_calls_and_keeps_missing_repeated_observations(
+    tmp_path, exploration, factor
 ):
     from test_real_generation import VALID
 
@@ -143,7 +160,11 @@ def test_threshold_reuses_raw_scores_zero_calls_and_keeps_missing_repeated_obser
         run_confirmation,
     )
 
-    selection = choice(exploration, "judge_threshold", "single_choice", 71.0)
+    rules = exploration["frozen"]["templates"]["single_choice"]["quality_rules"]
+    weights = {rule["id"]: float(index == 0) for index, rule in enumerate(rules)}
+    selection = choice(
+        exploration, factor, "single_choice", 71.0 if factor == "judge_threshold" else weights
+    )
     row = next(
         row
         for row in exploration["execution_plan"]
@@ -151,10 +172,9 @@ def test_threshold_reuses_raw_scores_zero_calls_and_keeps_missing_repeated_obser
     )
     row["state"] = "completed"
     exploration["generation_results"][row["path_id"]] = {"payload": VALID}
-    dimensions = {
-        rule["id"]: 70.004
-        for rule in exploration["frozen"]["templates"]["single_choice"]["quality_rules"]
-    }
+    dimensions = {rule["id"]: 70.004 for rule in rules}
+    if factor == "judge_weights":
+        dimensions = {rule["id"]: float(100 * (index != 0)) for index, rule in enumerate(rules)}
     exploration["judge_results"] = {
         row["path_id"]: {
             "state": "completed",
@@ -166,16 +186,35 @@ def test_threshold_reuses_raw_scores_zero_calls_and_keeps_missing_repeated_obser
     exploration["reference_results"] = {
         row["path_id"]: {"state": "completed", "reference_pass": True}
     }
-    bundle = freeze_confirmation(exploration, selection, run_id="threshold-confirm", seed=2)
+    observations = []
+    if factor == "judge_weights":
+        observation = copy.deepcopy(exploration)
+        observation["run_id"] = "recorded-round-two"
+        recorded = next(
+            item for item in observation["execution_plan"] if item["path_id"] == row["path_id"]
+        )
+        recorded["round"] = 2
+        observation["identities"]["execution_plan"] = canonical_hash(
+            {
+                "protocol": observation["protocol"],
+                "paths": [{**item, "state": "planned"} for item in observation["execution_plan"]],
+            }
+        )
+        observations.append(observation)
+    bundle = freeze_confirmation(
+        exploration, selection, run_id="threshold-confirm", seed=2, observations=observations
+    )
     run_confirmation(tmp_path / "confirm.json", bundle, clients={})
     report = confirmation_report(bundle)
     assert report["physical"]["call_count"] == 0
     assert report["planned_main_paths"] == 360
     assert report["paired_inputs"] == 1
-    assert report["contrasts"]["judge"]["paired_observations"] == 1
+    assert report["contrasts"]["judge"]["paired_observations"] == 1 + len(observations)
     assert report["contrasts"]["judge"]["change_percentage_points"] == -100.0
     assert report["unique_inputs"] == 60
-    assert report["groups"]["new:exploration"]["stages"]["judge"]["missing"] == 89
+    assert report["groups"]["new:exploration"]["stages"]["judge"]["missing"] == 89 - len(
+        observations
+    )
     # Production rounds total to two decimals before the policy comparison.
     target = next(
         row
@@ -184,7 +223,18 @@ def test_threshold_reuses_raw_scores_zero_calls_and_keeps_missing_repeated_obser
         and row["round"] == 1
         and row["version"] == "new"
     )
-    assert bundle["runs"][target["run_key"]]["judge_results"][target["path_id"]]["score"] == 70.0
+    assert bundle["runs"][target["run_key"]]["judge_results"][target["path_id"]]["score"] == (
+        70.0 if factor == "judge_threshold" else 0.0
+    )
+    if observations:
+        second = next(
+            item
+            for item in bundle["execution_plan"]
+            if item["case_id"] == row["case_id"] and item["round"] == 2 and item["version"] == "new"
+        )
+        inherited = bundle["runs"][second["run_key"]]["judge_results"][second["path_id"]]
+        assert inherited["inherited_from"]["run_id"] == "recorded-round-two"
+        assert inherited["inherited_from"]["source_hash"] == canonical_hash(observations[0])
     saved = json.loads((tmp_path / "confirm.json").read_text("utf-8"))
     saved["runs"][target["run_key"]]["frozen"]["prompts"]["judge-system.st"] = "tampered"
     with pytest.raises(ValueError, match="immutable"):
@@ -363,6 +413,16 @@ def test_confirmation_prefix_cold_resume_preserves_shared_draft_and_unknown_acce
     else:
         assert before == (10 if factor == "feedback_prompt" else 5)
         assert report["evidence"]["stages"]["generation"]["completed"] == limit
+    cancelled = next(
+        row
+        for row in saved["runs"][first["run_key"]]["execution_plan"]
+        if row["path_id"] == first["path_id"]
+    )
+    cancelled["state"] = "cancelled"
+    run_confirmation(
+        output, saved, clients=clients, smoke=smoke, trace_sink=lambda **_: None, path_limit=1
+    )
+    assert cancelled["state"] == "cancelled"
 
 
 def test_confirmation_cli_no_change_never_constructs_provider_clients(

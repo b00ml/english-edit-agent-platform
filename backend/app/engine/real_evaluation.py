@@ -364,7 +364,7 @@ def run_generation(
     for planned in manifest["execution_plan"]:
         if path_ids is not None and planned["path_id"] not in path_ids:
             continue
-        if planned["state"] in {"completed", "failed", "unresolved"}:
+        if planned["state"] in {"completed", "failed", "unresolved", "cancelled"}:
             continue
         case = next(
             c

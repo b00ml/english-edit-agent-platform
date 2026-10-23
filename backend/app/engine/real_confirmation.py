@@ -408,6 +408,8 @@ def run_confirmation(
     for planned in bundle["execution_plan"][:path_limit]:
         run = bundle["runs"][planned["run_key"]]
         row = next(item for item in run["execution_plan"] if item["path_id"] == planned["path_id"])
+        if row["state"] == "cancelled":
+            continue
         if factor.startswith("judge_"):
             _inherit(bundle, run, row)
         if offline:
@@ -441,8 +443,9 @@ def run_confirmation(
                     "threshold": policy["threshold"],
                     "weights": policy["weights"],
                     "inherited_from": {
-                        "run_id": bundle["source"]["run_id"],
+                        "run_id": observed["run_id"],
                         "path_id": old["path_id"],
+                        "source_hash": canonical_hash(observed),
                     },
                 }
             continue
