@@ -151,9 +151,16 @@ def real_enqueue_failure_sample(exc: RealEnqueueFailure, item_count: int) -> dic
         "failure_type": exc.failure_type,
         "submitted_items": item_count,
         "successful_items": 0,
-        "failed_items": item_count,
+        "failed_items": 0,
+        "cancelled_items": 0,
+        # No task ID was observed; a lost response may still have accepted the request.
+        "unresolved_items": item_count,
+        "cost_covered_items": 0,
+        "cost_unknown_items": item_count,
+        "cost_unknown_trace_count": 0,
         "api_enqueue_seconds": exc.elapsed_seconds,
         "submit_to_completion_seconds": None,
+        "known_estimated_trace_cost_subtotal": None,
         "estimated_trace_cost": None,
         "cost_sample_count": 0,
         "billed_cost": None,
@@ -204,37 +211,54 @@ def run_real_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     }:
                         break
                     time.sleep(args.poll_seconds)
-                if task is None or task.status not in {
+                terminal = task is not None and task.status in {
                     "succeeded",
                     "partially_succeeded",
                     "failed",
                     "cancelled",
-                }:
-                    run_samples.append(
-                        {
-                            "status": "timed_out" if task is not None else "missing_task",
-                            "task_id": task.id if task is not None else task_id,
-                            "submitted_items": args.real_items_per_run,
-                            "successful_items": 0,
-                            "failed_items": args.real_items_per_run,
-                            "api_enqueue_seconds": enqueue_seconds,
-                            "submit_to_completion_seconds": None,
-                            "estimated_trace_cost": None,
-                            "cost_sample_count": 0,
-                            "billed_cost": None,
-                            "enqueue_finished_at": enqueue_finished_at.isoformat(),
-                            "completed_at": None,
-                        }
-                    )
-                    continue
+                }
                 items = (
-                    db.query(GenerationTaskItem).filter(GenerationTaskItem.task_id == task.id).all()
+                    db.query(GenerationTaskItem).filter(GenerationTaskItem.task_id == task_id).all()
                 )
-                costs = db.query(TraceLog.cost).filter(TraceLog.task_id == task.id).all()
-                cost_values = [float(row[0]) for row in costs if row[0] is not None]
-                estimated_cost = sum(cost_values) if cost_values else None
+                traces = (
+                    db.query(
+                        TraceLog.trace_id, TraceLog.cost, TraceLog.usage_reported, TraceLog.stage
+                    )
+                    .filter(TraceLog.task_id == task_id)
+                    .all()
+                )
+                # record_lifecycle_event emits these nonbillable stages. Keep all other
+                # stages, including optional RAG provider calls, in cost coverage.
+                costs = [
+                    (trace_id, cost, usage_reported)
+                    for trace_id, cost, usage_reported, stage in traces
+                    if stage not in {"queue_dispatch", "queue_item", "workflow", "rag"}
+                ]
+                cost_values = [
+                    float(cost)
+                    for _, cost, usage_reported in costs
+                    if cost is not None and usage_reported is True
+                ]
+                costs_by_thread: dict[str, list[float | None]] = {}
+                for trace_id, cost, usage_reported in costs:
+                    costs_by_thread.setdefault(trace_id, []).append(
+                        cost if usage_reported is True else None
+                    )
+                covered_items = sum(
+                    item.status in {"succeeded", "failed", "cancelled"}
+                    and bool(costs_by_thread.get(item.thread_id))
+                    and all(cost is not None for cost in costs_by_thread[item.thread_id])
+                    for item in items
+                )
+                unknown_traces = sum(
+                    cost is None or usage_reported is not True for _, cost, usage_reported in costs
+                )
+                cost_complete = covered_items == args.real_items_per_run and not unknown_traces
+                known_subtotal = sum(cost_values) if cost_values else None
                 successful_items = sum(item.status == "succeeded" for item in items)
-                completed_at = task.updated_at
+                failed_items = sum(item.status == "failed" for item in items)
+                cancelled_items = sum(item.status == "cancelled" for item in items)
+                completed_at = task.updated_at if terminal else None
                 completion_seconds = (
                     (completed_at - task.created_at).total_seconds()
                     if completed_at and task.created_at
@@ -242,15 +266,29 @@ def run_real_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 run_samples.append(
                     {
-                        "task_id": task.id,
-                        "status": task.status,
+                        "task_id": task_id,
+                        "status": (
+                            task.status if terminal else "timed_out" if task else "missing_task"
+                        ),
                         "submitted_items": args.real_items_per_run,
                         "successful_items": successful_items,
-                        "failed_items": args.real_items_per_run - successful_items,
+                        "failed_items": failed_items,
+                        "cancelled_items": cancelled_items,
+                        "unresolved_items": (
+                            args.real_items_per_run
+                            - successful_items
+                            - failed_items
+                            - cancelled_items
+                        ),
+                        "missing_items": args.real_items_per_run - len(items),
                         "api_enqueue_seconds": enqueue_seconds,
                         "submit_to_completion_seconds": completion_seconds,
-                        "estimated_trace_cost": estimated_cost,
+                        "known_estimated_trace_cost_subtotal": known_subtotal,
+                        "estimated_trace_cost": known_subtotal if cost_complete else None,
                         "cost_sample_count": len(cost_values),
+                        "cost_unknown_trace_count": unknown_traces,
+                        "cost_covered_items": covered_items,
+                        "cost_unknown_items": args.real_items_per_run - covered_items,
                         "billed_cost": None,
                         "enqueue_finished_at": enqueue_finished_at.isoformat(),
                         "completed_at": completed_at.isoformat() if completed_at else None,
@@ -288,22 +326,36 @@ def summarize_real_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     submitted = sum(sample.get("submitted_items", 0) for sample in samples)
     succeeded = sum(sample.get("successful_items", 0) for sample in samples)
-    failed = submitted - succeeded
+    failed = sum(sample.get("failed_items", 0) for sample in samples)
+    cancelled = sum(sample.get("cancelled_items", 0) for sample in samples)
+    unresolved = submitted - succeeded - failed - cancelled
     estimated_costs = [
-        sample["estimated_trace_cost"]
+        sample["known_estimated_trace_cost_subtotal"]
         for sample in samples
-        if sample.get("estimated_trace_cost") is not None
+        if sample.get("known_estimated_trace_cost_subtotal") is not None
     ]
-    cost_covered_items = sum(
-        sample.get("submitted_items", 0)
-        for sample in samples
-        if sample.get("estimated_trace_cost") is not None
-    )
+    cost_covered_items = sum(sample.get("cost_covered_items", 0) for sample in samples)
+    unknown_traces = sum(sample.get("cost_unknown_trace_count", 0) for sample in samples)
+    cost_complete = bool(submitted) and cost_covered_items == submitted and not unknown_traces
+    known_subtotal = sum(estimated_costs) if estimated_costs else None
+    cost_covered_runs = sum(sample.get("estimated_trace_cost") is not None for sample in samples)
+    enqueue_errors = sum(sample.get("status") == "enqueue_failed" for sample in samples)
     return {
         "sample_count": submitted,
+        "submitted_items": submitted,
         "run_count": len(samples),
+        "enqueue_error_run_count": enqueue_errors,
+        "enqueue_error_rate": enqueue_errors / len(samples) if samples else None,
+        "enqueue_error_rate_denominator": len(samples),
+        "successful_items": succeeded,
         "failed_items": failed,
+        "cancelled_items": cancelled,
+        "unresolved_items": unresolved,
+        "missing_items": sum(sample.get("missing_items", 0) for sample in samples),
         "failure_rate": failed / submitted if submitted else None,
+        "failure_rate_denominator": submitted,
+        "unresolved_rate": unresolved / submitted if submitted else None,
+        "unresolved_rate_denominator": submitted,
         "api_enqueue_sample_count": len(enqueue_values),
         "api_enqueue_p95_seconds": _p95(enqueue_values),
         "submit_to_completion_sample_count": len(completion_values),
@@ -311,11 +363,26 @@ def summarize_real_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "estimated_trace_cost_sample_count": sum(
             sample.get("cost_sample_count", 0) for sample in samples
         ),
+        "estimated_trace_cost_unknown_sample_count": unknown_traces,
+        "cost_covered_items": cost_covered_items,
+        "cost_unknown_items": submitted - cost_covered_items,
+        "cost_coverage_denominator": submitted,
+        "cost_coverage_complete": cost_complete,
+        "cost_covered_runs": cost_covered_runs,
+        "cost_unknown_runs": len(samples) - cost_covered_runs,
+        "cost_run_coverage_denominator": len(samples),
+        "known_estimated_trace_cost_subtotal": known_subtotal,
+        "estimated_trace_cost_total": known_subtotal if cost_complete else None,
         "estimated_per_item_cost": (
-            sum(estimated_costs) / cost_covered_items if cost_covered_items else None
+            known_subtotal / submitted if cost_complete and known_subtotal is not None else None
         ),
         "billed_cost": None,
-        "cost_basis": "TraceLog.cost estimated values; billed costs unavailable",
+        "cost_basis": (
+            "TraceLog.cost estimates with usage_reported=True; "
+            "excludes nonbillable queue_dispatch/queue_item/workflow/rag lifecycle stages; "
+            "coverage requires every remaining trace of every terminal item; "
+            "billed costs unavailable"
+        ),
     }
 
 
@@ -389,7 +456,10 @@ def main() -> int:
     print(encoded)
     print(f"Redis configured: {'yes' if settings.REDIS_URL else 'no'}", file=sys.stderr)
     failed = report["metrics"].get("failed", report["metrics"].get("failed_items", 0))
-    return 0 if failed == 0 else 1
+    incomplete = report["metrics"].get("unresolved_items", 0) + report["metrics"].get(
+        "cancelled_items", 0
+    )
+    return 0 if failed == 0 and incomplete == 0 else 1
 
 
 if __name__ == "__main__":

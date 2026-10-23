@@ -173,6 +173,8 @@ def test_cli_imports_reference_assessments_and_keeps_blind_packet_separate(tmp_p
         json.dumps(
             {
                 "case_count": 1,
+                "cases_by_template": {"single_choice": 1},
+                "provenance": {"code_revision": "test-revision", "dataset_hash": "test-hash"},
                 "reference_review_packets": [
                     {
                         "review_id": review_packet_id(
@@ -185,13 +187,24 @@ def test_cli_imports_reference_assessments_and_keeps_blind_packet_separate(tmp_p
                 ],
                 "arms": {
                     "single_attempt": {
+                        "counts": {
+                            "final_schema_success": 1,
+                            "recovered": 0,
+                            "recovery_denominator": 0,
+                            "failed": 0,
+                            "missing": 0,
+                            "cancelled": 0,
+                            "unresolved": 0,
+                        },
+                        "denominators": {"planned_cases": 1},
+                        "attempts": {"adapter_calls": 1},
                         "outcomes": [
                             {
                                 "case_id": "single_choice-01",
                                 "final_schema_success": True,
                                 "payload": {"stem": "She ___ yesterday.", "answer": "walked"},
                             }
-                        ]
+                        ],
                     }
                 },
             }

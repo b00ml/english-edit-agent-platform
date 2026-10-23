@@ -1,3 +1,8 @@
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
 from app.worker.benchmark_metrics import summarize_samples
 from scripts import worker_benchmark
 
@@ -197,10 +202,13 @@ def test_http_generate_enqueue_measures_request_and_keeps_token_out_of_report(mo
     assert "secret-token" not in str(report)
 
 
-def test_http_enqueue_failure_preserves_request_latency_without_exposing_token(monkeypatch):
+@pytest.mark.parametrize("failure_type", ["ConnectError", "ReadTimeout"])
+def test_http_enqueue_failure_preserves_request_latency_without_exposing_token(
+    monkeypatch, failure_type
+):
     class Client:
         def post(self, *args, **kwargs):
-            raise worker_benchmark.httpx.ConnectError("connection refused")
+            raise getattr(worker_benchmark.httpx, failure_type)("request failed")
 
     ticks = iter([20.0, 20.4])
     monkeypatch.setattr(worker_benchmark.time, "monotonic", lambda: next(ticks))
@@ -214,15 +222,18 @@ def test_http_enqueue_failure_preserves_request_latency_without_exposing_token(m
         )
     except worker_benchmark.RealEnqueueFailure as exc:
         assert round(exc.elapsed_seconds, 2) == 0.4
-        assert exc.failure_type == "ConnectError"
+        assert exc.failure_type == failure_type
         assert "secret-token" not in str(exc)
         sample = worker_benchmark.real_enqueue_failure_sample(exc, item_count=2)
         metrics = worker_benchmark.summarize_real_samples([sample])
         assert sample["status"] == "enqueue_failed"
         assert sample["api_enqueue_seconds"] == exc.elapsed_seconds
         assert metrics["sample_count"] == 2
-        assert metrics["failed_items"] == 2
-        assert metrics["failure_rate"] == 1.0
+        assert metrics["failed_items"] == 0
+        assert metrics["failure_rate"] == 0.0
+        assert metrics["unresolved_items"] == 2
+        assert metrics["enqueue_error_run_count"] == 1
+        assert metrics["enqueue_error_rate_denominator"] == 1
         assert metrics["api_enqueue_sample_count"] == 1
         assert "secret-token" not in str(sample)
     else:
@@ -261,28 +272,37 @@ def test_real_arm_rejects_empty_api_url_or_token_before_request(monkeypatch):
             raise AssertionError(f"real arm must reject an empty {flag}")
 
 
-def test_real_summary_counts_http_enqueue_failure_in_item_denominator():
+def test_real_summary_separates_failure_and_unresolved_items():
     metrics = worker_benchmark.summarize_real_samples(
         [
             {
-                "status": "completed",
-                "submitted_items": 2,
-                "successful_items": 2,
+                "status": "partially_succeeded",
+                "submitted_items": 4,
+                "successful_items": 1,
+                "failed_items": 1,
+                "cancelled_items": 0,
+                "unresolved_items": 2,
                 "api_enqueue_seconds": 0.1,
             },
             {
                 "status": "enqueue_failed",
                 "submitted_items": 2,
                 "successful_items": 0,
-                "failed_items": 2,
+                "failed_items": 0,
+                "cancelled_items": 0,
+                "unresolved_items": 2,
                 "api_enqueue_seconds": 0.3,
             },
         ]
     )
 
-    assert metrics["sample_count"] == 4
-    assert metrics["failed_items"] == 2
-    assert metrics["failure_rate"] == 0.5
+    assert metrics["submitted_items"] == 6
+    assert metrics["successful_items"] == 1
+    assert metrics["failed_items"] == 1
+    assert metrics["cancelled_items"] == 0
+    assert metrics["unresolved_items"] == 4
+    assert metrics["failure_rate"] == 1 / 6
+    assert metrics["unresolved_rate"] == 4 / 6
     assert metrics["api_enqueue_sample_count"] == 2
 
 
@@ -291,33 +311,232 @@ def test_real_p95_uses_run_samples_and_empty_input_is_null():
     assert worker_benchmark._p95([]) is None
 
 
-def test_real_summary_labels_estimated_cost_and_counts_failures_in_denominator():
+def test_real_summary_marks_partial_item_cost_coverage_unknown():
     metrics = worker_benchmark.summarize_real_samples(
         [
             {
                 "submitted_items": 2,
                 "successful_items": 1,
+                "failed_items": 1,
+                "cancelled_items": 0,
+                "unresolved_items": 0,
                 "api_enqueue_seconds": 0.1,
                 "submit_to_completion_seconds": 2.0,
-                "estimated_trace_cost": 0.04,
-                "cost_sample_count": 2,
+                "known_estimated_trace_cost_subtotal": 0.04,
+                "estimated_trace_cost": None,
+                "cost_sample_count": 3,
+                "cost_unknown_trace_count": 1,
+                "cost_covered_items": 1,
+                "cost_unknown_items": 1,
             },
             {
                 "submitted_items": 1,
                 "successful_items": 0,
+                "failed_items": 0,
+                "cancelled_items": 0,
+                "unresolved_items": 1,
                 "api_enqueue_seconds": 0.2,
                 "submit_to_completion_seconds": None,
                 "estimated_trace_cost": None,
                 "cost_sample_count": 0,
+                "cost_unknown_trace_count": 0,
+                "cost_covered_items": 0,
+                "cost_unknown_items": 1,
             },
         ]
     )
 
-    assert metrics["sample_count"] == 3
-    assert metrics["failed_items"] == 2
-    assert metrics["failure_rate"] == 2 / 3
+    assert metrics["submitted_items"] == 3
+    assert metrics["successful_items"] == 1
+    assert metrics["failed_items"] == 1
+    assert metrics["unresolved_items"] == 1
+    assert metrics["failure_rate"] == 1 / 3
     assert metrics["api_enqueue_sample_count"] == 2
     assert metrics["submit_to_completion_sample_count"] == 1
-    assert metrics["estimated_trace_cost_sample_count"] == 2
-    assert metrics["estimated_per_item_cost"] == 0.04 / 2
+    assert metrics["estimated_trace_cost_sample_count"] == 3
+    assert metrics["estimated_trace_cost_unknown_sample_count"] == 1
+    assert metrics["cost_covered_items"] == 1
+    assert metrics["cost_unknown_items"] == 2
+    assert metrics["cost_coverage_complete"] is False
+    assert metrics["cost_covered_runs"] == 0
+    assert metrics["cost_unknown_runs"] == 2
+    assert metrics["known_estimated_trace_cost_subtotal"] == 0.04
+    assert metrics["estimated_trace_cost_total"] is None
+    assert metrics["estimated_per_item_cost"] is None
     assert metrics["billed_cost"] is None
+
+
+@pytest.mark.parametrize("task_status", ["running", "partially_succeeded", None])
+def test_real_runner_observes_items_and_cost_coverage_even_at_timeout(monkeypatch, task_status):
+    report = _real_report_with_snapshot(
+        monkeypatch,
+        task_status=task_status,
+        statuses=["succeeded", "failed", "cancelled", "running"],
+        quantity=5,
+        traces=[("task-1:0", 0.04, True), ("task-1:1", None, True), ("task-1:3", 0.02, True)],
+    )
+
+    sample = report["samples"][0]
+    assert sample["status"] == (
+        task_status
+        if task_status == "partially_succeeded"
+        else ("timed_out" if task_status else "missing_task")
+    )
+    assert sample["successful_items"] == 1
+    assert sample["failed_items"] == 1
+    assert sample["cancelled_items"] == 1
+    assert sample["unresolved_items"] == 2
+    assert sample["missing_items"] == 1
+    assert sample["estimated_trace_cost"] is None
+    assert sample["cost_covered_items"] == 1
+    assert sample["cost_unknown_items"] == 4
+    assert sample["cost_unknown_trace_count"] == 1
+    assert report["metrics"]["failure_rate"] == 1 / 5
+    assert report["metrics"]["known_estimated_trace_cost_subtotal"] == 0.06
+    assert report["metrics"]["estimated_per_item_cost"] is None
+    if task_status != "partially_succeeded":
+        assert report["metrics"]["submit_to_completion_sample_count"] == 0
+
+
+def test_real_summary_reports_cost_only_when_every_item_is_covered():
+    metrics = worker_benchmark.summarize_real_samples(
+        [
+            {
+                "submitted_items": 2,
+                "successful_items": 1,
+                "failed_items": 1,
+                "cost_covered_items": 2,
+                "known_estimated_trace_cost_subtotal": 0.06,
+                "estimated_trace_cost": 0.06,
+                "cost_sample_count": 3,
+            }
+        ]
+    )
+
+    assert metrics["cost_coverage_complete"] is True
+    assert metrics["cost_covered_runs"] == 1
+    assert metrics["cost_unknown_runs"] == 0
+    assert metrics["cost_unknown_items"] == 0
+    assert metrics["estimated_trace_cost_total"] == 0.06
+    assert metrics["estimated_per_item_cost"] == 0.03
+
+
+@pytest.mark.parametrize("usage_reported", [True, False, None])
+def test_real_cost_zero_requires_reported_usage(monkeypatch, usage_reported):
+    report = _real_report_with_snapshot(
+        monkeypatch,
+        task_status="succeeded",
+        statuses=["succeeded"],
+        quantity=1,
+        traces=[("task-1:0", 0.0, usage_reported)],
+    )
+
+    metrics = report["metrics"]
+    assert metrics["cost_covered_items"] == int(usage_reported is True)
+    assert metrics["cost_unknown_items"] == int(usage_reported is not True)
+    assert metrics["estimated_trace_cost_unknown_sample_count"] == int(usage_reported is not True)
+    assert metrics["cost_coverage_complete"] is (usage_reported is True)
+    assert metrics["estimated_per_item_cost"] == (0.0 if usage_reported is True else None)
+    assert metrics["known_estimated_trace_cost_subtotal"] == (
+        0.0 if usage_reported is True else None
+    )
+
+
+@pytest.mark.parametrize("stage", ["queue_dispatch", "queue_item", "workflow", "rag", "rag_rerank"])
+def test_real_cost_excludes_lifecycle_but_keeps_unknown_rag_call(monkeypatch, stage):
+    report = _real_report_with_snapshot(
+        monkeypatch,
+        task_status="succeeded",
+        statuses=["succeeded"],
+        quantity=1,
+        traces=[
+            ("task-1:0", 0.04, True, "generate"),
+            ("task-1:0", 0.01, True, "rag_plan"),
+            ("task-1:0", 0.0, None, stage),
+        ],
+    )
+
+    metrics = report["metrics"]
+    complete = stage != "rag_rerank"
+    assert metrics["cost_coverage_complete"] is complete
+    assert metrics["cost_covered_items"] == int(complete)
+    assert metrics["known_estimated_trace_cost_subtotal"] == pytest.approx(0.05)
+    assert metrics["estimated_trace_cost_unknown_sample_count"] == int(not complete)
+    assert metrics["estimated_per_item_cost"] == (pytest.approx(0.05) if complete else None)
+
+
+def _real_report_with_snapshot(monkeypatch, *, task_status, statuses, quantity, traces):
+    from app.models import GenerationTaskItem
+
+    now = datetime.now(timezone.utc)
+    task = (
+        SimpleNamespace(id="task-1", status=task_status, created_at=now, updated_at=now)
+        if task_status
+        else None
+    )
+    items = [
+        SimpleNamespace(status=status, thread_id=f"task-1:{index}")
+        for index, status in enumerate(statuses)
+    ]
+    traces = [trace if len(trace) == 4 else (*trace, "generate") for trace in traces]
+
+    class Query:
+        def __init__(self, entity):
+            self.entity = entity
+
+        def filter(self, *conditions):
+            return self
+
+        def first(self):
+            return task
+
+        def all(self):
+            return (
+                items
+                if self.entity[0] is GenerationTaskItem
+                else [trace[: len(self.entity)] for trace in traces]
+            )
+
+    class Database:
+        def query(self, *entities):
+            return Query(entities)
+
+        def expire_all(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    ticks = iter([0.0, 0.0, 0.0, 2.0, 2.0])
+    monkeypatch.setattr("app.database.SessionLocal", Database)
+    monkeypatch.setattr(worker_benchmark, "preflight_real_profile", lambda *args: None)
+    monkeypatch.setattr(
+        worker_benchmark, "enqueue_real_task", lambda *args, **kwargs: ("task-1", 0.1)
+    )
+    monkeypatch.setattr(worker_benchmark.httpx, "Client", Client)
+    monkeypatch.setattr(worker_benchmark.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(worker_benchmark.time, "sleep", lambda _: None)
+    args = worker_benchmark.argparse.Namespace(
+        real_template_id="template",
+        real_profile="fixed",
+        real_user_id="admin",
+        real_runs=1,
+        real_api_base_url="http://localhost:8000",
+        real_api_token="secret",
+        real_params={},
+        real_items_per_run=quantity,
+        timeout_seconds=1.0,
+        poll_seconds=0.1,
+    )
+
+    return worker_benchmark.run_real_benchmark(args)
