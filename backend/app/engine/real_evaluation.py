@@ -22,6 +22,7 @@ from app.engine.structured_output import StructuredResponse, generate_structured
 from app.engine.trace import record_trace
 from app.errors import EvaluationTransportError, EvaluationUnresolvedError, StructuredOutputError
 from app.models import ModelProfile
+from app.prompt_loader import with_frozen_assets
 from app.versioning import hash_value, model_profile_hash
 
 EvaluationResponse = StructuredResponse
@@ -123,13 +124,18 @@ class EvaluationLedger:
         manifest: dict[str, Any],
         *,
         trace_sink: Callable[..., bool | None] = record_trace,
+        persist: Callable[[], None] | None = None,
     ) -> None:
         self.path = path
         self.manifest = manifest
         self.trace_sink = trace_sink
+        self.persist = persist
 
     def save(self) -> None:
-        write_manifest(self.path, self.manifest, overwrite=True)
+        if self.persist is not None:
+            self.persist()
+        else:
+            write_manifest(self.path, self.manifest, overwrite=True)
 
     def call(
         self,
@@ -338,21 +344,26 @@ def _account(manifest: dict[str, Any]) -> None:
     }
 
 
+@with_frozen_assets
 def run_generation(
     path: Path,
     manifest: dict[str, Any],
     *,
     client: Any,
     trace_sink: Callable[..., bool | None] = record_trace,
+    path_ids: set[str] | None = None,
+    persist: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run frozen paths using the production validator; physical first drafts are shared."""
-    ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink)
+    ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink, persist=persist)
     config = manifest["frozen"]["config"]
     model = config["profiles"]["generation"]["model_name"]
     generation = config["generation"]
     transport = client.with_options(max_retries=0, timeout=generation["timeout_seconds"])
     results = manifest.setdefault("generation_results", {})
     for planned in manifest["execution_plan"]:
+        if path_ids is not None and planned["path_id"] not in path_ids:
+            continue
         if planned["state"] in {"completed", "failed", "unresolved"}:
             continue
         case = next(

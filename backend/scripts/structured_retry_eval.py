@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import yaml
 
@@ -257,6 +258,21 @@ def main() -> int:
     freeze.add_argument("--run-id", required=True)
     freeze.add_argument("--seed", type=int, required=True)
     freeze.add_argument("--set-name", choices=("smoke", "exploration"), default="exploration")
+    confirmation_freeze = subparsers.add_parser("freeze-confirmation")
+    confirmation_freeze.add_argument("--source", type=Path, required=True)
+    confirmation_freeze.add_argument("--selection", type=Path, required=True)
+    confirmation_freeze.add_argument("--observations", type=Path, action="append", default=[])
+    confirmation_freeze.add_argument("--run-id", required=True)
+    confirmation_freeze.add_argument("--seed", type=int, required=True)
+    confirmation_freeze.add_argument("--output", type=Path, required=True)
+    for name in ("execute-confirmation", "confirmation-evidence"):
+        confirmation = subparsers.add_parser(name)
+        confirmation.add_argument("--manifest", type=Path, required=True)
+        if name == "execute-confirmation":
+            confirmation.add_argument("--reviewed-smoke", type=Path)
+            confirmation.add_argument("--path-limit", type=int)
+        else:
+            confirmation.add_argument("--output", type=Path, required=True)
     resume = subparsers.add_parser("resume", help="Validate frozen inputs without replaying calls")
     resume.add_argument("--manifest", type=Path, required=True)
     resume.add_argument("--dataset", type=Path, required=True)
@@ -290,6 +306,72 @@ def main() -> int:
         elif command == "evidence":
             execute.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.command in {"freeze-confirmation", "execute-confirmation", "confirmation-evidence"}:
+        from app.engine.real_confirmation import (
+            confirmation_report,
+            freeze_confirmation,
+            run_confirmation,
+            validate_confirmation,
+        )
+
+        def read_json(path: Path) -> dict[str, Any]:
+            return json.loads(path.read_text("utf-8"))
+
+        try:
+            if args.command == "freeze-confirmation":
+                bundle = freeze_confirmation(
+                    read_json(args.source),
+                    read_json(args.selection),
+                    run_id=args.run_id,
+                    seed=args.seed,
+                    observations=[read_json(path) for path in args.observations],
+                )
+                write_manifest(args.output, bundle)
+            else:
+                bundle = read_json(args.manifest)
+                validate_confirmation(bundle)
+                if args.command == "execute-confirmation":
+                    smoke = read_json(args.reviewed_smoke) if args.reviewed_smoke else None
+                    factor = bundle["selection"].get("factor")
+                    if factor not in {None, "judge_threshold", "judge_weights"}:
+                        require_reviewed_smoke(bundle["source"], smoke)
+                    cache: dict[str, Any] = {}
+
+                    def clients(run: dict[str, Any]) -> dict[str, Any]:
+                        from app.database import SessionLocal
+                        from app.engine.evaluation_protocol import canonical_hash
+
+                        identity = canonical_hash(run["frozen"]["config"])
+                        if identity not in cache:
+                            with SessionLocal() as session:
+                                cache[identity] = verified_clients(run, session)
+                        return cache[identity]
+
+                    run_confirmation(
+                        args.manifest,
+                        bundle,
+                        clients=clients,
+                        smoke=smoke,
+                        path_limit=args.path_limit,
+                    )
+                else:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(confirmation_report(bundle), ensure_ascii=False, indent=2),
+                        "utf-8",
+                    )
+            print(
+                json.dumps(
+                    {
+                        "decision_identity": bundle["identity"],
+                        "planned_paths": len(bundle["execution_plan"]),
+                    }
+                )
+            )
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return 0
 
     if args.command in {
         "freeze",

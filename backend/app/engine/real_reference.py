@@ -15,7 +15,7 @@ from app.engine.real_evaluation import EvaluationLedger
 from app.engine.reference_review import ReferenceRubric
 from app.engine.trace import record_trace
 from app.errors import EvaluationTransportError, EvaluationUnresolvedError
-from app.prompt_loader import load_prompt, render
+from app.prompt_loader import load_prompt, render, with_frozen_assets
 from app.skill_registry import get_skill_by_id
 
 RUBRIC_VERSION = "blind-reference-v1"
@@ -185,7 +185,7 @@ def _account(manifest: dict[str, Any]) -> None:
     }
     paired = []
     for planned in manifest["execution_plan"]:
-        row = results[planned["path_id"]]
+        row = results.setdefault(planned["path_id"], {"state": "missing"})
         judge = manifest.get("judge_results", {}).get(planned["path_id"], {})
         # Link only after blind model calls; reference completion never requires a Judge label.
         row["judge_state"] = judge.get("state", "missing")
@@ -229,15 +229,18 @@ def _account(manifest: dict[str, Any]) -> None:
     }
 
 
+@with_frozen_assets
 def run_reference_review(
     path: Path,
     manifest: dict[str, Any],
     *,
     client: Any,
     trace_sink: Callable[..., bool | None] = record_trace,
+    path_ids: set[str] | None = None,
+    persist: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Independently solve then review each unique final content; preserve every planned path."""
-    ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink)
+    ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink, persist=persist)
     frozen = manifest["frozen"]
     config = frozen["config"]
     transport = client.with_options(max_retries=0, timeout=config["generation"]["timeout_seconds"])
@@ -246,6 +249,8 @@ def run_reference_review(
         raise ValueError("Reference format repairs must be within the frozen maximum of two")
     results = manifest.setdefault("reference_results", {})
     for planned in manifest["execution_plan"]:
+        if path_ids is not None and planned["path_id"] not in path_ids:
+            continue
         path_id = planned["path_id"]
         if results.get(path_id, {}).get("state") in {
             "completed",

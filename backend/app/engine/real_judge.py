@@ -14,6 +14,7 @@ from app.engine.real_evaluation import EvaluationLedger, evaluation_template
 from app.engine.structured_output import StructuredResponse
 from app.engine.trace import record_trace
 from app.errors import EvaluationTransportError, EvaluationUnresolvedError, QualityCheckError
+from app.prompt_loader import with_frozen_assets
 
 # Manifests and provider envelopes retain dynamic template-specific schema fields at this boundary.
 
@@ -68,15 +69,18 @@ def _account(manifest: dict[str, Any]) -> None:
     }
 
 
+@with_frozen_assets
 def run_judge(
     path: Path,
     manifest: dict[str, Any],
     *,
     client: Any,
     trace_sink: Callable[..., bool | None] = record_trace,
+    path_ids: set[str] | None = None,
+    persist: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Score each frozen final content once; preserve a result per logical path."""
-    ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink)
+    ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink, persist=persist)
     frozen = manifest["frozen"]
     config = frozen["config"]
     judge = config["judge"]
@@ -86,6 +90,8 @@ def run_judge(
     transport = client.with_options(max_retries=0, timeout=config["generation"]["timeout_seconds"])
     results = manifest.setdefault("judge_results", {})
     for planned in manifest["execution_plan"]:
+        if path_ids is not None and planned["path_id"] not in path_ids:
+            continue
         path_id = planned["path_id"]
         if results.get(path_id, {}).get("state") in {
             "completed",

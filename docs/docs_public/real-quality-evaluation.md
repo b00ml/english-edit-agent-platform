@@ -107,3 +107,37 @@ python scripts/structured_retry_eval.py evidence --dataset <local-cases.json> --
 吞吐或 MTTR。Judge 与参考模型一致率、Kappa 只描述模型间判断；原始坏例、分歧和
 未决状态保存在本地报告中。模型参考不等于人工金标准，探索结果不等于已确认质量提升。
 本地清单含完整输入输出；导出不会发布或上传这些内容。
+
+## 单一因素确认
+
+先根据探索报告冻结决策文件，再调度确认实验。证据不足时可使用
+`{"decision":"no_change","reason":"未发现可重复、可归因的问题"}`，保留依据且不创建调用。
+有依据时，文件须包含 `decision: "change"`、`factor`、`key`、`new`、`hypothesis`、
+`analysis` 和探索坏例的 `evidence_refs` 路径标识；一次只允许一个因素，冻结后不得改写。
+可选因素为生成或 Judge 的 Prompt、Skill、模型档案，生成温度，反馈 Prompt，以及
+某题型完整的 Judge 权重或阈值。模型替换同时提供完整 `profile` 和显式 `price`。
+Prompt 的 `key` 是冻结的 `.st` 文件名，Skill 是 `skills/<id>/SKILL.md`；
+阈值、权重的 `key` 是题型标识。旧定义来自已冻结探索，新定义与分析一同写入身份哈希。
+
+```powershell
+python scripts/structured_retry_eval.py freeze-confirmation --source <exploration.json> --selection <decision.json> --run-id <new-run-id> --seed 42 --output <confirmation.json>
+python scripts/structured_retry_eval.py execute-confirmation --manifest <confirmation.json> --reviewed-smoke <smoke.json>
+python scripts/structured_retry_eval.py confirmation-evidence --manifest <confirmation.json> --output <confirmation-report.json>
+```
+
+`freeze-confirmation` 与 `confirmation-evidence` 仅处理本地文件；`execute-confirmation`
+会显式连接冻结档案，可能产生费用。`--path-limit N` 只执行冻结顺序的前 N 条路径，
+用于检查部分结果；扩大前缀后续跑，已完成响应仍复用原账本。
+生成、Judge、参考评审的 Prompt 和 Skill 均读取清单内快照，不读取运行时修改的文本。
+
+主比较为两个 30 输入集 × 三轮 × old/new，共 360 条逻辑路径。输入是统计单位，
+各输入先汇总重复轮次，再计算带符号的平均变化；报告分别列出集合、题型和轮次，
+并保留不完整配对。反馈改动另加 180 条等尝试预算的盲重试控制，不并入主比较分母。
+只有不影响首调用的改动共用首稿；生成因素使用独立首稿。运行次序按冻结随机种子交错。
+
+Judge Prompt、Skill 或模型改动复用已有内容，缺失内容按输入和轮次仅获取一次基线；
+阈值或权重改动使用生产聚合和两位小数规则重算已有维度分，额外 LLM 调用为零。
+`--observations <recorded-manifest.json>` 可重复提供冻结资产一致的既有观测；缺失轮次
+仍显示缺失，不把一次原始分数扩成三次独立观测。Judge 策略变化只说明放行行为变化。
+物理账本只累计本次实际发送，逻辑路径可以引用同一响应；未知费用继续保持未知。
+零变化、退化和 `no_change` 均为合法结果，程序不会自动选择或采用“最优”方案。
