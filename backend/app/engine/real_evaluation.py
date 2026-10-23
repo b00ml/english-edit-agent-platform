@@ -176,6 +176,13 @@ class EvaluationLedger:
                     physical_id,
                     True,
                 )
+            limits = self.manifest["protocol"]["call_limits"][stage]
+            stage_calls = [item for item in records if item["stage"] == stage]
+            if len(stage_calls) >= limits["physical"]:
+                raise ValueError(f"{stage} physical call limit reached")
+            semantic_ids = {item["request_id"] for item in stage_calls}
+            if call_id not in semantic_ids and len(semantic_ids) >= limits["semantic"]:
+                raise ValueError(f"{stage} semantic call limit reached")
             row: dict[str, Any] = {
                 "call_id": physical_id,
                 "request_id": call_id,

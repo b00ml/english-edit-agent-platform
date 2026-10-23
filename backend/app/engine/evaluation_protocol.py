@@ -156,7 +156,13 @@ def asset_snapshot(backend: Path) -> dict[str, Any]:
 
 
 def freeze_protocol(
-    *, dataset_path: Path, config_path: Path, backend: Path, run_id: str, seed: int
+    *,
+    dataset_path: Path,
+    config_path: Path,
+    backend: Path,
+    run_id: str,
+    seed: int,
+    set_name: Literal["smoke", "exploration"] = "exploration",
 ) -> dict[str, Any]:
     """Build an offline manifest; freezing never submits a provider request."""
     if not run_id.strip():
@@ -178,7 +184,9 @@ def freeze_protocol(
     frozen = {"dataset": dataset, **asset_snapshot(backend), "config": config}
     judge_policies(frozen["templates"], config["judge"]["calibration"])
     plan: list[dict[str, Any]] = []
-    cases = list(dataset["sets"]["exploration"])
+    if set_name not in {"smoke", "exploration"}:
+        raise ValueError("Only smoke or exploration can be scheduled")
+    cases = list(dataset["sets"][set_name])
     rng = random.Random(seed)
     rng.shuffle(cases)
     for case in cases:
@@ -191,13 +199,14 @@ def freeze_protocol(
                 {
                     "path_id": path_id,
                     "case_id": case["case_id"],
-                    "set_name": "exploration",
+                    "set_name": set_name,
                     "arm": arm,
                     "first_draft_id": first_draft,
                     "state": "planned",
                 }
             )
     protocol = {
+        "set_name": set_name,
         "seed": seed,
         "dataset_schema_hash": canonical_hash(
             json.loads(
@@ -215,6 +224,18 @@ def freeze_protocol(
         "reference_max_format_repairs": 2,
         "confirmation_rounds": 3,
         "confirmation_policy": "freeze one evidence-supported factor before scheduling",
+    }
+    # At most two retry arms branch after one shared failed draft: 5N generation,
+    # 2N distinct valid final contents. Every semantic request permits three sends.
+    semantic_limits = {
+        "generate": 5 * len(cases),
+        "qc": 2 * len(cases) * config["judge"]["sample_rounds"] * config["judge"]["max_attempts"],
+        "reference_solve": 6 * len(cases),
+        "reference_review": 6 * len(cases),
+    }
+    protocol["call_limits"] = {
+        stage: {"semantic": limit, "physical": 3 * limit}
+        for stage, limit in semantic_limits.items()
     }
     identities = {name: canonical_hash(value) for name, value in frozen.items()}
     identities["execution_plan"] = canonical_hash({"protocol": protocol, "paths": plan})
@@ -243,6 +264,7 @@ def resume_manifest(
         backend=backend,
         run_id=manifest["run_id"],
         seed=manifest["protocol"]["seed"],
+        set_name=manifest["protocol"]["set_name"],
     )
     if expected["identities"] != manifest.get("identities"):
         raise ValueError("Frozen identity drift: create a new run instead of resuming")
