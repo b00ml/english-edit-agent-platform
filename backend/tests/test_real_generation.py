@@ -47,6 +47,14 @@ def local_manifest():
     template = yaml.safe_load((BACKEND / "app/templates/single_choice.yaml").read_text("utf-8"))
     return {
         "run_id": "fixture-run",
+        "protocol": {
+            "call_limits": {
+                "generate": {"semantic": 5, "physical": 15},
+                "qc": {"semantic": 6, "physical": 18},
+                "reference_solve": {"semantic": 6, "physical": 18},
+                "reference_review": {"semantic": 6, "physical": 18},
+            }
+        },
         "frozen": {
             "templates": {"single_choice": template},
             "config": {
