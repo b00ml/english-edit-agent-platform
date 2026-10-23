@@ -196,7 +196,9 @@ def summarize_reference_reviews(
         },
         "assessments": [item.model_dump(mode="json") for item in assessments],
         "limitations": [
-            "This is model-to-model agreement, not human accuracy or proof of teaching correctness.",
-            "Unresolved reviews are excluded from confirmed reference pass/fail and agreement metrics.",
+            "This is model-to-model agreement, not human accuracy "
+            "or proof of teaching correctness.",
+            "Unresolved reviews are excluded from confirmed reference "
+            "pass/fail and agreement metrics.",
         ],
     }

@@ -304,10 +304,14 @@ def generate_structured(
     max_retry = int(run_config.get("max_retry", 3))
 
     model_name = (model_profile.model_name if model_profile else None) or settings.LLM_MODEL_NAME
-    client = None if response_adapter is not None else (
-        client_for_profile(model_profile)
-        if getattr(model_profile, "provider_id", None)
-        else _get_openai_client()
+    client = (
+        None
+        if response_adapter is not None
+        else (
+            client_for_profile(model_profile)
+            if getattr(model_profile, "provider_id", None)
+            else _get_openai_client()
+        )
     )
 
     schema = template.output_schema

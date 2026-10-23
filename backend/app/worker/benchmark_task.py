@@ -24,7 +24,9 @@ def _cpu_seconds() -> float | None:
     return time.process_time()
 
 
-@shared_task(name="app.worker.benchmark_task.infrastructure_probe", ignore_result=False)  # type: ignore[untyped-decorator]
+@shared_task(  # type: ignore[untyped-decorator]
+    name="app.worker.benchmark_task.infrastructure_probe", ignore_result=False
+)
 def infrastructure_probe(
     submitted_at: str, work_seconds: float, should_fail: bool = False
 ) -> dict[str, object]:
