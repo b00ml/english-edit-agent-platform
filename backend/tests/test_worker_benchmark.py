@@ -122,7 +122,21 @@ def test_real_arm_requires_explicit_fixed_profile_configuration(monkeypatch):
     monkeypatch.setattr(
         worker_benchmark.sys,
         "argv",
-        ["worker_benchmark.py", "--arm", "real", "--worker-concurrency", "5"],
+        [
+            "worker_benchmark.py",
+            "--arm",
+            "real",
+            "--worker-concurrency",
+            "5",
+            "--real-profile",
+            "fixed",
+            "--real-template-id",
+            "template",
+            "--real-user-id",
+            "admin",
+            "--real-params",
+            "{}",
+        ],
     )
 
     try:
@@ -131,6 +145,145 @@ def test_real_arm_requires_explicit_fixed_profile_configuration(monkeypatch):
         assert exc.code == 2
     else:
         raise AssertionError("real arm must refuse to run without fixed profile configuration")
+
+
+def test_http_generate_enqueue_measures_request_and_keeps_token_out_of_report(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"task_id": "task-1"}
+
+    class Client:
+        def post(self, url, *, json, headers):
+            assert url == "http://localhost:8000/api/generate"
+            assert headers == {"Authorization": "Bearer secret-token"}
+            return Response()
+
+    ticks = iter([10.0, 10.25])
+    monkeypatch.setattr(worker_benchmark.time, "monotonic", lambda: next(ticks))
+
+    task_id, elapsed = worker_benchmark.enqueue_real_task(
+        Client(),
+        base_url="http://localhost:8000",
+        token="secret-token",
+        payload={"template_id": "template", "params": {}, "quantity": 1},
+    )
+
+    assert task_id == "task-1"
+    assert elapsed == 0.25
+    report = {
+        "configuration": worker_benchmark.real_benchmark_configuration(
+            worker_benchmark.argparse.Namespace(
+                real_profile="fixed",
+                real_template_id="template",
+                real_runs=1,
+                real_items_per_run=1,
+                timeout_seconds=30,
+                real_api_base_url="http://localhost:8000/",
+            )
+        ),
+        "metrics": worker_benchmark.summarize_real_samples(
+            [{"submitted_items": 1, "successful_items": 0, "api_enqueue_seconds": elapsed}]
+        ),
+    }
+    assert report["metrics"]["api_enqueue_p95_seconds"] == 0.25
+    assert report["configuration"]["api_enqueue_measurement"] == (
+        "authenticated HTTP POST /api/generate round-trip"
+    )
+    assert "secret-token" not in str(report)
+
+
+def test_http_enqueue_failure_preserves_request_latency_without_exposing_token(monkeypatch):
+    class Client:
+        def post(self, *args, **kwargs):
+            raise worker_benchmark.httpx.ConnectError("connection refused")
+
+    ticks = iter([20.0, 20.4])
+    monkeypatch.setattr(worker_benchmark.time, "monotonic", lambda: next(ticks))
+
+    try:
+        worker_benchmark.enqueue_real_task(
+            Client(),
+            base_url="http://localhost:8000",
+            token="secret-token",
+            payload={},
+        )
+    except worker_benchmark.RealEnqueueFailure as exc:
+        assert round(exc.elapsed_seconds, 2) == 0.4
+        assert exc.failure_type == "ConnectError"
+        assert "secret-token" not in str(exc)
+        sample = worker_benchmark.real_enqueue_failure_sample(exc, item_count=2)
+        metrics = worker_benchmark.summarize_real_samples([sample])
+        assert sample["status"] == "enqueue_failed"
+        assert sample["api_enqueue_seconds"] == exc.elapsed_seconds
+        assert metrics["sample_count"] == 2
+        assert metrics["failed_items"] == 2
+        assert metrics["failure_rate"] == 1.0
+        assert metrics["api_enqueue_sample_count"] == 1
+        assert "secret-token" not in str(sample)
+    else:
+        raise AssertionError("failed HTTP request must remain a failed enqueue sample")
+
+
+def test_real_arm_rejects_empty_api_url_or_token_before_request(monkeypatch):
+    base_argv = [
+        "worker_benchmark.py",
+        "--arm",
+        "real",
+        "--worker-concurrency",
+        "5",
+        "--real-profile",
+        "fixed",
+        "--real-template-id",
+        "template",
+        "--real-user-id",
+        "admin",
+        "--real-params",
+        "{}",
+        "--real-api-base-url",
+        "http://localhost:8000",
+        "--real-api-token",
+        "secret-token",
+    ]
+    for flag in ("--real-api-base-url", "--real-api-token"):
+        argv = base_argv.copy()
+        argv[argv.index(flag) + 1] = ""
+        monkeypatch.setattr(worker_benchmark.sys, "argv", argv)
+        try:
+            worker_benchmark.parse_args()
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"real arm must reject an empty {flag}")
+
+
+def test_real_summary_counts_http_enqueue_failure_in_item_denominator():
+    metrics = worker_benchmark.summarize_real_samples(
+        [
+            {
+                "status": "completed",
+                "submitted_items": 2,
+                "successful_items": 2,
+                "api_enqueue_seconds": 0.1,
+            },
+            {
+                "status": "enqueue_failed",
+                "submitted_items": 2,
+                "successful_items": 0,
+                "failed_items": 2,
+                "api_enqueue_seconds": 0.3,
+            },
+        ]
+    )
+
+    assert metrics["sample_count"] == 4
+    assert metrics["failed_items"] == 2
+    assert metrics["failure_rate"] == 0.5
+    assert metrics["api_enqueue_sample_count"] == 2
 
 
 def test_real_p95_uses_run_samples_and_empty_input_is_null():

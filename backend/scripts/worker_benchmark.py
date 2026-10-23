@@ -13,7 +13,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -36,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--real-template-id")
     parser.add_argument("--real-user-id")
     parser.add_argument("--real-params", help="JSON object of valid template parameters")
+    parser.add_argument("--real-api-base-url")
+    parser.add_argument("--real-api-token")
     parser.add_argument("--real-runs", type=int, default=5)
     parser.add_argument("--real-items-per-run", type=int, default=1)
     args = parser.parse_args()
@@ -51,11 +56,16 @@ def parse_args() -> argparse.Namespace:
                 ("--real-template-id", args.real_template_id),
                 ("--real-user-id", args.real_user_id),
                 ("--real-params", args.real_params),
+                ("--real-api-base-url", args.real_api_base_url),
+                ("--real-api-token", args.real_api_token),
             )
             if not value
         ]
         if missing:
             parser.error(f"--arm real requires configured values: {', '.join(missing)}")
+        api_url = urlsplit(args.real_api_base_url)
+        if api_url.scheme not in {"http", "https"} or not api_url.netloc:
+            parser.error("--real-api-base-url must be an absolute HTTP(S) URL")
         try:
             args.real_params = json.loads(args.real_params)
         except json.JSONDecodeError as exc:
@@ -91,110 +101,166 @@ def preflight_real_profile(db: Any, template_id: str, profile_name: str, user_id
     return user
 
 
+class RealEnqueueFailure(Exception):
+    def __init__(self, elapsed_seconds: float, failure_type: str) -> None:
+        super().__init__(failure_type)
+        self.elapsed_seconds = elapsed_seconds
+        self.failure_type = failure_type
+
+
+def enqueue_real_task(
+    client: httpx.Client,
+    *,
+    base_url: str,
+    token: str,
+    payload: dict[str, Any],
+) -> tuple[str, float]:
+    started = time.monotonic()
+    try:
+        response = client.post(
+            f"{base_url.rstrip('/')}/api/generate",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+        response_body = response.json()
+        task_id = response_body.get("task_id") if isinstance(response_body, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("Generation API response did not include a task_id")
+        return task_id, time.monotonic() - started
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RealEnqueueFailure(time.monotonic() - started, type(exc).__name__) from exc
+
+
+def real_benchmark_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "profile": args.real_profile,
+        "template_id": args.real_template_id,
+        "runs": args.real_runs,
+        "items_per_run": args.real_items_per_run,
+        "timeout_seconds_per_run": args.timeout_seconds,
+        "profile_preflight": "database route exact match",
+        "api_base_url": args.real_api_base_url.rstrip("/"),
+        "api_enqueue_measurement": "authenticated HTTP POST /api/generate round-trip",
+    }
+
+
+def real_enqueue_failure_sample(exc: RealEnqueueFailure, item_count: int) -> dict[str, Any]:
+    return {
+        "status": "enqueue_failed",
+        "failure_type": exc.failure_type,
+        "submitted_items": item_count,
+        "successful_items": 0,
+        "failed_items": item_count,
+        "api_enqueue_seconds": exc.elapsed_seconds,
+        "submit_to_completion_seconds": None,
+        "estimated_trace_cost": None,
+        "cost_sample_count": 0,
+        "billed_cost": None,
+        "enqueue_finished_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+    }
+
+
 def run_real_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     from app.database import SessionLocal
     from app.models import GenerationTask, GenerationTaskItem, TraceLog
-    from app.schemas import GenerateRequest
-    from app.services.generation_service import GenerationService
 
     db = SessionLocal()
     try:
-        user = preflight_real_profile(
-            db, args.real_template_id, args.real_profile, args.real_user_id
-        )
+        preflight_real_profile(db, args.real_template_id, args.real_profile, args.real_user_id)
         run_samples: list[dict[str, Any]] = []
         total_started = time.monotonic()
-        for _ in range(args.real_runs):
-            enqueue_started = time.monotonic()
-            response = GenerationService(db).create_task(
-                GenerateRequest(
-                    template_id=args.real_template_id,
-                    params=args.real_params,
-                    quantity=args.real_items_per_run,
-                ),
-                user,
-                celery_app,
-            )
-            enqueue_seconds = time.monotonic() - enqueue_started
-            enqueue_finished_at = datetime.now(timezone.utc)
-            deadline = time.monotonic() + args.timeout_seconds
-            task = None
-            while time.monotonic() < deadline:
-                db.expire_all()
-                task = (
-                    db.query(GenerationTask).filter(GenerationTask.id == response.task_id).first()
-                )
-                if task is not None and task.status in {
+        with httpx.Client(timeout=args.timeout_seconds) as client:
+            for _ in range(args.real_runs):
+                enqueue_finished_at = None
+                try:
+                    task_id, enqueue_seconds = enqueue_real_task(
+                        client,
+                        base_url=args.real_api_base_url,
+                        token=args.real_api_token,
+                        payload={
+                            "template_id": args.real_template_id,
+                            "params": args.real_params,
+                            "quantity": args.real_items_per_run,
+                        },
+                    )
+                    enqueue_finished_at = datetime.now(timezone.utc)
+                except RealEnqueueFailure as exc:
+                    # Failed authenticated API submissions remain in the item denominator.
+                    run_samples.append(real_enqueue_failure_sample(exc, args.real_items_per_run))
+                    continue
+
+                deadline = time.monotonic() + args.timeout_seconds
+                task = None
+                while time.monotonic() < deadline:
+                    db.expire_all()
+                    task = db.query(GenerationTask).filter(GenerationTask.id == task_id).first()
+                    if task is not None and task.status in {
+                        "succeeded",
+                        "partially_succeeded",
+                        "failed",
+                        "cancelled",
+                    }:
+                        break
+                    time.sleep(args.poll_seconds)
+                if task is None or task.status not in {
                     "succeeded",
                     "partially_succeeded",
                     "failed",
                     "cancelled",
                 }:
-                    break
-                time.sleep(args.poll_seconds)
-            if task is None or task.status not in {
-                "succeeded",
-                "partially_succeeded",
-                "failed",
-                "cancelled",
-            }:
+                    run_samples.append(
+                        {
+                            "status": "timed_out" if task is not None else "missing_task",
+                            "task_id": task.id if task is not None else task_id,
+                            "submitted_items": args.real_items_per_run,
+                            "successful_items": 0,
+                            "failed_items": args.real_items_per_run,
+                            "api_enqueue_seconds": enqueue_seconds,
+                            "submit_to_completion_seconds": None,
+                            "estimated_trace_cost": None,
+                            "cost_sample_count": 0,
+                            "billed_cost": None,
+                            "enqueue_finished_at": enqueue_finished_at.isoformat(),
+                            "completed_at": None,
+                        }
+                    )
+                    continue
+                items = (
+                    db.query(GenerationTaskItem).filter(GenerationTaskItem.task_id == task.id).all()
+                )
+                costs = db.query(TraceLog.cost).filter(TraceLog.task_id == task.id).all()
+                cost_values = [float(row[0]) for row in costs if row[0] is not None]
+                estimated_cost = sum(cost_values) if cost_values else None
+                successful_items = sum(item.status == "succeeded" for item in items)
+                completed_at = task.updated_at
+                completion_seconds = (
+                    (completed_at - task.created_at).total_seconds()
+                    if completed_at and task.created_at
+                    else None
+                )
                 run_samples.append(
                     {
-                        "status": "timed_out" if task is not None else "missing_task",
-                        "task_id": task.id if task is not None else response.task_id,
+                        "task_id": task.id,
+                        "status": task.status,
                         "submitted_items": args.real_items_per_run,
-                        "successful_items": 0,
-                        "failed_items": args.real_items_per_run,
+                        "successful_items": successful_items,
+                        "failed_items": args.real_items_per_run - successful_items,
                         "api_enqueue_seconds": enqueue_seconds,
-                        "submit_to_completion_seconds": None,
-                        "estimated_trace_cost": None,
-                        "cost_sample_count": 0,
+                        "submit_to_completion_seconds": completion_seconds,
+                        "estimated_trace_cost": estimated_cost,
+                        "cost_sample_count": len(cost_values),
                         "billed_cost": None,
                         "enqueue_finished_at": enqueue_finished_at.isoformat(),
-                        "completed_at": None,
+                        "completed_at": completed_at.isoformat() if completed_at else None,
                     }
                 )
-                break
-            items = db.query(GenerationTaskItem).filter(GenerationTaskItem.task_id == task.id).all()
-            costs = db.query(TraceLog.cost).filter(TraceLog.task_id == task.id).all()
-            cost_values = [float(row[0]) for row in costs if row[0] is not None]
-            estimated_cost = sum(cost_values) if cost_values else None
-            successful_items = sum(item.status == "succeeded" for item in items)
-            completed_at = task.updated_at
-            completion_seconds = (
-                (completed_at - task.created_at).total_seconds()
-                if completed_at and task.created_at
-                else None
-            )
-            run_samples.append(
-                {
-                    "task_id": task.id,
-                    "status": task.status,
-                    "submitted_items": args.real_items_per_run,
-                    "successful_items": successful_items,
-                    "failed_items": args.real_items_per_run - successful_items,
-                    "api_enqueue_seconds": enqueue_seconds,
-                    "submit_to_completion_seconds": completion_seconds,
-                    "estimated_trace_cost": estimated_cost,
-                    "cost_sample_count": len(cost_values),
-                    "billed_cost": None,
-                    "enqueue_finished_at": enqueue_finished_at.isoformat(),
-                    "completed_at": completed_at.isoformat() if completed_at else None,
-                }
-            )
         elapsed = time.monotonic() - total_started
         return {
             "benchmark_kind": "real_model_end_to_end",
             "provider_calls": "opt_in_only",
-            "configuration": {
-                "profile": args.real_profile,
-                "template_id": args.real_template_id,
-                "runs": args.real_runs,
-                "items_per_run": args.real_items_per_run,
-                "timeout_seconds_per_run": args.timeout_seconds,
-                "profile_preflight": "database route exact match",
-                "api_enqueue_measurement": "GenerationService.create_task duration; excludes HTTP transport",
-            },
+            "configuration": real_benchmark_configuration(args),
             "metrics": summarize_real_samples(run_samples),
             "elapsed_seconds": elapsed,
             "samples": run_samples,
