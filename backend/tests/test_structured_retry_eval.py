@@ -28,10 +28,19 @@ def test_frozen_retry_evaluation_cli_reports_explicit_denominators(tmp_path):
     assert report["cases_by_template"] == {"cloze": 10, "reading": 10, "single_choice": 10}
     assert report["provider_calls"] == 0
     assert set(report["arms"]) == {"single_attempt", "blind_retry", "feedback_retry"}
+    packets = report["reference_review_packets"]
+    assert len(packets) == len({packet["review_id"] for packet in packets}) == 30
+    assert all(
+        set(packet) == {"review_id", "content", "instructions", "rubric_version"}
+        for packet in packets
+    )
     for arm in report["arms"].values():
         assert arm["denominators"]["planned_cases"] == 30
         assert arm["counts"]["missing"] == 0
-        assert arm["counts"]["failed"] == arm["denominators"]["planned_cases"] - arm["counts"]["final_schema_success"]
+        assert (
+            arm["counts"]["failed"]
+            == arm["denominators"]["planned_cases"] - arm["counts"]["final_schema_success"]
+        )
         assert arm["counts"]["cancelled"] == 0
         assert arm["counts"]["unresolved"] == 0
         assert arm["cost"]["complete"] is False
