@@ -1,9 +1,11 @@
 type_id: single_choice
 name: 单项选择
-version: 3
+version: 4
 input_schema:
   type: object
   properties:
+    grade: {type: integer, minimum: 1, maximum: 12}
+    constraints: {type: string}
     knowledge_point: {type: string}
     difficulty: {type: string, enum: [易, 中, 难]}
     quantity: {type: integer, minimum: 1, maximum: 50}

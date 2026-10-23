@@ -17,6 +17,11 @@ BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
 from app.engine import structured_output  # noqa: E402
+from app.engine.evaluation_protocol import (  # noqa: E402
+    freeze_protocol,
+    resume_manifest,
+    write_manifest,
+)
 from app.engine.reference_review import (  # noqa: E402
     ReferenceAssessment,
     build_review_packets,
@@ -231,7 +236,50 @@ def main() -> int:
     review.add_argument("--evaluation", type=Path, required=True)
     review.add_argument("--assessments", type=Path, required=True)
     review.add_argument("--output", type=Path, required=True)
+    freeze = subparsers.add_parser(
+        "freeze", help="Freeze explicitly supplied local evaluation inputs"
+    )
+    freeze.add_argument("--dataset", type=Path, required=True)
+    freeze.add_argument("--config", type=Path, required=True)
+    freeze.add_argument("--output", type=Path, required=True)
+    freeze.add_argument("--run-id", required=True)
+    freeze.add_argument("--seed", type=int, required=True)
+    resume = subparsers.add_parser("resume", help="Validate frozen inputs without replaying calls")
+    resume.add_argument("--manifest", type=Path, required=True)
+    resume.add_argument("--dataset", type=Path, required=True)
+    resume.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.command in {"freeze", "resume"}:
+        try:
+            if args.command == "freeze":
+                manifest = freeze_protocol(
+                    dataset_path=args.dataset,
+                    config_path=args.config,
+                    backend=BACKEND,
+                    run_id=args.run_id,
+                    seed=args.seed,
+                )
+                write_manifest(args.output, manifest)
+            else:
+                manifest = resume_manifest(
+                    manifest_path=args.manifest,
+                    dataset_path=args.dataset,
+                    config_path=args.config,
+                    backend=BACKEND,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "run_id": manifest["run_id"],
+                            "compatible": True,
+                            "provider_calls_replayed": 0,
+                        }
+                    )
+                )
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return 0
 
     if args.command == "review":
         evaluation = json.loads(args.evaluation.read_text(encoding="utf-8"))
