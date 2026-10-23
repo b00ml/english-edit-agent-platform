@@ -1,4 +1,4 @@
-"""Run the frozen structured-output retry cases with a deterministic offline adapter."""
+"""Freeze, validate, or explicitly execute structured-output evaluation inputs."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from app.engine.evaluation_protocol import (  # noqa: E402
     resume_manifest,
     write_manifest,
 )
+from app.engine.real_evaluation import run_generation, verified_clients  # noqa: E402
 from app.engine.reference_review import (  # noqa: E402
     ReferenceAssessment,
     build_review_packets,
@@ -102,6 +103,7 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
                 trace_id=f"offline-eval:{case['case_id']}:{max_retry}:{feedback}",
                 response_adapter=adapter,
                 retry_feedback=feedback,
+                trace_sink=lambda **row: None,
             )
             success = True
             failure = None
@@ -248,9 +250,16 @@ def main() -> int:
     resume.add_argument("--manifest", type=Path, required=True)
     resume.add_argument("--dataset", type=Path, required=True)
     resume.add_argument("--config", type=Path, required=True)
+    execute = subparsers.add_parser(
+        "execute-generation",
+        help="Explicitly execute frozen generation; may incur provider charges",
+    )
+    execute.add_argument("--manifest", type=Path, required=True)
+    execute.add_argument("--dataset", type=Path, required=True)
+    execute.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
 
-    if args.command in {"freeze", "resume"}:
+    if args.command in {"freeze", "resume", "execute-generation"}:
         try:
             if args.command == "freeze":
                 manifest = freeze_protocol(
@@ -268,6 +277,14 @@ def main() -> int:
                     config_path=args.config,
                     backend=BACKEND,
                 )
+                if args.command == "execute-generation":
+                    from app.database import SessionLocal
+
+                    with SessionLocal() as session:
+                        clients = verified_clients(manifest, session)
+                    run_generation(args.manifest, manifest, client=clients["generation"])
+                    print(json.dumps(manifest["generation_accounting"]))
+                    return 0
                 print(
                     json.dumps(
                         {
@@ -368,7 +385,6 @@ def main() -> int:
         path.stem: yaml.safe_load(path.read_text(encoding="utf-8"))
         for path in sorted((BACKEND / "app" / "templates").glob("*.yaml"))
     }
-    structured_output.record_trace = lambda **kwargs: None
     arms = {
         "single_attempt": _run_arm(cases, templates, 1, False),
         "blind_retry": _run_arm(cases, templates, 3, False),
