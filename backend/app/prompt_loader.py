@@ -3,7 +3,36 @@
 # 生成时按题型加载对应 skill 规范注入 system prompt，作为「出题技能」约束。
 import json
 import os
-from typing import Any, Dict
+from contextvars import ContextVar
+from functools import wraps
+from typing import Any, Callable, Dict
+
+_FROZEN_ASSETS: ContextVar[dict[str, Any] | None] = ContextVar("frozen_assets", default=None)
+
+
+def frozen_skill(skill_id: str, *, fallback: bool = False) -> str | None:
+    """Resolve an evaluation skill from its snapshot; None means normal live execution."""
+    assets = _FROZEN_ASSETS.get()
+    if assets is None or "skills" not in assets:
+        return None
+    skills = assets["skills"]
+    key = f"skills/{skill_id}/SKILL.md"
+    return skills.get(key, skills.get("skills/generate_question/SKILL.md", "") if fallback else "")
+
+
+def with_frozen_assets(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Scope all generation/Judge/reference prompt reads to one immutable snapshot."""
+
+    @wraps(function)
+    def scoped(path: Any, manifest: dict[str, Any], **kwargs: Any) -> Any:
+        token = _FROZEN_ASSETS.set(manifest["frozen"])
+        try:
+            return function(path, manifest, **kwargs)
+        finally:
+            _FROZEN_ASSETS.reset(token)
+
+    return scoped
+
 
 # prompts 目录（backend/prompts）
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
@@ -13,6 +42,9 @@ def load_prompt(rel_path: str) -> str:
     """加载 prompts/ 下的 .st 文件内容，安全解析相对路径前缀。"""
     if rel_path.startswith("prompts/"):
         rel_path = rel_path[len("prompts/") :]
+    assets = _FROZEN_ASSETS.get()
+    if assets is not None and "prompts" in assets:
+        return str(assets["prompts"][rel_path])
     filepath = os.path.join(PROMPTS_DIR, rel_path)
     with open(filepath, "r", encoding="utf-8") as f:
         return f.read()
