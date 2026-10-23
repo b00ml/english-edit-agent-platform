@@ -1,4 +1,4 @@
-"""Whole, human-approved examples; isolated from RAG evidence and generation constraints."""
+"""Whole, reviewed examples; isolated from RAG evidence and generation constraints."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.engine.content_validation import inspect_content
+from app.engine.fewshot_evaluation import RUBRIC_DIMENSIONS
 from app.models import ContentItem, GenerationTask, QualityRecord, QuestionTemplate, SamplePool
 from app.rag.knowledge_points import normalized
 from app.versioning import hash_value
@@ -29,7 +30,7 @@ def select_fewshot(
         "selected": [],
         "skipped": {},
         "context": "",
-        "semantic_status": "human_reviewed_not_expert_gold",
+        "semantic_status": "no_examples_selected",
     }
     if not enabled:
         return report
@@ -63,16 +64,18 @@ def select_fewshot(
         reason = ""
         item = session.get(ContentItem, sample.item_id)
         task = session.get(GenerationTask, item.task_id) if item else None
-        reviewer = (
-            session.query(QualityRecord)
-            .filter(
-                QualityRecord.item_id == sample.item_id,
-                QualityRecord.source == "manual_review",
-                QualityRecord.tenant_id == params.get("tenant_id"),
+        reviewer = None
+        if sample.source != "model_review":
+            reviewer = (
+                session.query(QualityRecord)
+                .filter(
+                    QualityRecord.item_id == sample.item_id,
+                    QualityRecord.source == "manual_review",
+                    QualityRecord.tenant_id == params.get("tenant_id"),
+                )
+                .order_by(QualityRecord.created_at.desc(), QualityRecord.id.desc())
+                .first()
             )
-            .order_by(QualityRecord.created_at.desc(), QualityRecord.id.desc())
-            .first()
-        )
         if normalized(sample.knowledge_point or "") != normalized(kp):
             reason = "knowledge_point_mismatch"
         elif (
@@ -89,7 +92,9 @@ def select_fewshot(
             or task.template_id != template.type_id
         ):
             reason = "same_task_or_missing_source"
-        elif (
+        elif sample.source == "model_review" and not _model_review_is_eligible(sample, item):
+            reason = "model_review_not_approved"
+        elif sample.source != "model_review" and (
             reviewer is None
             or reviewer.score != 100
             or not reviewer.reviewer
@@ -125,8 +130,18 @@ def select_fewshot(
                         "sample_id": sample.id,
                         "item_id": item.id,
                         "payload_hash": digest,
-                        "review_record_id": reviewer.id,
-                        "reviewer": reviewer.reviewer,
+                        "review_record_id": reviewer.id if reviewer else None,
+                        "review_source": (
+                            "model_reference_review"
+                            if sample.source == "model_review"
+                            else "manual_review"
+                        ),
+                        "reviewer": reviewer.reviewer if reviewer else None,
+                        "reviewer_model": (
+                            (sample.meta or {}).get("review", {}).get("reviewer_model")
+                            if sample.source == "model_review"
+                            else None
+                        ),
                         "template_version": template.version,
                     }
                 )
@@ -138,4 +153,43 @@ def select_fewshot(
         json.dumps(entry, ensure_ascii=False, sort_keys=True) for entry in selected
     )
     report["chars"] = used
+    review_sources = {entry["review_source"] for entry in report["selected"]}
+    if not review_sources:
+        report["semantic_status"] = "no_examples_selected"
+    elif review_sources == {"model_reference_review"}:
+        report["semantic_status"] = "model_reviewed_not_human_attested"
+    elif "model_reference_review" in review_sources:
+        report["semantic_status"] = "mixed_model_and_human_review_not_human_only"
+    else:
+        report["semantic_status"] = "human_reviewed_not_expert_gold"
     return report
+
+
+def _model_review_is_eligible(sample: SamplePool, item: ContentItem | None) -> bool:
+    if item is None:
+        return False
+    meta = sample.meta or {}
+    review = meta.get("review") or {}
+    approval = meta.get("evaluation_approval") or {}
+    judgments = review.get("judgments") or {}
+    current_hash = hash_value(item.payload)
+    return bool(
+        review.get("source") == "model"
+        and review.get("status") == "passed"
+        and review.get("reviewer_model")
+        and review.get("rubric_version")
+        and set(judgments) == set(RUBRIC_DIMENSIONS)
+        and all(
+            isinstance(judgments.get(dimension), dict)
+            and judgments[dimension].get("verdict") == "pass"
+            and judgments[dimension].get("evidence")
+            for dimension in RUBRIC_DIMENSIONS
+        )
+        and review.get("payload_hash") == current_hash
+        and hash_value(sample.payload) == current_hash
+        and approval.get("approved") is True
+        and approval.get("reviewer")
+        and approval.get("reviewed_at")
+        and approval.get("report_hash")
+        and approval.get("payload_hash") == current_hash
+    )
