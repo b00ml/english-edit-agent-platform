@@ -286,6 +286,9 @@ def generate_structured(
     task_id: Optional[str] = None,
     template_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
+    *,
+    response_adapter: Any = None,
+    retry_feedback: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """根据模板生成符合 output_schema 的单条结构化内容。
 
@@ -302,9 +305,13 @@ def generate_structured(
 
     model_name = (model_profile.model_name if model_profile else None) or settings.LLM_MODEL_NAME
     client = (
-        client_for_profile(model_profile)
-        if getattr(model_profile, "provider_id", None)
-        else _get_openai_client()
+        None
+        if response_adapter is not None
+        else (
+            client_for_profile(model_profile)
+            if getattr(model_profile, "provider_id", None)
+            else _get_openai_client()
+        )
     )
 
     schema = template.output_schema
@@ -336,7 +343,10 @@ def generate_structured(
     for attempt in range(1, max_retry + 1):
         try:
             try:
-                text, latency_ms, usage = _call_openai_json(client, model_name, messages)
+                if response_adapter is None:
+                    text, latency_ms, usage = _call_openai_json(client, model_name, messages)
+                else:
+                    text, latency_ms, usage = response_adapter(messages, attempt)
             except OpenAIError as exc:
                 if trace_id:
                     record_trace(
@@ -460,7 +470,7 @@ def generate_structured(
             )
             if attempt >= max_retry:
                 break
-            if settings.STRUCTURED_RETRY_FEEDBACK:
+            if settings.STRUCTURED_RETRY_FEEDBACK if retry_feedback is None else retry_feedback:
                 if isinstance(
                     exc, (ValidationError, jsonschema.ValidationError, ContentValidationError)
                 ):
