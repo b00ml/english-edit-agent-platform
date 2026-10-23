@@ -1,5 +1,6 @@
 """The real-evaluation CLI freezes inputs and resumes durable local artifacts offline."""
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -11,7 +12,12 @@ import pytest
 import yaml
 
 from app.engine import quality
-from app.engine.evaluation_protocol import freeze_protocol, resume_manifest, write_manifest
+from app.engine.evaluation_protocol import (
+    freeze_protocol,
+    load_dataset,
+    resume_manifest,
+    write_manifest,
+)
 from app.engine.reference_review import build_review_packets
 from app.prompt_loader import build_user_prompt
 
@@ -126,7 +132,9 @@ def dataset_path(tmp_path: Path) -> Path:
                     "grade": 10,
                     "difficulty": "中",
                     "quantity": 1,
-                    "knowledge_point": f"test-only {name} {template} {index}",
+                    "knowledge_point": hashlib.sha256(
+                        f"{name}-{template}-{index}".encode()
+                    ).hexdigest(),
                     "constraints": "test-only teaching requirement",
                 }
                 if template == "cloze":
@@ -136,6 +144,10 @@ def dataset_path(tmp_path: Path) -> Path:
                 cases.append(
                     {
                         "case_id": f"{name}-{template}-{index}",
+                        "source_family": f"test-only-{name}-{template}-{index}",
+                        "teaching_goal": "test-only grammar target",
+                        "scope": "test-only grade-ten scope",
+                        "judgment_basis": "test-only rubric",
                         "template_id": template,
                         "params": params,
                     }
@@ -173,9 +185,23 @@ def runtime_config() -> dict:
             }
             for role in ("generation", "judge", "reference")
         },
-        "generation": {"temperature": 0.7, "timeout_seconds": 120},
+        "generation": {
+            "temperature": 0.7,
+            "timeout_seconds": 120,
+            "max_output_tokens": 2048,
+            "context_limit_tokens": 8192,
+        },
+        "reference": {
+            "temperature": 0.2,
+            "timeout_seconds": 90,
+            "max_output_tokens": 3072,
+            "context_limit_tokens": 16384,
+        },
         "judge": {
             "temperature": 0.3,
+            "timeout_seconds": 60,
+            "max_output_tokens": 1024,
+            "context_limit_tokens": 8192,
             "sample_rounds": 1,
             "max_attempts": 3,
             "calibration": {},
@@ -498,3 +524,125 @@ def test_teaching_context_reaches_generator_judge_and_blinded_reference(
     )
     assert packets[0]["generation_constraints"] == case["params"]
     assert "hidden-arm" not in json.dumps(packets)
+
+
+@pytest.mark.parametrize("role", ["generation", "judge", "reference"])
+@pytest.mark.parametrize(
+    "field", ["timeout_seconds", "max_output_tokens", "context_limit_tokens", "temperature"]
+)
+def test_freeze_requires_explicit_request_limits_for_every_role(
+    tmp_path: Path, runtime_config: dict[str, Any], dataset_path: Path, role: str, field: str
+) -> None:
+    runtime_config[role].pop(field, None)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(runtime_config), "utf-8")
+    with pytest.raises(ValueError, match=field):
+        freeze_protocol(
+            dataset_path=dataset_path,
+            config_path=config,
+            backend=BACKEND,
+            run_id="missing-request-limit",
+            seed=21,
+        )
+
+
+@pytest.mark.parametrize("field", ["source_family", "teaching_goal", "scope", "judgment_basis"])
+def test_dataset_requires_explicit_teaching_and_source_metadata(
+    dataset_path: Path, field: str
+) -> None:
+    dataset = json.loads(dataset_path.read_text("utf-8"))
+    dataset["sets"]["exploration"][0].pop(field, None)
+    dataset_path.write_text(json.dumps(dataset), "utf-8")
+    with pytest.raises(ValueError, match=field):
+        load_dataset(dataset_path, BACKEND)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["source", "source_unicode", "unicode", "edit", "long_edit", "id_only"]
+)
+def test_dataset_rejects_source_and_near_duplicate_leaks(dataset_path: Path, mutation: str) -> None:
+    dataset = json.loads(dataset_path.read_text("utf-8"))
+    original = dataset["sets"]["exploration"][0]
+    other = dataset["sets"]["confirmation"][0]
+    if mutation.startswith("source"):
+        family = original["source_family"]
+        other["source_family"] = (
+            "".join(chr(ord(char) + 0xFEE0) for char in family)
+            if mutation == "source_unicode"
+            else family
+        )
+        error = "source famil"
+    else:
+        if mutation == "long_edit":
+            original["params"]["knowledge_point"] = "test-only reading explanation " * 30
+        other["params"] = dict(original["params"])
+        point = original["params"]["knowledge_point"]
+        if mutation == "unicode":
+            other["params"]["knowledge_point"] = "".join(chr(ord(char) + 0xFEE0) for char in point)
+        elif mutation == "long_edit":
+            other["params"]["knowledge_point"] = "changed " + point[8:]
+        elif mutation == "edit":
+            other["params"]["knowledge_point"] = point[:-1] + "xyz"
+        error = "disjoint" if mutation == "id_only" else "near-duplicate"
+    dataset_path.write_text(json.dumps(dataset), "utf-8")
+    with pytest.raises(ValueError, match=error):
+        load_dataset(dataset_path, BACKEND)
+
+
+@pytest.mark.parametrize("role", ["generation", "judge", "reference"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_output_tokens", 0),
+        ("context_limit_tokens", 1),
+        ("timeout_seconds", 0),
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("max_output_tokens", 1.5),
+    ],
+)
+def test_freeze_rejects_invalid_or_incompatible_role_limits(
+    tmp_path: Path,
+    runtime_config: dict[str, Any],
+    dataset_path: Path,
+    role: str,
+    field: str,
+    value: float,
+) -> None:
+    runtime_config[role][field] = value
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(runtime_config), "utf-8")
+    with pytest.raises(ValueError, match=field):
+        freeze_protocol(
+            dataset_path=dataset_path,
+            config_path=config,
+            backend=BACKEND,
+            run_id="invalid-request-limit",
+            seed=21,
+        )
+
+
+@pytest.mark.parametrize("field", ["source_family", "teaching_goal", "scope", "judgment_basis"])
+def test_dataset_rejects_blank_case_metadata(dataset_path: Path, field: str) -> None:
+    dataset = json.loads(dataset_path.read_text("utf-8"))
+    dataset["sets"]["exploration"][0][field] = "  \t\n"
+    dataset_path.write_text(json.dumps(dataset), "utf-8")
+    with pytest.raises(ValueError, match=field):
+        load_dataset(dataset_path, BACKEND)
+
+
+@pytest.mark.parametrize("field", ["prompt_per_1k", "completion_per_1k"])
+def test_freeze_requires_explicit_price_or_unknown_value(
+    tmp_path: Path, runtime_config: dict[str, Any], dataset_path: Path, field: str
+) -> None:
+    runtime_config["prices"]["fixture-generation"].pop(field)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(runtime_config), "utf-8")
+    with pytest.raises(ValueError, match=field):
+        freeze_protocol(
+            dataset_path=dataset_path,
+            config_path=config,
+            backend=BACKEND,
+            run_id="missing-price",
+            seed=21,
+        )

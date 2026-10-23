@@ -12,6 +12,12 @@ from app.engine.real_reference import run_reference_review
 def manifest_fixture():
     manifest = local_manifest()
     config = manifest["frozen"]["config"]
+    config["reference"] = {
+        "temperature": 0.2,
+        "timeout_seconds": 90,
+        "max_output_tokens": 3072,
+        "context_limit_tokens": 16384,
+    }
     config["profiles"]["reference"] = {"model_name": "fixture-reference", "model_family": "ref"}
     config["prices"]["fixture-reference"] = config["prices"]["fixture-model"]
     manifest["protocol"]["reference_max_format_repairs"] = 2
@@ -82,8 +88,9 @@ def test_blind_fresh_phases_dedup_trace_and_independent_completion(tmp_path):
         tmp_path / "run.json", manifest, client=client, trace_sink=lambda **row: traces.append(row)
     )
     assert len(client.requests) == len(traces) == len(manifest["provider_calls"]) == 2
-    assert client.options == {"max_retries": 0, "timeout": 45}
-    assert all(request["temperature"] == 0.4 for request in client.requests)
+    assert client.options == {"max_retries": 0, "timeout": 90}
+    assert all(request["temperature"] == 0.2 for request in client.requests)
+    assert all(request["max_tokens"] == 3072 for request in client.requests)
     first, second = [request["messages"] for request in client.requests]
     assert [m["role"] for m in first] == ["system", "user"]
     assert [m["role"] for m in second] == ["system", "user"]
