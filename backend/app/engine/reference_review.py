@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.prompt_loader import load_prompt
+
 REFERENCE_RUBRIC_VERSION = "english-content-review-v1"
 
 
@@ -104,6 +106,7 @@ def review_packet_id(case_id: str, payload: dict[str, object]) -> str:
 def build_review_packets(arms: dict[str, dict[str, object]]) -> list[dict[str, object]]:
     """Return deduplicated content-only packets, with arm/config/Judge data withheld."""
     candidates: dict[str, dict[str, object]] = {}
+    instructions = load_prompt("reference-review-instructions.st")
     for arm in arms.values():
         outcomes = arm.get("outcomes", [])
         if not isinstance(outcomes, list):
@@ -123,14 +126,7 @@ def build_review_packets(arms: dict[str, dict[str, object]]) -> list[dict[str, o
             candidates[review_id] = {
                 "review_id": review_id,
                 "content": payload,
-                "instructions": (
-                    "First solve the question independently and record the answer with reasoning. "
-                    "Then assess answer correctness, explanation correctness, ambiguity, "
-                    "knowledge-point fit, and difficulty fit. For each dimension return "
-                    "pass/fail/unresolved with brief evidence. Derive overall pass only when "
-                    "all dimensions pass; use fail when any dimension fails, and unresolved "
-                    "when no dimension fails but evidence is insufficient."
-                ),
+                "instructions": instructions,
                 "rubric_version": REFERENCE_RUBRIC_VERSION,
             }
     return [candidates[key] for key in sorted(candidates)]

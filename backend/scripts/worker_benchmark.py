@@ -350,7 +350,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         record["sample"] = value
                     else:
                         record["sample"] = {"status": "failed"}
-                except Exception as exc:  # broker task failure remains in submitted denominator
+                except Exception as exc:  # noqa: BLE001 - retain broker failures in denominator
                     record["sample"] = {"status": "failed", "error": type(exc).__name__}
         if any(not record.get("sample") for record in records.values()):
             time.sleep(args.poll_seconds)

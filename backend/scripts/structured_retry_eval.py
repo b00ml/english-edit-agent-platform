@@ -100,7 +100,7 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
             )
             success = True
             failure = None
-        except Exception as exc:  # evaluation records a failed case rather than dropping it
+        except Exception as exc:  # noqa: BLE001 - retain failed cases in the report denominator
             success = False
             failure = type(exc).__name__
         case_latency = (time.perf_counter() - start) * 1000
