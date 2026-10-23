@@ -47,6 +47,29 @@ def review(count=1):
     }
 
 
+@pytest.mark.parametrize("failure", ["price", "physical_cap"])
+def test_local_reference_configuration_failure_keeps_no_phantom_source(tmp_path, failure):
+    manifest = manifest_fixture()
+    if failure == "price":
+        del manifest["frozen"]["config"]["prices"]["fixture-reference"]
+        error, message = KeyError, "fixture-reference"
+    else:
+        manifest["protocol"]["call_limits"]["reference_solve"]["physical"] = 0
+        error, message = ValueError, "physical call limit"
+    client = FakeClient([])
+    traces = []
+    path = tmp_path / "run.json"
+    with pytest.raises(error, match=message):
+        run_reference_review(
+            path, manifest, client=client, trace_sink=lambda **row: traces.append(row)
+        )
+    saved = json.loads(path.read_text("utf-8"))
+    assert client.requests == traces == saved["provider_calls"] == []
+    result = saved["reference_results"]["single_attempt"]
+    assert result["source_call_ids"] == []
+    assert result["state"] == "failed" and result["error_type"] == error.__name__
+
+
 def test_blind_fresh_phases_dedup_trace_and_independent_completion(tmp_path):
     manifest = manifest_fixture()
     manifest["judge_results"] = {

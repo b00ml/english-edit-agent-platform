@@ -283,12 +283,12 @@ def run_quality_check(
             latency_ms = 0.0
             once = None
             replayed = False
+            if response_adapter is not None:
+                response = response_adapter(messages, round_idx + 1, attempt)
+                text, latency_ms, usage = response.text, response.latency_ms, response.usage
+                replayed = response.replayed
             try:
-                if response_adapter is not None:
-                    response = response_adapter(messages, round_idx + 1, attempt)
-                    text, latency_ms, usage = response.text, response.latency_ms, response.usage
-                    replayed = response.replayed
-                else:
+                if response_adapter is None:
                     text, latency_ms, usage = _call_judge_once(
                         cast(OpenAI, client),
                         model_name,
@@ -297,7 +297,7 @@ def run_quality_check(
                         rule_ids,
                         **({"temperature": temperature} if temperature is not None else {}),
                     )
-                data = json.loads(text)
+                data = json.loads(cast(str, text))
                 once = _validate_dimension_scores(data.get("dimension_scores"), rule_ids)
             except (
                 ValidationError,

@@ -318,15 +318,12 @@ def generate_structured(
     max_retry = int(run_config.get("max_retry", 3))
 
     model_name = (model_profile.model_name if model_profile else None) or settings.LLM_MODEL_NAME
-    client = (
-        None
-        if response_adapter is not None
-        else (
+    if response_adapter is None:
+        client = (
             client_for_profile(model_profile)
             if getattr(model_profile, "provider_id", None)
             else _get_openai_client()
         )
-    )
 
     schema = template.output_schema
     output_model = _build_pydantic_from_schema(schema)
@@ -362,17 +359,16 @@ def generate_structured(
             if response is None or not response.replayed or trace_sink is not None:
                 recorder(**row)
 
-        try:
+        if response_adapter is not None:
+            adapted = response_adapter(messages, attempt)
+            if isinstance(adapted, StructuredResponse):
+                response = adapted
+                text, latency_ms, usage = response.text, response.latency_ms, response.usage
+            else:
+                text, latency_ms, usage = adapted
+        else:
             try:
-                if response_adapter is None:
-                    text, latency_ms, usage = _call_openai_json(client, model_name, messages)
-                else:
-                    adapted = response_adapter(messages, attempt)
-                    if isinstance(adapted, StructuredResponse):
-                        response = adapted
-                        text, latency_ms, usage = response.text, response.latency_ms, response.usage
-                    else:
-                        text, latency_ms, usage = adapted
+                text, latency_ms, usage = _call_openai_json(client, model_name, messages)
             except OpenAIError as exc:
                 if trace_id:
                     emit(
@@ -412,6 +408,7 @@ def generate_structured(
                         status_code=status_code, detail=f"Provider调用失败: {type(exc).__name__}"
                     ) from None
                 raise
+        try:
             raw = json.loads(text)
             # 兜底展平偶发嵌套包装后再做 Pydantic 二次校验
             normalized = _normalize_flat(schema, raw)
@@ -442,7 +439,6 @@ def generate_structured(
             ValidationError,
             jsonschema.ValidationError,
             json.JSONDecodeError,
-            KeyError,
             ContentValidationError,
         ) as exc:
             summary = _summarize_validation_error(exc)
