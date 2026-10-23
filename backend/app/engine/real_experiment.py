@@ -12,6 +12,7 @@ from app.engine.evaluation_protocol import canonical_hash, write_manifest
 from app.engine.real_evaluation import run_generation
 from app.engine.real_judge import run_judge
 from app.engine.real_reference import run_reference_review
+from app.engine.reference_review import model_agreement
 from app.engine.trace import record_trace
 
 
@@ -379,16 +380,7 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
                     "reference": reference,
                 }
             )
-    expected = None
-    if pairs:
-        judge_yes = sum(judge for judge, _ in pairs.values()) / len(pairs)
-        reference_yes = sum(reference for _, reference in pairs.values()) / len(pairs)
-        expected = judge_yes * reference_yes + (1 - judge_yes) * (1 - reference_yes)
-    agreement = (
-        sum(judge == reference for judge, reference in pairs.values()) / len(pairs)
-        if pairs
-        else None
-    )
+    agreement_metrics = model_agreement(list(pairs.values()), len(paths))
     return {
         "run_id": manifest["run_id"],
         "identities": manifest["identities"],
@@ -417,12 +409,9 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
             "paired": len(pairs),
             "paired_paths": paired_paths,
             "planned": len(paths),
-            "agreement": agreement,
-            "kappa": (
-                (agreement - expected) / (1 - expected)
-                if agreement is not None and expected is not None and expected != 1
-                else None
-            ),
+            "agreement": agreement_metrics["agreement"],
+            "kappa": agreement_metrics["kappa"],
+            "kappa_status": agreement_metrics["kappa_status"],
         },
         "provenance": manifest["frozen"]["dataset"].get("provenance", "unspecified"),
         "limitations": [

@@ -48,7 +48,7 @@ def freeze_confirmation(
         raise ValueError("Selection must originate from frozen exploration evidence")
     if not run_id.strip() or run_id == source["run_id"]:
         raise ValueError("Confirmation requires a new nonempty run identifier")
-    bundle = {
+    bundle: dict[str, Any] = {
         "version": "real-quality-confirmation-v1",
         "run_id": run_id,
         "seed": seed,
@@ -118,7 +118,8 @@ def _variant(source: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any
     evidence = {row["path"]["path_id"] for row in build_evidence_report(source)["bad_cases"]}
     if not selection["evidence_refs"] or not set(selection["evidence_refs"]) <= evidence:
         raise ValueError("The factor must cite existing exploration evidence")
-    frozen = copy.deepcopy(source["frozen"])
+    # Frozen assets retain template-specific JSON at the validated manifest boundary.
+    frozen: dict[str, Any] = copy.deepcopy(source["frozen"])
     factor, key, new = selection["factor"], selection["key"], selection["new"]
     if factor in {"generation_prompt", "feedback_prompt", "judge_prompt"}:
         generation = {
@@ -136,13 +137,13 @@ def _variant(source: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any
             raise ValueError("Unsupported prompt intervention")
         parent = frozen["prompts"]
     elif factor in {"generation_skill", "judge_skill"}:
-        permitted = (
+        permitted_skills = (
             {"skills/judge/SKILL.md"}
             if factor == "judge_skill"
             else {f"skills/{name}/SKILL.md" for name in (*frozen["templates"], "generate_question")}
         )
         if (
-            key not in permitted
+            key not in permitted_skills
             or key not in frozen["skills"]
             or not isinstance(new, str)
             or not new.strip()
@@ -299,7 +300,7 @@ def validate_confirmation(bundle: dict[str, Any]) -> None:
         "identity"
     ) != _identity(bundle):
         raise ValueError("Confirmation decision and execution plan are immutable; create a new run")
-    expected = {}
+    expected: dict[str, list[dict[str, Any]]] = {}
     for row in bundle["execution_plan"]:
         expected.setdefault(row["run_key"], []).append(row)
     main_keys = {key for key in bundle["runs"] if not key.startswith("content:")}

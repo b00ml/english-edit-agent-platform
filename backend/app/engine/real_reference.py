@@ -11,8 +11,8 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.engine.evaluation_protocol import canonical_hash
-from app.engine.real_evaluation import EvaluationLedger
-from app.engine.reference_review import ReferenceRubric
+from app.engine.real_evaluation import EvaluationLedger, frozen_teaching_context
+from app.engine.reference_review import ReferenceRubric, model_agreement
 from app.engine.trace import record_trace
 from app.errors import EvaluationTransportError, EvaluationUnresolvedError
 from app.prompt_loader import load_prompt, render, with_frozen_assets
@@ -53,7 +53,7 @@ class ContentReview(BaseModel):
 
 
 def _solve_packet(
-    template_id: str, payload: dict[str, Any], teaching_context: dict[str, Any] | None = None
+    template_id: str, payload: dict[str, Any], teaching_context: dict[str, Any]
 ) -> dict[str, Any]:
     """Structural allowlist: generated answers, explanations and arbitrary metadata cannot enter."""
     packet: dict[str, Any]
@@ -79,24 +79,7 @@ def _solve_packet(
         }
     else:
         raise ValueError("Reference review requires a supported frozen template")
-    if teaching_context:
-        packet["teaching_context"] = {
-            key: teaching_context[key]
-            for key in (
-                "teaching_goal",
-                "scope",
-                "judgment_basis",
-                "grade",
-                "difficulty",
-                "knowledge_point",
-                "topic",
-                "constraints",
-                "quantity",
-                "blank_count",
-                "question_count",
-            )
-            if key in teaching_context
-        }
+    packet["teaching_context"] = teaching_context
     return packet
 
 
@@ -200,7 +183,7 @@ def _phase(
                 ),
             },
         ]
-    result.update(state="failed", error=f"{phase} format repairs exhausted")
+    result.update(state="unresolved", error=f"{phase} format repairs exhausted")
     return None
 
 
@@ -221,11 +204,10 @@ def _account(manifest: dict[str, Any]) -> None:
             paired.append(row)
     n = len(paired)
     agreement = sum(r["reference_pass"] is r["judge_pass"] for r in paired)
-    expected = None
-    if n:
-        ref_yes = sum(r["reference_pass"] is True for r in paired) / n
-        judge_yes = sum(r["judge_pass"] is True for r in paired) / n
-        expected = ref_yes * judge_yes + (1 - ref_yes) * (1 - judge_yes)
+    agreement_metrics = model_agreement(
+        [(row["judge_pass"], row["reference_pass"]) for row in paired],
+        len(manifest["execution_plan"]),
+    )
     manifest["reference_accounting"] = {
         "state_counts": dict(Counter(row["state"] for row in results.values())),
         "full_plan_denominator": len(manifest["execution_plan"]),
@@ -245,11 +227,8 @@ def _account(manifest: dict[str, Any]) -> None:
             "denominator": n,
             "agreement_count": agreement,
             "agreement_rate": agreement / n if n else None,
-            "kappa": (
-                (agreement / n - expected) / (1 - expected)
-                if expected is not None and expected < 1
-                else None
-            ),
+            "kappa": agreement_metrics["kappa"],
+            "kappa_status": agreement_metrics["kappa_status"],
             "interpretation": "Model agreement only; not human accuracy",
         },
     }
@@ -321,7 +300,7 @@ def run_reference_review(
         }
         results[path_id] = result
         try:
-            teaching_context = manifest.get("reference_teaching_context")
+            teaching_context = frozen_teaching_context(case)
             packet = _solve_packet(case["template_id"], payload, teaching_context)
             count = {"single_choice": 1, "cloze": 5, "reading": 3}[case["template_id"]]
             solve = _phase(ledger, result, "solve", packet, count, config, transport, repairs)
@@ -336,23 +315,8 @@ def run_reference_review(
             review_packet = {
                 "content": payload,
                 "independent_solve": solve.model_dump(),
-                "constraints": {
-                    k: case["params"][k]
-                    for k in (
-                        "grade",
-                        "knowledge_point",
-                        "difficulty",
-                        "quantity",
-                        "constraints",
-                        "blank_count",
-                        "question_count",
-                        "topic",
-                    )
-                    if k in case["params"]
-                },
+                "teaching_context": teaching_context,
             }
-            if teaching_context:
-                review_packet["teaching_context"] = packet["teaching_context"]
             review = _phase(
                 ledger,
                 result,

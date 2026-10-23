@@ -10,7 +10,11 @@ from typing import Any, Callable
 
 from app.engine.evaluation_protocol import canonical_hash, judge_policies
 from app.engine.quality import run_quality_check
-from app.engine.real_evaluation import EvaluationLedger, evaluation_template
+from app.engine.real_evaluation import (
+    EvaluationLedger,
+    evaluation_template,
+    frozen_teaching_context,
+)
 from app.engine.structured_output import StructuredResponse
 from app.engine.trace import record_trace
 from app.errors import EvaluationTransportError, EvaluationUnresolvedError, QualityCheckError
@@ -159,7 +163,7 @@ def run_judge(
                     stage="qc",
                     model=model,
                     price=config["prices"][model],
-                    metadata={"judge": judge},
+                    metadata={"settings": judge, "model_profile": profile},
                     invoke=lambda: transport.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -192,7 +196,7 @@ def run_judge(
                 template_id=case["template_id"],
                 rounds=judge["sample_rounds"],
                 weights_override=weights,
-                generation_params=case["params"],
+                generation_params=frozen_teaching_context(case),
                 response_adapter=adapter,
                 trace_sink=recorder,
                 temperature=judge["temperature"],

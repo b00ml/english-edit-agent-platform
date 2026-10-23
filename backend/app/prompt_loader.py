@@ -10,6 +10,27 @@ from typing import Any, Callable, Dict
 _FROZEN_ASSETS: ContextVar[dict[str, Any] | None] = ContextVar("frozen_assets", default=None)
 
 
+def teaching_constraints(params: dict[str, Any]) -> dict[str, Any]:
+    """Allow only teaching requirements, never content answers or evaluation outcomes."""
+    return {
+        key: params[key]
+        for key in (
+            "grade",
+            "difficulty",
+            "knowledge_point",
+            "topic",
+            "constraints",
+            "quantity",
+            "blank_count",
+            "question_count",
+            "teaching_goal",
+            "scope",
+            "judgment_basis",
+        )
+        if key in params
+    }
+
+
 def frozen_skill(skill_id: str, *, fallback: bool = False) -> str | None:
     """Resolve an evaluation skill from its snapshot; None means normal live execution."""
     assets = _FROZEN_ASSETS.get()
@@ -17,7 +38,10 @@ def frozen_skill(skill_id: str, *, fallback: bool = False) -> str | None:
         return None
     skills = assets["skills"]
     key = f"skills/{skill_id}/SKILL.md"
-    return skills.get(key, skills.get("skills/generate_question/SKILL.md", "") if fallback else "")
+    value = skills.get(key, skills.get("skills/generate_question/SKILL.md", "") if fallback else "")
+    if not isinstance(value, str):
+        raise ValueError("Frozen skill must be text")
+    return value
 
 
 def with_frozen_assets(function: Callable[..., Any]) -> Callable[..., Any]:
@@ -71,11 +95,7 @@ def build_system_prompt(template: Any, params: Dict[str, Any], skill_md: str = "
 def build_user_prompt(template: Any, params: Dict[str, Any]) -> str:
     """构造 user prompt = user .st 渲染 + 可选 RAG 参考资料。"""
     user = render(load_prompt(template.gen_prompt["user"]), params)
-    teaching = {
-        key: params[key]
-        for key in ("grade", "constraints", "blank_count", "question_count")
-        if key in params
-    }
+    teaching = teaching_constraints(params)
     if teaching:
         user += "\n\n" + render(
             load_prompt("teaching-constraints.st"),

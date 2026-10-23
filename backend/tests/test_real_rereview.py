@@ -63,7 +63,7 @@ def test_selection_all_disagreements_random_six_context_dedup_and_immutable_no_c
     assert source == original
     assert bundle["original"]["selection"]["decision"] == "no_change"
     altered = copy.deepcopy(bundle)
-    altered["reviews"][selected[0]["content_id"]]["reference_teaching_context"][
+    altered["reviews"][selected[0]["content_id"]]["frozen"]["dataset"]["sets"]["exploration"][0][
         "judgment_basis"
     ] = "changed after freeze"
     with pytest.raises(ValueError, match="immutable"):
@@ -90,6 +90,11 @@ def test_fresh_two_phase_once_preserves_originals_and_unknown_after_cold_resume(
         trace_sink=lambda **row: traces.append(row),
     )
     assert len(client.requests) == 13
+    assert len({trace["trace_id"] for trace in traces}) == 13
+    for trace, request in zip(traces, client.requests):
+        assert trace["snapshot_data"]["messages"] == request["messages"]
+        assert trace["snapshot_data"]["max_tokens"] == request["max_tokens"]
+    assert traces[0]["snapshot_data"]["response_text"] is None
     assert source == original == bundle["original"]
     serialized = json.dumps(client.requests)
     for forbidden in (

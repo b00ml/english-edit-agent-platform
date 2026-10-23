@@ -22,10 +22,24 @@ from app.engine.structured_output import StructuredResponse, generate_structured
 from app.engine.trace import record_trace
 from app.errors import EvaluationTransportError, EvaluationUnresolvedError, StructuredOutputError
 from app.models import ModelProfile
-from app.prompt_loader import with_frozen_assets
+from app.prompt_loader import teaching_constraints, with_frozen_assets
 from app.versioning import hash_value, model_profile_hash
 
 EvaluationResponse = StructuredResponse
+
+
+def frozen_teaching_context(case: dict[str, Any]) -> dict[str, Any]:
+    """Derive every role's teaching requirements from the same frozen case."""
+    return teaching_constraints(
+        {
+            **case["params"],
+            **{
+                key: case[key]
+                for key in ("teaching_goal", "scope", "judgment_basis")
+                if key in case
+            },
+        }
+    )
 
 
 def verified_clients(manifest: dict[str, Any], session: Session) -> dict[str, OpenAI]:
@@ -301,6 +315,23 @@ class EvaluationLedger:
             completion_cost=row["completion_cost"],
         )
         trace.setdefault("input_data", {"messages": row["messages"]})
+        metadata = row["metadata"] or {}
+        settings = metadata.get("settings", {})
+        request_kwargs = {
+            "temperature": settings.get("temperature"),
+            "max_tokens": settings.get("max_output_tokens"),
+            "response_format": {"type": "json_object"},
+        }
+        trace["snapshot_data"] = {
+            **trace.get("snapshot_data", {}),
+            "messages": copy.deepcopy(row["messages"]),
+            "response_text": row["response_text"],
+            "model": row["model"],
+            **request_kwargs,
+            "request_kwargs": request_kwargs,
+            "model_profile": metadata.get("model_profile"),
+            "settings": settings,
+        }
         durable = self.trace_sink(**trace)
         row["trace_state"] = "failed" if durable is False else "completed"
         self.save()
@@ -392,7 +423,10 @@ def run_generation(
                     stage="generate",
                     model=model,
                     price=config["prices"][model],
-                    metadata={"generation": generation},
+                    metadata={
+                        "settings": generation,
+                        "model_profile": config["profiles"]["generation"],
+                    },
                     invoke=lambda: transport.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -419,7 +453,7 @@ def run_generation(
         try:
             result["payload"] = generate_structured(
                 template,
-                copy.deepcopy(case["params"]),
+                frozen_teaching_context(case),
                 SimpleNamespace(model_name=model),
                 trace_id=planned["path_id"],
                 template_id=case["template_id"],
