@@ -52,27 +52,52 @@ class ContentReview(BaseModel):
     questions: list[QuestionReview] = Field(min_length=1)
 
 
-def _solve_packet(template_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _solve_packet(
+    template_id: str, payload: dict[str, Any], teaching_context: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Structural allowlist: generated answers, explanations and arbitrary metadata cannot enter."""
+    packet: dict[str, Any]
     if template_id == "single_choice":
-        return {"questions": [{"index": 1, "stem": payload["stem"], "options": payload["options"]}]}
-    if template_id == "cloze":
-        return {
+        packet = {
+            "questions": [{"index": 1, "stem": payload["stem"], "options": payload["options"]}]
+        }
+    elif template_id == "cloze":
+        packet = {
             "passage": payload["passage"],
             "questions": [
                 {"index": i, "options": item["options"]}
                 for i, item in enumerate(payload["blanks"], 1)
             ],
         }
-    if template_id == "reading":
-        return {
+    elif template_id == "reading":
+        packet = {
             "passage": payload["passage"],
             "questions": [
                 {"index": i, "stem": item["stem"], "options": item["options"]}
                 for i, item in enumerate(payload["questions"], 1)
             ],
         }
-    raise ValueError("Reference review requires a supported frozen template")
+    else:
+        raise ValueError("Reference review requires a supported frozen template")
+    if teaching_context:
+        packet["teaching_context"] = {
+            key: teaching_context[key]
+            for key in (
+                "teaching_goal",
+                "scope",
+                "judgment_basis",
+                "grade",
+                "difficulty",
+                "knowledge_point",
+                "topic",
+                "constraints",
+                "quantity",
+                "blank_count",
+                "question_count",
+            )
+            if key in teaching_context
+        }
+    return packet
 
 
 def _verdict(rubric: dict[str, Any]) -> bool | None:
@@ -296,7 +321,8 @@ def run_reference_review(
         }
         results[path_id] = result
         try:
-            packet = _solve_packet(case["template_id"], payload)
+            teaching_context = manifest.get("reference_teaching_context")
+            packet = _solve_packet(case["template_id"], payload, teaching_context)
             count = {"single_choice": 1, "cloze": 5, "reading": 3}[case["template_id"]]
             solve = _phase(ledger, result, "solve", packet, count, config, transport, repairs)
             if not isinstance(solve, IndependentSolve):
@@ -325,6 +351,8 @@ def run_reference_review(
                     if k in case["params"]
                 },
             }
+            if teaching_context:
+                review_packet["teaching_context"] = packet["teaching_context"]
             review = _phase(
                 ledger,
                 result,
