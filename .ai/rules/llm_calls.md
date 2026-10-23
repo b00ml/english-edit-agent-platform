@@ -293,3 +293,9 @@ P1 补充：独立生成/Judge 调用缺少 trace_id 时自动创建 ID；DB 失
 - 三臂共用首稿，`StructuredResponse.source_call_id/replayed` 使每臂仍经真实确定性校验，但每个物理调用只写一次 Trace。Trace 写入中断可能已提交，不再写第二次，覆盖率必须显示未解决；已保存响应可只在本地重验。
 - manifest 保留实际 messages、原文、模型、延迟、usage/成本完整性与验证结果；缺 usage 或未核验价格保持 unknown。物理费用只计一次，各臂独立运行逻辑估计另列，不能混为供应商实付。
 - 评估入口仅传教学参数，固定完形 5 空/阅读 3 问，无 RAG/fewshot/fallback/Judge 改写；不放宽生产模板来源要求。官方数据集保持空骨架，未经授权不得收费试跑或把自动评估当人审标签。
+
+## 生产 Judge 独立评估（OPT-084 / #23）
+- `structured_retry_eval.py execute-judge` 先做与生成相同的冻结资产/实际绑定档案核验，再对最终 Schema 合法内容调用生产 `run_quality_check`；不走独立 reference 的五项全通过语义。
+- Judge 温度、采样轮数、格式重试次数、规则权重和阈值均取冻结配置。`judge.calibration[template_id]` 为已声明规则 ID 到权重的映射，保留键 `threshold` 覆盖阈值（0 有效）；未配置项取冻结模板。拒绝未知规则/题型、非有限值、负权重、权重总和为零及 0..100 外阈值。
+- `judge_results` 独立保存每条逻辑路径的维度分/加权分、`score >= threshold` 标签、校准/档案来源与物理调用 ID。相同输入和最终内容共用一次评分与 Trace；生成失败、取消、缺失及 Judge failed/unresolved 分开计数，不覆盖 reference。
+- `judge_accounting` 分别报告全部路径、Schema 合法路径和完成评分路径分母，以及物理调用/费用、各臂逻辑费用与 Trace 缺口。冻结响应中断可只做本地重验；未知受理不自动重发，Trace 中断不冒称完整。

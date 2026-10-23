@@ -23,6 +23,7 @@ from app.engine.evaluation_protocol import (  # noqa: E402
     write_manifest,
 )
 from app.engine.real_evaluation import run_generation, verified_clients  # noqa: E402
+from app.engine.real_judge import run_judge  # noqa: E402
 from app.engine.reference_review import (  # noqa: E402
     ReferenceAssessment,
     build_review_packets,
@@ -250,16 +251,16 @@ def main() -> int:
     resume.add_argument("--manifest", type=Path, required=True)
     resume.add_argument("--dataset", type=Path, required=True)
     resume.add_argument("--config", type=Path, required=True)
-    execute = subparsers.add_parser(
-        "execute-generation",
-        help="Explicitly execute frozen generation; may incur provider charges",
-    )
-    execute.add_argument("--manifest", type=Path, required=True)
-    execute.add_argument("--dataset", type=Path, required=True)
-    execute.add_argument("--config", type=Path, required=True)
+    for command in ("execute-generation", "execute-judge"):
+        execute = subparsers.add_parser(
+            command, help="Explicitly execute frozen evaluation; may incur provider charges"
+        )
+        execute.add_argument("--manifest", type=Path, required=True)
+        execute.add_argument("--dataset", type=Path, required=True)
+        execute.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
 
-    if args.command in {"freeze", "resume", "execute-generation"}:
+    if args.command in {"freeze", "resume", "execute-generation", "execute-judge"}:
         try:
             if args.command == "freeze":
                 manifest = freeze_protocol(
@@ -277,13 +278,15 @@ def main() -> int:
                     config_path=args.config,
                     backend=BACKEND,
                 )
-                if args.command == "execute-generation":
+                if args.command in {"execute-generation", "execute-judge"}:
                     from app.database import SessionLocal
 
                     with SessionLocal() as session:
                         clients = verified_clients(manifest, session)
-                    run_generation(args.manifest, manifest, client=clients["generation"])
-                    print(json.dumps(manifest["generation_accounting"]))
+                    role = "generation" if args.command == "execute-generation" else "judge"
+                    executor = run_generation if role == "generation" else run_judge
+                    executor(args.manifest, manifest, client=clients[role])
+                    print(json.dumps(manifest[f"{role}_accounting"]))
                     return 0
                 print(
                     json.dumps(

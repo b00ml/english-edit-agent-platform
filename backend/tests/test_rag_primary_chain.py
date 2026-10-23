@@ -170,7 +170,7 @@ def test_builtin_knowledge_templates_require_source_and_reference_review(name: s
     data = yaml.safe_load(
         (Path(__file__).parents[1] / "app/templates" / (name + ".yaml")).read_text(encoding="utf-8")
     )
-    assert data["version"] == 3
+    assert data["version"] == 4
     assert data["run_config"]["rag"] == {"mode": "required", "require_human_verification": True}
     assert "knowledge_point" in data["input_schema"]["required"]
 
