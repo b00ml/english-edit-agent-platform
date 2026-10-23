@@ -164,6 +164,63 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
     }
 
 
+def _interview_brief(evaluation: dict, summary: dict) -> str:
+    case_count = evaluation["case_count"]
+    distribution = ", ".join(
+        f"{count} {template}" for template, count in sorted(evaluation["cases_by_template"].items())
+    )
+    coverage = summary["assessment_coverage"]
+    reference_passes = summary["confirmed_reference_pass_rate"]
+    comparison = summary["model_judge_comparison"]
+    lines = [
+        "# Exploratory evaluation interview brief",
+        "",
+        f"Sample: {case_count} fixed inputs ({distribution}); exploratory sample only.",
+        "Method: paired single attempt, equal-budget blind and feedback retries on the same "
+        "inputs. A deterministic synthetic adapter scripts failures and recovery; reference "
+        "packets hide the arm and Judge result and deduplicate identical content per input.",
+        "",
+        "Observed harness results (scripted mechanics, not empirical model quality):",
+        "",
+    ]
+    for arm_name, arm in evaluation["arms"].items():
+        counts = arm["counts"]
+        lines.append(
+            f"- {arm_name}: schema-valid {counts['final_schema_success']}/"
+            f"{arm['denominators']['planned_cases']}; recovered {counts['recovered']}/"
+            f"{counts['recovery_denominator']} initial failures; "
+            f"failed {counts['failed']}, missing {counts['missing']}, "
+            f"cancelled {counts['cancelled']}, unresolved {counts['unresolved']}; "
+            f"adapter calls {arm['attempts']['adapter_calls']}."
+        )
+    lines.extend(
+        [
+            "",
+            f"Reference review: assessments {coverage['numerator']}/{coverage['denominator']}; "
+            f"pending {coverage['denominator'] - coverage['numerator']}/{coverage['denominator']}; "
+            f"unresolved {len(summary['unresolved_cases'])}/{coverage['numerator']} assessments; "
+            f"confirmed reference passes {reference_passes['numerator']}/"
+            f"{reference_passes['denominator']}; model/Judge agreement "
+            f"{comparison['agreement_count']}/{comparison['denominator']}. "
+            "Zero denominators mean unavailable. These are exploratory model-reference "
+            "comparisons, not human accuracy or proof of teaching correctness.",
+            "",
+            "Cost: unknown; no provider billing observed. Local adapter latency cannot establish "
+            "provider P95, throughput or MTTR. There is no measured production improvement "
+            "or quality gain in these synthetic results.",
+            "",
+            "Delivery boundary: this artifact demonstrates the evaluation harness, schema "
+            "recovery accounting and reference-review import. Owner-confirmed personal "
+            "contribution: pending. " + summary["contribution_boundary"],
+            "",
+            f"Evidence: code revision {evaluation['provenance']['code_revision']}; "
+            f"dataset hash {evaluation['provenance']['dataset_hash']}.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -248,11 +305,13 @@ def main() -> int:
             "This evaluation records system behavior only; it does not establish individual "
             "contribution. Add owner-confirmed contribution facts before interview use."
         )
-        result = {**evaluation, "reference_review": summary}
+        brief = _interview_brief(evaluation, summary)
+        result = {**evaluation, "reference_review": summary, "interview_brief": brief}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        args.output.with_suffix(".md").write_text(brief, encoding="utf-8")
         return 0
 
     frozen = json.loads(args.cases.read_text(encoding="utf-8"))
@@ -301,9 +360,12 @@ def main() -> int:
             "prompt_config_hashes": prompt_hashes,
         },
         "limitations": [
-            "Synthetic adapter tests retry and schema-validation mechanics only; it is not a model quality benchmark.",
-            "The adapter scripts 15 first-attempt failures; blind retries repeat them, while feedback retries recover them. These rates are scripted, not empirical.",
-            "Latency is local validation/adapter wall time and cannot be compared with provider end-to-end latency.",
+            "Synthetic adapter tests retry and schema-validation mechanics only; "
+            "it is not a model quality benchmark.",
+            "The adapter scripts 15 first-attempt failures; blind retries repeat them, "
+            "while feedback retries recover them. These rates are scripted, not empirical.",
+            "Latency is local validation/adapter wall time and cannot be compared "
+            "with provider end-to-end latency.",
             "Cost is unknown and excluded; unknown cost is never treated as zero.",
         ],
     }
