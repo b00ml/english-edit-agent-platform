@@ -18,12 +18,14 @@ from app.prompt_loader import build_user_prompt
 BACKEND = Path(__file__).parents[1]
 
 
-def test_execute_judge_cli_runs_verified_frozen_service(
+@pytest.mark.parametrize("role", ["judge", "reference"])
+def test_execute_review_cli_runs_verified_frozen_service(
     tmp_path: Path,
     runtime_config: dict[str, Any],
     dataset_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    role: str,
 ) -> None:
     from contextlib import nullcontext
 
@@ -42,44 +44,50 @@ def test_execute_judge_cli_runs_verified_frozen_service(
     manifest["generation_results"] = {first["path_id"]: {"payload": VALID}}
     output = tmp_path / "run.json"
     write_manifest(output, manifest)
-    client = FakeClient(
-        [
-            {
-                "dimension_scores": {
-                    rule["id"]: 90
-                    for rule in manifest["frozen"]["templates"][
-                        next(
-                            case["template_id"]
-                            for case in manifest["frozen"]["dataset"]["sets"]["exploration"]
-                            if case["case_id"] == first["case_id"]
-                        )
-                    ]["quality_rules"]
-                }
+    responses = [
+        {
+            "dimension_scores": {
+                rule["id"]: 90
+                for rule in manifest["frozen"]["templates"][
+                    next(
+                        case["template_id"]
+                        for case in manifest["frozen"]["dataset"]["sets"]["exploration"]
+                        if case["case_id"] == first["case_id"]
+                    )
+                ]["quality_rules"]
             }
-        ]
-    )
+        }
+    ]
+    if role == "reference":
+        from test_real_reference import review, solve
+
+        responses = [solve(), review()]
+    client = FakeClient(responses)
     monkeypatch.setattr(database, "SessionLocal", lambda: nullcontext("fixture-session"))
     verified = []
 
     def clients(frozen: dict[str, Any], session: object) -> dict[str, FakeClient]:
-        verified.append((frozen["frozen"]["config"]["profiles"]["judge"], session))
-        return {"judge": client}
+        verified.append((frozen["frozen"]["config"]["profiles"][role], session))
+        return {role: client}
 
     monkeypatch.setattr(cli, "verified_clients", clients)
-    # Trace persistence is the external storage boundary; execute the real Judge service.
+    # Trace persistence is the external storage boundary; execute the real review service.
     from app.engine.real_judge import run_judge
+    from app.engine.real_reference import run_reference_review
 
     monkeypatch.setattr(
         cli,
-        "run_judge",
-        lambda path, data, **kwargs: run_judge(path, data, trace_sink=lambda **row: None, **kwargs),
+        "run_judge" if role == "judge" else "run_reference_review",
+        lambda path, data, **kwargs: (run_judge if role == "judge" else run_reference_review)(
+            path, data, trace_sink=lambda **row: None, **kwargs
+        ),
     )
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "eval",
-            "execute-judge",
+            f"execute-{role}",
             "--manifest",
             str(output),
             "--dataset",
@@ -90,9 +98,16 @@ def test_execute_judge_cli_runs_verified_frozen_service(
     )
     assert cli.main() == 0
     saved = json.loads(output.read_text("utf-8"))
-    assert len(verified) == len(client.requests) == 1
-    assert saved["judge_results"][first["path_id"]]["state"] == "completed"
-    assert json.loads(capsys.readouterr().out)["pass_rate_all_paths"]["denominator"] == 90
+    assert len(verified) == 1
+    assert len(client.requests) == (1 if role == "judge" else 2)
+    assert saved[f"{role}_results"][first["path_id"]]["state"] == "completed"
+    accounting = json.loads(capsys.readouterr().out)
+    denominator = (
+        accounting["pass_rate_all_paths"]["denominator"]
+        if role == "judge"
+        else accounting["full_plan_denominator"]
+    )
+    assert denominator == 90
 
 
 @pytest.fixture

@@ -184,6 +184,7 @@ categories:
 | 2 | `quality.py` LLM-as-judge 质检 | `judge-system.st` + `judge-user.st`，独立注入本次生成约束 | `judge`（通用质检评分 Skill） | 成功/失败尝试均记录 token/成本 | 动态 Pydantic：维度齐全、0–100 有限数 | 有限重试、耗尽失败关闭（OPT-039/040） |
 | 3 | `rag/embedding.py` 向量化 | 非对话模型，N/A | N/A | 成功/失败、tenant/task/trace、usage/成本均记录，支持补偿 | 索引数量/维度/有限数校验 | P1 已实现，真实服务未验 |
 | 4 | 改版 revise（graph.py 节点里调用 generate_structured） | 复用 `revise-system/user.st`（题型专属，经 `build_user_prompt` 注入 revise_flag） | 复用题型 skill + 改版规则来自 quality_record | ✅ | ✅ | ✅ 合规（复用生成链路） |
+| 5 | `real_reference.py` 两阶段盲态模型参考评审 | `reference-solve/review-system/user.st` + `reference-format-repair-user.st`，独立解题后新会话复核 | `reference_review` | 物理请求复用评测账本，每次成功/格式失败均保留 usage/成本/Trace | 严格索引/题数、五维证据；整篇结论由代码归并 | 独立模型来源；不写人工标注；未知请求不重发；格式修复每阶段最多 2 次 |
 
 ---
 

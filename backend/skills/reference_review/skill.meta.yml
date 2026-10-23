@@ -1,0 +1,7 @@
+displayName: 独立参考评审
+display:
+  icon: review
+categories:
+  - key: QUALITY
+    label: 质量评估
+    priority: CORE

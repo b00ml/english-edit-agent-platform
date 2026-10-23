@@ -24,6 +24,7 @@ from app.engine.evaluation_protocol import (  # noqa: E402
 )
 from app.engine.real_evaluation import run_generation, verified_clients  # noqa: E402
 from app.engine.real_judge import run_judge  # noqa: E402
+from app.engine.real_reference import run_reference_review  # noqa: E402
 from app.engine.reference_review import (  # noqa: E402
     ReferenceAssessment,
     build_review_packets,
@@ -251,7 +252,12 @@ def main() -> int:
     resume.add_argument("--manifest", type=Path, required=True)
     resume.add_argument("--dataset", type=Path, required=True)
     resume.add_argument("--config", type=Path, required=True)
-    for command in ("execute-generation", "execute-judge"):
+    executors = {
+        "execute-generation": ("generation", run_generation),
+        "execute-judge": ("judge", run_judge),
+        "execute-reference": ("reference", run_reference_review),
+    }
+    for command in executors:
         execute = subparsers.add_parser(
             command, help="Explicitly execute frozen evaluation; may incur provider charges"
         )
@@ -260,7 +266,7 @@ def main() -> int:
         execute.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
 
-    if args.command in {"freeze", "resume", "execute-generation", "execute-judge"}:
+    if args.command in {"freeze", "resume", *executors}:
         try:
             if args.command == "freeze":
                 manifest = freeze_protocol(
@@ -278,13 +284,12 @@ def main() -> int:
                     config_path=args.config,
                     backend=BACKEND,
                 )
-                if args.command in {"execute-generation", "execute-judge"}:
+                if args.command in executors:
                     from app.database import SessionLocal
 
                     with SessionLocal() as session:
                         clients = verified_clients(manifest, session)
-                    role = "generation" if args.command == "execute-generation" else "judge"
-                    executor = run_generation if role == "generation" else run_judge
+                    role, executor = executors[args.command]
                     executor(args.manifest, manifest, client=clients[role])
                     print(json.dumps(manifest[f"{role}_accounting"]))
                     return 0
