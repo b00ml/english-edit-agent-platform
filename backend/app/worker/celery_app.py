@@ -1,5 +1,6 @@
 # app/worker/celery_app.py —— Celery 应用实例
 import logging
+from typing import Any
 
 from celery import Celery
 from celery.signals import worker_ready
@@ -13,7 +14,7 @@ celery_app = Celery(
     "english_edit",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=["app.worker.tasks", "app.worker.ocr_tasks"],
+    include=["app.worker.tasks", "app.worker.ocr_tasks", "app.worker.benchmark_task"],
 )
 
 # 任务模块自动发现
@@ -57,7 +58,7 @@ celery_app.conf.update(
 
 
 @worker_ready.connect
-def _recover_stale_tasks_on_startup(**_kwargs):
+def _recover_stale_tasks_on_startup(**_kwargs: Any) -> None:
     """启动时触发有界SQL对账与Outbox投递，与周期maintenance共用路径。
 
     恢复失败仅告警，不阻断 worker 启动。
