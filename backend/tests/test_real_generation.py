@@ -104,19 +104,25 @@ def local_manifest():
     }
 
 
-def test_local_configuration_failure_is_not_a_physical_generation_attempt(tmp_path):
+@pytest.mark.parametrize("failure", ["price", "physical_cap"])
+def test_local_configuration_failure_is_not_a_physical_generation_attempt(tmp_path, failure):
     manifest = local_manifest()
-    del manifest["frozen"]["config"]["prices"]["fixture-model"]
+    if failure == "price":
+        del manifest["frozen"]["config"]["prices"]["fixture-model"]
+        error, message = KeyError, "fixture-model"
+    else:
+        manifest["protocol"]["call_limits"]["generate"]["physical"] = 0
+        error, message = ValueError, "physical call limit"
     client = FakeClient([])
     traces = []
     path = tmp_path / "run.json"
-    with pytest.raises(KeyError, match="fixture-model"):
+    with pytest.raises(error, match=message):
         run_generation(path, manifest, client=client, trace_sink=lambda **row: traces.append(row))
     saved = json.loads(path.read_text("utf-8"))
     assert client.requests == traces == saved["provider_calls"] == []
     assert saved["generation_results"]["single_attempt"]["attempts"] == []
     assert saved["execution_plan"][0]["state"] == "failed"
-    assert saved["generation_results"]["single_attempt"]["error_type"] == "KeyError"
+    assert saved["generation_results"]["single_attempt"]["error_type"] == error.__name__
 
 
 def test_local_failure_after_invalid_response_keeps_only_real_attempts(tmp_path):

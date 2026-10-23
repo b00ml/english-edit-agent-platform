@@ -61,19 +61,25 @@ def test_judge_adapter_failure_does_not_become_output_validation_or_retry(error)
     assert traces == []
 
 
-def test_local_judge_configuration_failure_keeps_no_phantom_source(tmp_path):
+@pytest.mark.parametrize("failure", ["price", "physical_cap"])
+def test_local_judge_configuration_failure_keeps_no_phantom_source(tmp_path, failure):
     manifest = judge_manifest()
-    del manifest["frozen"]["config"]["prices"]["fixture-judge"]
+    if failure == "price":
+        del manifest["frozen"]["config"]["prices"]["fixture-judge"]
+        error, message = KeyError, "fixture-judge"
+    else:
+        manifest["protocol"]["call_limits"]["qc"]["physical"] = 0
+        error, message = ValueError, "physical call limit"
     client = FakeClient([])
     traces = []
     path = tmp_path / "run.json"
-    with pytest.raises(KeyError, match="fixture-judge"):
+    with pytest.raises(error, match=message):
         run_judge(path, manifest, client=client, trace_sink=lambda **row: traces.append(row))
     saved = json.loads(path.read_text("utf-8"))
     assert client.requests == traces == saved["provider_calls"] == []
     result = saved["judge_results"]["single_attempt"]
     assert result["source_call_ids"] == []
-    assert result["state"] == "failed" and result["error_type"] == "KeyError"
+    assert result["state"] == "failed" and result["error_type"] == error.__name__
 
 
 def test_shared_content_uses_production_weighted_judge_and_one_physical_trace(
