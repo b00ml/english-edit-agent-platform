@@ -165,3 +165,34 @@ Judge Prompt、Skill 或模型改动复用已有内容，缺失内容按输入�
 仍显示缺失，不把一次原始分数扩成三次独立观测。Judge 策略变化只说明放行行为变化。
 物理账本只累计本次实际发送，逻辑路径可以引用同一响应；未知费用继续保持未知。
 零变化、退化和 `no_change` 均为合法结果，程序不会自动选择或采用“最优”方案。
+
+## 分歧复核与证据包
+
+```powershell
+python scripts/structured_retry_eval.py freeze-rereview --source <exploration-or-confirmation.json> --run-id <fresh-run-id> --seed 42 --output <rereview.json>
+python scripts/structured_retry_eval.py execute-rereview --manifest <rereview.json> --reviewed-smoke <smoke.json>
+python scripts/structured_retry_eval.py evidence-package --manifest <rereview.json> --output <evidence.json>
+```
+
+冻结阶段接受探索清单或确认包（包括合法 `no_change`），不构造模型客户端。选择池按
+终稿与教学上下文共同去重，保留源路径、集合、轮次和版本成员关系；同文不同教学目标
+不会合并。纳入全部已确定的 Judge/参考模型分歧，再按种子从全部候选随机选最多六份，
+取并集只复核一次；重叠内容保留两个选择理由。保存池哈希与种子。没有可用内容时仍可
+导出空证据，不能据此称已完成复核。
+
+显式执行命令可能产生费用，先核对已人工检查的 smoke，再验证冻结模型档案。
+每份选中内容使用新持久调用命名空间，独立解题后进行一次盲态五维复评；两个阶段均
+复用既有参考执行器及最多两次格式修复。请求不携带旧判断、实验臂、选择理由或假设。
+独立解题只接收答案/解析已剥离的内容，加上冻结的教学目标、范围、判断依据及年级、
+难度、知识点、题量和约束等 allowlist 参数。
+原始评审与新复评分别保存，未知接收/计费继续未决，续跑不会自动再发一次。
+
+证据命令不连接数据库或供应商，在本地输出完整 JSON、同名中文 Markdown，以及
+`*.public-candidate.json`。本地包保留原始冻结材料、全部阶段状态、样本/成员分母、
+首评/复评记录、未知费用、Token/Trace 覆盖、模型一致率及贡献责任边界。
+比较以保留的原始路径成员为口径，不能当作独立内容样本；任一标签边际退化时 Kappa
+标为 unavailable。分歧富集复评不能外推总体质量，模型一致率不能表述为人工准确率。
+
+公开候选通过固定白名单构造，仅含固定方法说明、配置与资产哈希、聚合计数和账目；
+不通过删字段或替换文本处理完整私有报告。候选不含题目、Prompt、来源、路径或档案
+名称，状态为 `requires_separate_approval`。这些命令只生成本地文件，不发布或上传。

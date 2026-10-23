@@ -265,6 +265,18 @@ def main() -> int:
     confirmation_freeze.add_argument("--run-id", required=True)
     confirmation_freeze.add_argument("--seed", type=int, required=True)
     confirmation_freeze.add_argument("--output", type=Path, required=True)
+    rereview_freeze = subparsers.add_parser("freeze-rereview")
+    rereview_freeze.add_argument("--source", type=Path, required=True)
+    rereview_freeze.add_argument("--run-id", required=True)
+    rereview_freeze.add_argument("--seed", type=int, required=True)
+    rereview_freeze.add_argument("--output", type=Path, required=True)
+    for name in ("execute-rereview", "evidence-package"):
+        rereview = subparsers.add_parser(name)
+        rereview.add_argument("--manifest", type=Path, required=True)
+        if name == "execute-rereview":
+            rereview.add_argument("--reviewed-smoke", type=Path, required=True)
+        else:
+            rereview.add_argument("--output", type=Path, required=True)
     for name in ("execute-confirmation", "confirmation-evidence"):
         confirmation = subparsers.add_parser(name)
         confirmation.add_argument("--manifest", type=Path, required=True)
@@ -306,6 +318,66 @@ def main() -> int:
         elif command == "evidence":
             execute.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.command in {"freeze-rereview", "execute-rereview", "evidence-package"}:
+        from app.engine.real_rereview import (
+            build_evidence_package,
+            freeze_rereview,
+            run_rereview,
+            validate_rereview,
+        )
+
+        try:
+            if args.command == "freeze-rereview":
+                bundle = freeze_rereview(
+                    json.loads(args.source.read_text("utf-8")),
+                    run_id=args.run_id,
+                    seed=args.seed,
+                )
+                write_manifest(args.output, bundle)
+            else:
+                bundle = json.loads(args.manifest.read_text("utf-8"))
+                validate_rereview(bundle)
+                if args.command == "execute-rereview":
+                    original = bundle["original"]
+                    source = original.get("source", original)
+                    smoke = json.loads(args.reviewed_smoke.read_text("utf-8"))
+                    require_reviewed_smoke(source, smoke)
+                    client_cache: dict[str, Any] = {}
+
+                    def rereview_clients(run: dict[str, Any]) -> dict[str, Any]:
+                        from app.database import SessionLocal
+
+                        identity = canonical_hash(run["frozen"]["config"])
+                        if identity not in client_cache:
+                            with SessionLocal() as session:
+                                client_cache[identity] = verified_clients(run, session)
+                        return client_cache[identity]
+
+                    run_rereview(args.manifest, bundle, clients=rereview_clients)
+                else:
+                    package = build_evidence_package(bundle)
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(package["local"], ensure_ascii=False, indent=2), "utf-8"
+                    )
+                    args.output.with_suffix(".md").write_text(package["summary_zh"], "utf-8")
+                    args.output.with_name(args.output.stem + ".public-candidate.json").write_text(
+                        json.dumps(package["public_candidate"], ensure_ascii=False, indent=2),
+                        "utf-8",
+                    )
+            print(
+                json.dumps(
+                    {
+                        "identity": bundle["identity"],
+                        "selected": len(bundle["selection"]),
+                        "published": False,
+                    }
+                )
+            )
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return 0
 
     if args.command in {"freeze-confirmation", "execute-confirmation", "confirmation-evidence"}:
         from app.engine.real_confirmation import (
