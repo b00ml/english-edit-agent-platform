@@ -7,13 +7,15 @@ import hashlib
 import json
 import math
 import random
+import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from jsonschema import validate
 from jsonschema.exceptions import ValidationError as SchemaValidationError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 TEMPLATES = ("single_choice", "cloze", "reading")
 ARMS = ("single_attempt", "blind_retry", "feedback_retry")
@@ -34,23 +36,29 @@ class ProfileSnapshot(BaseModel):
 class PriceSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    prompt_per_1k: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    completion_per_1k: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    prompt_per_1k: float | None = Field(ge=0, allow_inf_nan=False)
+    completion_per_1k: float | None = Field(ge=0, allow_inf_nan=False)
     currency: str = Field(min_length=1)
     verified: bool
 
 
-class GenerationSnapshot(BaseModel):
+class RequestSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    temperature: float = Field(ge=0, le=2)
+    temperature: float = Field(ge=0, le=2, allow_inf_nan=False)
     timeout_seconds: int = Field(gt=0)
+    max_output_tokens: int = Field(gt=0)
+    # Frozen provider constraint; this is not an estimate of rendered input tokens.
+    context_limit_tokens: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def compatible_limits(self) -> RequestSnapshot:
+        if self.max_output_tokens >= self.context_limit_tokens:
+            raise ValueError("max_output_tokens must leave input room within context_limit_tokens")
+        return self
 
 
-class JudgeSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    temperature: float = Field(ge=0, le=2)
+class JudgeSnapshot(RequestSnapshot):
     sample_rounds: int = Field(ge=1)
     max_attempts: int = Field(ge=1)
     calibration: dict[str, dict[str, float]]
@@ -61,8 +69,9 @@ class RuntimeSnapshot(BaseModel):
 
     profiles: dict[Literal["generation", "judge", "reference"], ProfileSnapshot]
     prices: dict[str, PriceSnapshot]
-    generation: GenerationSnapshot
+    generation: RequestSnapshot
     judge: JudgeSnapshot
+    reference: RequestSnapshot
 
 
 def canonical_hash(value: object) -> str:
@@ -101,6 +110,12 @@ def judge_policies(
     return policies
 
 
+def _normalized_text(text: str) -> str:
+    return "".join(
+        char for char in unicodedata.normalize("NFKC", text).casefold() if char.isalnum()
+    )
+
+
 def load_dataset(path: Path, backend: Path) -> dict[str, Any]:
     """Validate populated, non-overlapping sets against the frozen protocol geometry."""
     dataset: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
@@ -115,6 +130,8 @@ def load_dataset(path: Path, backend: Path) -> dict[str, Any]:
         ) from exc
     identities: set[str] = set()
     inputs: set[str] = set()
+    sources: dict[str, str] = {}
+    normalized_inputs: list[tuple[str, str]] = []
     for set_name, size in (("exploration", 30), ("confirmation", 30), ("smoke", 3)):
         cases = dataset["sets"][set_name]
         if len(cases) != size:
@@ -130,7 +147,21 @@ def load_dataset(path: Path, backend: Path) -> dict[str, Any]:
                 raise ValueError("All case identifiers and inputs must be disjoint across sets")
             identities.add(case["case_id"])
             inputs.add(input_id)
+            source = _normalized_text(case["source_family"])
+            if not source or sources.get(source, set_name) != set_name:
+                raise ValueError(
+                    "Evaluation source families must be nonempty and disjoint across sets"
+                )
+            sources[source] = set_name
             params = case["params"]
+            text = _normalized_text(" ".join(str(params[key]) for key in sorted(params)))
+            if any(
+                prior_set != set_name
+                and SequenceMatcher(None, text, prior, autojunk=False).ratio() >= 0.85
+                for prior_set, prior in normalized_inputs
+            ):
+                raise ValueError("Evaluation near-duplicate inputs must be disjoint across sets")
+            normalized_inputs.append((set_name, text))
             if case["template_id"] == "cloze" and params.get("blank_count") != 5:
                 raise ValueError("Cloze cases require exactly five blanks")
             if case["template_id"] == "reading" and params.get("question_count") != 3:
@@ -205,7 +236,7 @@ def freeze_protocol(
                     "state": "planned",
                 }
             )
-    protocol = {
+    protocol: dict[str, Any] = {
         "set_name": set_name,
         "seed": seed,
         "dataset_schema_hash": canonical_hash(

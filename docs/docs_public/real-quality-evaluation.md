@@ -13,7 +13,13 @@
 - 探索集 30 条、确认集 30 条：每集单选、完形、阅读各 10 条。
 - 独立冒烟集 3 条：每种题型各 1 条，不与两集共享输入或标识。
 - 高一、难度中、每次生成 1 份；完形 5 空，阅读 3 问。
-- 每条保留 `knowledge_point`、`constraints`，通过模板声明、生成提示词和参考评审上下文传递。
+- 每条用例必须显式填写非空白的 `source_family`（来源族）、`teaching_goal`（教学目标）、
+  `scope`（适用范围）、`judgment_basis`（判断依据），与 `case_id/template_id/params` 一起冻结。
+- 教学请求放在 `params`：保留 `knowledge_point`、`constraints`；阅读可填写 `topic`。
+  这些参数进入生成提示词、Judge 与参考评审上下文。
+- 三个集合的来源族必须互斥。来源族与输入文本经 Unicode NFKC、casefold 和字母数字归一化；
+  不同集合的全部参数文本经确定性序列匹配，相似度达到 0.85 即拒绝，改标识或轻微改写不能绕过。
+  这是一项本地文本隔离检查，不证明语义上完全独立，来源和教学范围仍须人工确认。
 
 ## 冻结与续跑检查
 
@@ -27,8 +33,12 @@ python scripts/structured_retry_eval.py resume --dataset <local-cases.json> --co
 配置须显式提供 `profiles.generation/judge/reference`，每个档案含
 `name/provider_id/provider_config_hash/model_name/model_family/profile_hash`；凭据和端点原文不进入清单。
 `prices` 以模型名索引，记录 `prompt_per_1k/completion_per_1k/currency/verified`，未知价格用 `null`。
-`generation` 含 `temperature/timeout_seconds`；`judge` 含
-`temperature/sample_rounds/max_attempts/calibration`（按题型的维度权重覆盖）。
+`generation`、`judge`、`reference` 分别显式提供 `temperature/timeout_seconds/max_output_tokens/context_limit_tokens`。
+温度须为有限的 0..2 数值；超时、输出和上下文上限须为正整数，且输出上限严格小于上下文上限。
+每个角色使用自己的温度、超时及输出上限（发送为 `max_tokens`），不从生成角色借用设置。
+上下文上限是冻结的供应商约束，当前不对渲染输入执行精确 token 计数；操作者须按实际模型核对。
+`judge` 另含 `sample_rounds/max_attempts/calibration`（按题型的维度权重覆盖）。
+以上字段缺失即停止冻结；价格两项也须明确填写数值或 `null`，不可省略。
 参考模型家族须同时区别于生成模型和 Judge 模型家族。
 
 清单冻结完整数据、模板、提示词、技能、档案、价格、参数、Judge 权重和模板阈值。
@@ -69,7 +79,7 @@ python scripts/structured_retry_eval.py execute-experiment --dataset <local-case
 携带 `--reviewed-smoke`。Judge 失败保留结果，独立参考评审继续执行。
 
 入口先执行相同的冻结一致性检查，再从数据库读取绑定档案，重新计算实际
-Provider 配置与模型档案身份；任何漂移或缺失均拒绝发送。执行使用冻结温度和超时，
+Provider 配置与模型档案身份；任何漂移或缺失均拒绝发送。执行使用各角色冻结的温度、超时和输出上限，
 SDK 重试固定为 0，教学参数进入生产生成器和校验器；不会填入官方空数据骨架。
 完整执行器按生成、生产 Judge、独立两阶段参考评审顺序执行，确认集实验另行冻结。
 

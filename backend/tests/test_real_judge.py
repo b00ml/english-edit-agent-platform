@@ -21,6 +21,9 @@ def judge_manifest() -> dict[str, Any]:
     config["prices"]["fixture-judge"] = copy.deepcopy(config["prices"]["fixture-model"])
     config["judge"] = {
         "temperature": 0.1,
+        "timeout_seconds": 30,
+        "max_output_tokens": 1024,
+        "context_limit_tokens": 8192,
         "sample_rounds": 1,
         "max_attempts": 2,
         "calibration": {"single_choice": {"threshold": 80.0}},
@@ -104,8 +107,9 @@ def test_shared_content_uses_production_weighted_judge_and_one_physical_trace(
     saved = json.loads(path.read_text("utf-8"))
     assert len(client.requests) == len(traces) == len(saved["provider_calls"]) == 1
     assert client.requests[0]["temperature"] == 0.1
+    assert client.requests[0]["max_tokens"] == 1024
     assert "self-authored revision" in client.requests[0]["messages"][1]["content"]
-    assert client.options == {"max_retries": 0, "timeout": 45}
+    assert client.options == {"max_retries": 0, "timeout": 30}
     assert all(
         row["score"] == 83.0 and row["passed"] is True and row["threshold"] == 80.0
         for row in saved["judge_results"].values()

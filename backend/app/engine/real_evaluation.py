@@ -386,6 +386,7 @@ def run_generation(
                         model=model,
                         messages=messages,
                         temperature=generation["temperature"],
+                        max_tokens=generation["max_output_tokens"],
                         response_format={"type": "json_object"},
                     ),
                 )
@@ -407,20 +408,7 @@ def run_generation(
         try:
             result["payload"] = generate_structured(
                 template,
-                {
-                    key: copy.deepcopy(value)
-                    for key, value in case["params"].items()
-                    if key
-                    in {
-                        "knowledge_point",
-                        "difficulty",
-                        "quantity",
-                        "grade",
-                        "constraints",
-                        "blank_count",
-                        "question_count",
-                    }
-                },
+                copy.deepcopy(case["params"]),
                 SimpleNamespace(model_name=model),
                 trace_id=planned["path_id"],
                 template_id=case["template_id"],

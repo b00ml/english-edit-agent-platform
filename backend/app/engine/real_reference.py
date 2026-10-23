@@ -126,13 +126,14 @@ def _phase(
                 price=config["prices"][model],
                 metadata={
                     "rubric_version": RUBRIC_VERSION,
-                    "settings": config["generation"],
+                    "settings": config["reference"],
                     "model_profile": config["profiles"]["reference"],
                 },
                 invoke=lambda: transport.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=config["generation"]["temperature"],
+                    temperature=config["reference"]["temperature"],
+                    max_tokens=config["reference"]["max_output_tokens"],
                     response_format={"type": "json_object"},
                 ),
             )
@@ -240,7 +241,7 @@ def run_reference_review(
     ledger = EvaluationLedger(path, manifest, trace_sink=trace_sink)
     frozen = manifest["frozen"]
     config = frozen["config"]
-    transport = client.with_options(max_retries=0, timeout=config["generation"]["timeout_seconds"])
+    transport = client.with_options(max_retries=0, timeout=config["reference"]["timeout_seconds"])
     repairs = manifest["protocol"]["reference_max_format_repairs"]
     if not 0 <= repairs <= 2:
         raise ValueError("Reference format repairs must be within the frozen maximum of two")
@@ -285,7 +286,7 @@ def run_reference_review(
             "content_id": content_id,
             "rubric_version": RUBRIC_VERSION,
             "model_profile": copy.deepcopy(config["profiles"]["reference"]),
-            "settings": copy.deepcopy(config["generation"]),
+            "settings": copy.deepcopy(config["reference"]),
             "source_call_ids": [],
         }
         results[path_id] = result
