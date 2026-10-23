@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 from typing import Any, Literal
@@ -67,6 +68,37 @@ class RuntimeSnapshot(BaseModel):
 def canonical_hash(value: object) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def judge_policies(
+    templates: dict[str, Any], calibration: dict[str, dict[str, float]]
+) -> dict[str, Any]:
+    """Resolve frozen rule weights and reserved threshold without live calibration reads."""
+    if set(calibration) - templates.keys():
+        raise ValueError("Judge calibration contains unknown templates")
+    policies = {}
+    for template_id, template in templates.items():
+        overrides = calibration.get(template_id, {})
+        rules = template["quality_rules"]
+        ids = {rule["id"] for rule in rules}
+        if set(overrides) - (ids | {"threshold"}):
+            raise ValueError("Judge calibration contains undeclared dimensions")
+        weights = {rule["id"]: overrides.get(rule["id"], rule["weight"]) for rule in rules}
+        threshold = overrides.get("threshold")
+        if threshold is None:
+            threshold = template.get("run_config", {}).get("quality_threshold", 70)
+        if (
+            not math.isfinite(threshold)
+            or not 0 <= threshold <= 100
+            or any(not math.isfinite(value) or value < 0 for value in weights.values())
+            or sum(weights.values()) <= 0
+        ):
+            raise ValueError(
+                "Judge calibration requires finite nonnegative weights, positive total "
+                "and a threshold in 0..100"
+            )
+        policies[template_id] = {"weights": weights, "threshold": threshold}
+    return policies
 
 
 def load_dataset(path: Path, backend: Path) -> dict[str, Any]:
@@ -144,6 +176,7 @@ def freeze_protocol(
         if profile["model_name"] not in config["prices"]:
             raise ValueError("Every frozen model requires an explicit price or unknown-price entry")
     frozen = {"dataset": dataset, **asset_snapshot(backend), "config": config}
+    judge_policies(frozen["templates"], config["judge"]["calibration"])
     plan: list[dict[str, Any]] = []
     cases = list(dataset["sets"]["exploration"])
     rng = random.Random(seed)
@@ -218,7 +251,14 @@ def resume_manifest(
             raise ValueError(f"Frozen manifest content drift: {name}")
     plan = copy.deepcopy(manifest["execution_plan"])
     for path in plan:
-        if path.get("state") not in {"planned", "in_flight", "completed", "failed", "unresolved"}:
+        if path.get("state") not in {
+            "planned",
+            "in_flight",
+            "completed",
+            "failed",
+            "unresolved",
+            "cancelled",
+        }:
             raise ValueError("Unknown execution path state")
         path["state"] = "planned"
     identity = canonical_hash({"protocol": manifest["protocol"], "paths": plan})

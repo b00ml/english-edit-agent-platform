@@ -6,7 +6,7 @@ import math
 import time
 import uuid
 from statistics import mean
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 from openai import OpenAI, OpenAIError
 from pydantic import ConfigDict, Field, ValidationError, confloat, create_model
@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.engine.providers import client_for_profile, profile_identity
+from app.engine.structured_output import StructuredResponse
 from app.engine.trace import (
     compute_cost,
     elapsed_ms,
@@ -178,12 +179,14 @@ def _call_judge_once(
     system_prompt: str,
     user_prompt: str,
     rule_ids: List[str],
+    *,
+    temperature: float | None = None,
 ) -> Tuple[str, float, Any]:
     """调用 Judge 一次，先返回原文以保留无效输出的 usage 和耗时。"""
     start = time.perf_counter_ns()
     resp = client.chat.completions.create(
         model=model,
-        temperature=settings.JUDGE_TEMPERATURE,
+        temperature=settings.JUDGE_TEMPERATURE if temperature is None else temperature,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
@@ -206,6 +209,11 @@ def run_quality_check(
     weights_override: Optional[Dict[str, float]] = None,
     generation_params: Optional[Dict[str, Any]] = None,
     model_profile: ModelProfile | None = None,
+    *,
+    response_adapter: Callable[[list[dict[str, str]], int, int], StructuredResponse] | None = None,
+    trace_sink: Callable[..., bool | None] | None = None,
+    temperature: float | None = None,
+    max_attempts: int | None = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """执行自动质检，返回 (总分 0-100, 维度分 dict)。
 
@@ -231,18 +239,26 @@ def run_quality_check(
         if configured is not None:
             model_name = configured.model_name
         client = (
-            client_for_profile(configured)
-            if configured is not None and configured.provider_id
-            else _get_openai_client()
+            None
+            if response_adapter is not None
+            else (
+                client_for_profile(configured)
+                if configured is not None and configured.provider_id
+                else _get_openai_client()
+            )
         )
     except ProviderConfigurationError as exc:
         raise QualityCheckError(str(exc)) from exc
     system_prompt, user_prompt = _build_judge_prompt(template, payload, generation_params)
 
     judge_rounds = rounds if rounds is not None else settings.JUDGE_SAMPLE_ROUNDS
-    max_attempts = int(
-        (getattr(template, "run_config", None) or {}).get(
-            "judge_max_retry", settings.JUDGE_MAX_RETRIES
+    max_attempts = (
+        max_attempts
+        if max_attempts is not None
+        else int(
+            (getattr(template, "run_config", None) or {}).get(
+                "judge_max_retry", settings.JUDGE_MAX_RETRIES
+            )
         )
     )
     if judge_rounds < 1 or max_attempts < 1:
@@ -253,6 +269,11 @@ def run_quality_check(
         if key in (getattr(template, "input_schema", None) or {}).get("properties", {})
     }
     round_scores: List[Dict[str, float]] = []
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    actual_temperature = settings.JUDGE_TEMPERATURE if temperature is None else temperature
     for round_idx in range(judge_rounds):
         last_error: Exception | None = None
         for attempt in range(1, max_attempts + 1):
@@ -261,10 +282,21 @@ def run_quality_check(
             usage = None
             latency_ms = 0.0
             once = None
+            replayed = False
             try:
-                text, latency_ms, usage = _call_judge_once(
-                    client, model_name, system_prompt, user_prompt, rule_ids
-                )
+                if response_adapter is not None:
+                    response = response_adapter(messages, round_idx + 1, attempt)
+                    text, latency_ms, usage = response.text, response.latency_ms, response.usage
+                    replayed = response.replayed
+                else:
+                    text, latency_ms, usage = _call_judge_once(
+                        cast(OpenAI, client),
+                        model_name,
+                        system_prompt,
+                        user_prompt,
+                        rule_ids,
+                        **({"temperature": temperature} if temperature is not None else {}),
+                    )
                 data = json.loads(text)
                 once = _validate_dimension_scores(data.get("dimension_scores"), rule_ids)
             except (
@@ -288,8 +320,8 @@ def run_quality_check(
                     last_error,
                 )
             tokens = token_breakdown(usage, model_name)
-            if trace_id:
-                record_trace(
+            if trace_id and (trace_sink is not None or not replayed):
+                (trace_sink or record_trace)(
                     snapshot_data={
                         "messages": [
                             {"role": "system", "content": system_prompt},
@@ -297,7 +329,7 @@ def run_quality_check(
                         ],
                         "response_text": text,
                         "model": model_name,
-                        "temperature": settings.JUDGE_TEMPERATURE,
+                        "temperature": actual_temperature,
                         "response_format": {"type": "json_object"},
                     },
                     trace_id=trace_id,

@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import yaml
@@ -15,6 +16,83 @@ from app.engine.reference_review import build_review_packets
 from app.prompt_loader import build_user_prompt
 
 BACKEND = Path(__file__).parents[1]
+
+
+def test_execute_judge_cli_runs_verified_frozen_service(
+    tmp_path: Path,
+    runtime_config: dict[str, Any],
+    dataset_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from contextlib import nullcontext
+
+    from test_real_generation import VALID, FakeClient
+
+    from app import database
+    from scripts import structured_retry_eval as cli
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(runtime_config), "utf-8")
+    manifest = freeze_protocol(
+        dataset_path=dataset_path, config_path=config, backend=BACKEND, run_id="judge-cli", seed=21
+    )
+    first = next(row for row in manifest["execution_plan"] if "single_choice" in row["case_id"])
+    first["state"] = "completed"
+    manifest["generation_results"] = {first["path_id"]: {"payload": VALID}}
+    output = tmp_path / "run.json"
+    write_manifest(output, manifest)
+    client = FakeClient(
+        [
+            {
+                "dimension_scores": {
+                    rule["id"]: 90
+                    for rule in manifest["frozen"]["templates"][
+                        next(
+                            case["template_id"]
+                            for case in manifest["frozen"]["dataset"]["sets"]["exploration"]
+                            if case["case_id"] == first["case_id"]
+                        )
+                    ]["quality_rules"]
+                }
+            }
+        ]
+    )
+    monkeypatch.setattr(database, "SessionLocal", lambda: nullcontext("fixture-session"))
+    verified = []
+
+    def clients(frozen: dict[str, Any], session: object) -> dict[str, FakeClient]:
+        verified.append((frozen["frozen"]["config"]["profiles"]["judge"], session))
+        return {"judge": client}
+
+    monkeypatch.setattr(cli, "verified_clients", clients)
+    # Trace persistence is the external storage boundary; execute the real Judge service.
+    from app.engine.real_judge import run_judge
+
+    monkeypatch.setattr(
+        cli,
+        "run_judge",
+        lambda path, data, **kwargs: run_judge(path, data, trace_sink=lambda **row: None, **kwargs),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval",
+            "execute-judge",
+            "--manifest",
+            str(output),
+            "--dataset",
+            str(dataset_path),
+            "--config",
+            str(config),
+        ],
+    )
+    assert cli.main() == 0
+    saved = json.loads(output.read_text("utf-8"))
+    assert len(verified) == len(client.requests) == 1
+    assert saved["judge_results"][first["path_id"]]["state"] == "completed"
+    assert json.loads(capsys.readouterr().out)["pass_rate_all_paths"]["denominator"] == 90
 
 
 @pytest.fixture
@@ -83,6 +161,44 @@ def runtime_config() -> dict:
             "calibration": {},
         },
     }
+
+
+@pytest.mark.parametrize(
+    "calibration",
+    [
+        {"unknown_template": {}},
+        {"single_choice": {"unknown_rule": 1.0}},
+        {"single_choice": {"threshold": -1.0}},
+        {"single_choice": {"threshold": 101.0}},
+        {"single_choice": {"kp_match": float("inf")}},
+        {"single_choice": {"kp_match": -1.0}},
+        {
+            "single_choice": {
+                "kp_match": 0.0,
+                "diff_match": 0.0,
+                "distractor": 0.0,
+                "unambiguous": 0.0,
+            }
+        },
+    ],
+)
+def test_freeze_rejects_invalid_frozen_judge_calibration(
+    tmp_path: Path,
+    runtime_config: dict[str, Any],
+    dataset_path: Path,
+    calibration: dict[str, dict[str, float]],
+) -> None:
+    runtime_config["judge"]["calibration"] = calibration
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(runtime_config), "utf-8")
+    with pytest.raises(ValueError, match="calibration"):
+        freeze_protocol(
+            dataset_path=dataset_path,
+            config_path=config,
+            backend=BACKEND,
+            run_id="calibration-test",
+            seed=21,
+        )
 
 
 def test_freeze_cli_persists_balanced_disjoint_protocol_and_blinded_contracts(
@@ -206,6 +322,7 @@ def test_resume_preserves_unresolved_and_inflight_evidence_without_replay(
     manifest["execution_plan"][0]["state"] = "in_flight"
     manifest["execution_plan"][1]["state"] = "unresolved"
     manifest["execution_plan"][2]["state"] = "completed"
+    manifest["execution_plan"][3]["state"] = "cancelled"
     manifest["provider_calls"] = [
         {
             "call_id": "existing-call",
