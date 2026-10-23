@@ -14,7 +14,8 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 def summarize_samples(samples: list[dict[str, Any]], elapsed_seconds: float) -> dict[str, Any]:
     submitted = len(samples)
     succeeded = sum(sample["status"] == "succeeded" for sample in samples)
-    failed = submitted - succeeded
+    failed = sum(sample["status"] == "failed" for sample in samples)
+    unresolved = submitted - succeeded - failed
     queue_latencies = [
         float(sample["queue_latency_seconds"])
         for sample in samples
@@ -39,7 +40,11 @@ def summarize_samples(samples: list[dict[str, Any]], elapsed_seconds: float) -> 
         "submitted": submitted,
         "succeeded": succeeded,
         "failed": failed,
+        "unresolved": unresolved,
         "failure_rate": failed / submitted if submitted else None,
+        "failure_rate_denominator": submitted,
+        "unresolved_rate": unresolved / submitted if submitted else None,
+        "unresolved_rate_denominator": submitted,
         "successful_throughput_per_hour": (
             succeeded * 3600 / elapsed_seconds if submitted and elapsed_seconds > 0 else None
         ),

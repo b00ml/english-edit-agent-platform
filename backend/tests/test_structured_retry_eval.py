@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -52,6 +53,17 @@ def test_frozen_retry_evaluation_cli_reports_explicit_denominators(tmp_path):
     assert report["arms"]["feedback_retry"]["counts"]["recovered"] == 15
     assert report["provenance"]["code_revision"]
     assert len(report["provenance"]["case_hashes"]) == 30
+    expected_skills = {
+        path.relative_to(backend).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (backend / "skills").rglob("*")
+        if path.name in {"SKILL.md", "skill.meta.yml"}
+    }
+    assert expected_skills
+    assert {
+        key.replace("\\", "/"): value
+        for key, value in report["provenance"]["prompt_config_hashes"].items()
+        if key.replace("\\", "/").startswith("skills/")
+    } == expected_skills
     assert report["limitations"]
 
 

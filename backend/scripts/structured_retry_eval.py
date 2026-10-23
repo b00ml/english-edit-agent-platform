@@ -336,10 +336,14 @@ def main() -> int:
     for case in cases:
         counts[case["template_id"]] = counts.get(case["template_id"], 0) + 1
     prompt_files = sorted((BACKEND / "prompts").glob("*.st"))
-    skill_files = sorted((BACKEND / "skills").glob("*"))
+    skill_files = sorted(
+        path
+        for path in (BACKEND / "skills").rglob("*")
+        if path.is_file() and path.name in {"SKILL.md", "skill.meta.yml"}
+    )
     prompt_hashes = {
         str(path.relative_to(BACKEND)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in prompt_files + [path for path in skill_files if path.is_file()]
+        for path in prompt_files + skill_files
     }
     report = {
         "case_count": len(cases),
