@@ -117,27 +117,28 @@ def _phase(
     ]
     for attempt in range(repairs + 1):
         call_id = canonical_hash([ledger.manifest["run_id"], result["content_id"], phase, attempt])
-        result["source_call_ids"].append(call_id)
-        ledger.save()
-        response = ledger.call(
-            call_id,
-            messages,
-            stage=f"reference_{phase}",
-            model=model,
-            price=config["prices"][model],
-            metadata={
-                "rubric_version": RUBRIC_VERSION,
-                "settings": config["generation"],
-                "model_profile": config["profiles"]["reference"],
-            },
-            invoke=lambda: transport.chat.completions.create(
+        try:
+            response = ledger.call(
+                call_id,
+                messages,
+                stage=f"reference_{phase}",
                 model=model,
-                messages=messages,
-                temperature=config["generation"]["temperature"],
-                response_format={"type": "json_object"},
-            ),
-        )
-        result["source_call_ids"][-1] = response.source_call_id
+                price=config["prices"][model],
+                metadata={
+                    "rubric_version": RUBRIC_VERSION,
+                    "settings": config["generation"],
+                    "model_profile": config["profiles"]["reference"],
+                },
+                invoke=lambda: transport.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=config["generation"]["temperature"],
+                    response_format={"type": "json_object"},
+                ),
+            )
+        finally:
+            result["source_call_ids"].extend(ledger.source_call_ids(call_id))
+            ledger.save()
         error = None
         try:
             parsed = schema.model_validate_json(response.text)
@@ -288,9 +289,9 @@ def run_reference_review(
             "source_call_ids": [],
         }
         results[path_id] = result
-        packet = _solve_packet(case["template_id"], payload)
-        count = {"single_choice": 1, "cloze": 5, "reading": 3}[case["template_id"]]
         try:
+            packet = _solve_packet(case["template_id"], payload)
+            count = {"single_choice": 1, "cloze": 5, "reading": 3}[case["template_id"]]
             solve = _phase(ledger, result, "solve", packet, count, config, transport, repairs)
             if not isinstance(solve, IndependentSolve):
                 continue
@@ -346,6 +347,9 @@ def run_reference_review(
             result.update(state="failed", error=str(exc))
         except EvaluationUnresolvedError as exc:
             result.update(state="unresolved", error=str(exc))
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            result.update(state="failed", error=str(exc), error_type=type(exc).__name__)
+            raise
         finally:
             ledger.save()
     _account(manifest)

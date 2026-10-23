@@ -47,6 +47,23 @@ def review(count=1):
     }
 
 
+def test_local_reference_configuration_failure_keeps_no_phantom_source(tmp_path):
+    manifest = manifest_fixture()
+    del manifest["frozen"]["config"]["prices"]["fixture-reference"]
+    client = FakeClient([])
+    traces = []
+    path = tmp_path / "run.json"
+    with pytest.raises(KeyError, match="fixture-reference"):
+        run_reference_review(
+            path, manifest, client=client, trace_sink=lambda **row: traces.append(row)
+        )
+    saved = json.loads(path.read_text("utf-8"))
+    assert client.requests == traces == saved["provider_calls"] == []
+    result = saved["reference_results"]["single_attempt"]
+    assert result["source_call_ids"] == []
+    assert result["state"] == "failed" and result["error_type"] == "KeyError"
+
+
 def test_blind_fresh_phases_dedup_trace_and_independent_completion(tmp_path):
     manifest = manifest_fixture()
     manifest["judge_results"] = {

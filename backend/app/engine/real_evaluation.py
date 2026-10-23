@@ -255,6 +255,14 @@ class EvaluationLedger:
             )
         raise EvaluationTransportError(accepted=False, completed=False, transient=False)
 
+    def source_call_ids(self, request_id: str) -> list[str]:
+        """Return only physical rows recorded for this logical request, in send order."""
+        return [
+            row["call_id"]
+            for row in self.manifest["provider_calls"]
+            if row["request_id"] == request_id
+        ]
+
     def record_validation(self, source_call_id: str, **trace: Any) -> None:
         """Record validation locally, and emit each physical request's Trace at most once."""
         row = next(r for r in self.manifest["provider_calls"] if r["call_id"] == source_call_id)
@@ -354,30 +362,33 @@ def run_generation(
 
         def adapter(messages: list[dict[str, str]], attempt: int) -> EvaluationResponse:
             nonlocal current_id
-            current_id = (
+            request_id = (
                 f'{planned["first_draft_id"]}:0'
                 if attempt == 1
                 else f'{planned["path_id"]}:{attempt - 1}'
             )
-            attempt_record = {"attempt": attempt, "source_call_id": current_id}
-            result["attempts"].append(attempt_record)
-            ledger.save()
-            response = ledger.call(
-                current_id,
-                messages,
-                stage="generate",
-                model=model,
-                price=config["prices"][model],
-                metadata={"generation": generation},
-                invoke=lambda: transport.chat.completions.create(
+            try:
+                response = ledger.call(
+                    request_id,
+                    messages,
+                    stage="generate",
                     model=model,
-                    messages=messages,
-                    temperature=generation["temperature"],
-                    response_format={"type": "json_object"},
-                ),
-            )
+                    price=config["prices"][model],
+                    metadata={"generation": generation},
+                    invoke=lambda: transport.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=generation["temperature"],
+                        response_format={"type": "json_object"},
+                    ),
+                )
+            finally:
+                sources = ledger.source_call_ids(request_id)
+                if sources:
+                    result["attempts"].append({"attempt": attempt, "source_call_id": sources[-1]})
+                ledger.save()
             current_id = response.source_call_id
-            attempt_record.update(source_call_id=current_id, replayed=response.replayed)
+            result["attempts"][-1].update(replayed=response.replayed)
             ledger.save()
             return response
 
@@ -417,6 +428,11 @@ def run_generation(
         except EvaluationUnresolvedError as exc:
             planned["state"] = "unresolved"
             result["error"] = str(exc)
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            planned["state"] = "failed"
+            result.update(error=str(exc), error_type=type(exc).__name__)
+            ledger.save()
+            raise
         _account(manifest)
         ledger.save()
     return manifest

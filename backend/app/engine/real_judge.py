@@ -143,27 +143,28 @@ def run_judge(
             messages: list[dict[str, str]], sample_round: int, attempt: int
         ) -> StructuredResponse:
             nonlocal current_id
-            current_id = canonical_hash(
+            request_id = canonical_hash(
                 [manifest["run_id"], "qc", content_id, judge, sample_round, attempt]
             )
-            result["source_call_ids"].append(current_id)
-            ledger.save()
-            response = ledger.call(
-                current_id,
-                messages,
-                stage="qc",
-                model=model,
-                price=config["prices"][model],
-                metadata={"judge": judge},
-                invoke=lambda: transport.chat.completions.create(
+            try:
+                response = ledger.call(
+                    request_id,
+                    messages,
+                    stage="qc",
                     model=model,
-                    messages=messages,
-                    temperature=judge["temperature"],
-                    response_format={"type": "json_object"},
-                ),
-            )
+                    price=config["prices"][model],
+                    metadata={"judge": judge},
+                    invoke=lambda: transport.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=judge["temperature"],
+                        response_format={"type": "json_object"},
+                    ),
+                )
+            finally:
+                result["source_call_ids"].extend(ledger.source_call_ids(request_id))
+                ledger.save()
             current_id = response.source_call_id
-            result["source_call_ids"][-1] = current_id
             return response
 
         def recorder(**trace: Any) -> None:
@@ -200,6 +201,10 @@ def run_judge(
             result.update(state="failed", error=str(exc))
         except EvaluationUnresolvedError as exc:
             result.update(state="unresolved", error=str(exc))
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            result.update(state="failed", error=str(exc), error_type=type(exc).__name__)
+            ledger.save()
+            raise
         _account(manifest)
         ledger.save()
     _account(manifest)

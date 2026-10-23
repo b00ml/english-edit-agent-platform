@@ -8,7 +8,10 @@ from typing import Any
 import pytest
 from test_real_generation import VALID, FakeClient, local_manifest
 
+from app.engine.quality import run_quality_check
+from app.engine.real_evaluation import evaluation_template
 from app.engine.real_judge import run_judge
+from app.errors import QualityCheckError
 
 
 def judge_manifest() -> dict[str, Any]:
@@ -27,6 +30,50 @@ def judge_manifest() -> dict[str, Any]:
         planned["state"] = "completed"
         manifest["generation_results"][planned["path_id"]] = {"payload": copy.deepcopy(VALID)}
     return manifest
+
+
+@pytest.mark.parametrize(
+    "error", [AttributeError("local adapter"), QualityCheckError("local adapter")]
+)
+def test_judge_adapter_failure_does_not_become_output_validation_or_retry(error):
+    manifest = judge_manifest()
+    case = manifest["frozen"]["dataset"]["sets"]["exploration"][0]
+    template = evaluation_template(manifest, case, 1)
+    requests = []
+    traces = []
+
+    def adapter(messages, sample_round, attempt):
+        requests.append((sample_round, attempt))
+        raise error
+
+    with pytest.raises(type(error)) as caught:
+        run_quality_check(
+            template,
+            VALID,
+            model_name="fixture-judge",
+            rounds=1,
+            response_adapter=adapter,
+            trace_sink=lambda **row: traces.append(row),
+            max_attempts=2,
+        )
+    assert caught.value is error
+    assert requests == [(1, 1)]
+    assert traces == []
+
+
+def test_local_judge_configuration_failure_keeps_no_phantom_source(tmp_path):
+    manifest = judge_manifest()
+    del manifest["frozen"]["config"]["prices"]["fixture-judge"]
+    client = FakeClient([])
+    traces = []
+    path = tmp_path / "run.json"
+    with pytest.raises(KeyError, match="fixture-judge"):
+        run_judge(path, manifest, client=client, trace_sink=lambda **row: traces.append(row))
+    saved = json.loads(path.read_text("utf-8"))
+    assert client.requests == traces == saved["provider_calls"] == []
+    result = saved["judge_results"]["single_attempt"]
+    assert result["source_call_ids"] == []
+    assert result["state"] == "failed" and result["error_type"] == "KeyError"
 
 
 def test_shared_content_uses_production_weighted_judge_and_one_physical_trace(

@@ -96,6 +96,45 @@ def local_manifest():
     }
 
 
+def test_local_configuration_failure_is_not_a_physical_generation_attempt(tmp_path):
+    manifest = local_manifest()
+    del manifest["frozen"]["config"]["prices"]["fixture-model"]
+    client = FakeClient([])
+    traces = []
+    path = tmp_path / "run.json"
+    with pytest.raises(KeyError, match="fixture-model"):
+        run_generation(path, manifest, client=client, trace_sink=lambda **row: traces.append(row))
+    saved = json.loads(path.read_text("utf-8"))
+    assert client.requests == traces == saved["provider_calls"] == []
+    assert saved["generation_results"]["single_attempt"]["attempts"] == []
+    assert saved["execution_plan"][0]["state"] == "failed"
+    assert saved["generation_results"]["single_attempt"]["error_type"] == "KeyError"
+
+
+def test_local_failure_after_invalid_response_keeps_only_real_attempts(tmp_path):
+    manifest = local_manifest()
+    manifest["execution_plan"] = [manifest["execution_plan"][1]]
+
+    class PriceRemovedClient(FakeClient):
+        def create(self, **kwargs):
+            response = super().create(**kwargs)
+            del manifest["frozen"]["config"]["prices"]["fixture-model"]
+            return response
+
+    client = PriceRemovedClient([{}])
+    traces = []
+    path = tmp_path / "run.json"
+    with pytest.raises(KeyError, match="fixture-model"):
+        run_generation(path, manifest, client=client, trace_sink=lambda **row: traces.append(row))
+    saved = json.loads(path.read_text("utf-8"))
+    assert len(client.requests) == len(traces) == len(saved["provider_calls"]) == 1
+    assert traces[0]["success"] is False
+    assert saved["generation_results"]["blind_retry"]["attempts"] == [
+        {"attempt": 1, "source_call_id": "shared-draft:0", "replayed": False}
+    ]
+    assert saved["execution_plan"][0]["state"] == "failed"
+
+
 def test_shared_valid_draft_has_one_physical_trace_and_three_revalidated_paths(tmp_path):
     manifest = local_manifest()
     path = tmp_path / "run.json"
@@ -150,6 +189,10 @@ def test_interrupted_send_and_unknown_acceptance_are_never_resent(tmp_path):
     assert len(client.requests) == len(traces) == 1
     assert manifest["provider_calls"][0]["state"] == "unresolved"
     assert all(p["state"] == "unresolved" for p in manifest["execution_plan"])
+    assert all(
+        row["attempts"] == [{"attempt": 1, "source_call_id": "shared-draft:0"}]
+        for row in manifest["generation_results"].values()
+    )
     assert "never store provider credentials" not in path.read_text("utf-8")
     run_generation(path, manifest, client=client, trace_sink=lambda **row: traces.append(row))
     assert len(client.requests) == len(traces) == 1
