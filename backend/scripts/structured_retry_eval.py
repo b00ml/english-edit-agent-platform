@@ -17,6 +17,12 @@ BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
 from app.engine import structured_output  # noqa: E402
+from app.engine.reference_review import (  # noqa: E402
+    ReferenceAssessment,
+    build_review_packets,
+    review_packet_id,
+    summarize_reference_reviews,
+)
 
 
 def canonical_hash(value: object) -> str:
@@ -27,11 +33,26 @@ def canonical_hash(value: object) -> str:
 def _payload(template_id: str) -> dict:
     options = ["walked", "walks", "walking", "will walk"]
     if template_id == "single_choice":
-        return {"stem": "Yesterday, she ___ to school.", "options": options, "answer": "A", "explanation": "Past simple."}
+        return {
+            "stem": "Yesterday, she ___ to school.",
+            "options": options,
+            "answer": "A",
+            "explanation": "Past simple.",
+        }
     choice = {"index": 1, "answer": "A", "options": options, "explanation": "Past simple."}
     if template_id == "cloze":
         return {"passage": "Yesterday, she ____ to school.", "blanks": [choice]}
-    return {"passage": "Yesterday, she walked to school.", "questions": [{"stem": "How did she travel?", "options": options, "answer": "A", "explanation": "The passage says she walked."}]}
+    return {
+        "passage": "Yesterday, she walked to school.",
+        "questions": [
+            {
+                "stem": "How did she travel?",
+                "options": options,
+                "answer": "A",
+                "explanation": "The passage says she walked.",
+            }
+        ],
+    }
 
 
 def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool) -> dict:
@@ -46,6 +67,7 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
 
         case_adapter_calls = 0
         first_attempt_pass = False
+        generated_payload = None
 
         def adapter(messages, attempt):
             nonlocal adapter_calls
@@ -68,7 +90,7 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
 
         start = time.perf_counter()
         try:
-            structured_output.generate_structured(
+            generated_payload = structured_output.generate_structured(
                 template,
                 case["params"],
                 model_profile=None,
@@ -87,18 +109,23 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
             initial_passes += 1
         if not first_attempt_pass:
             initial_failures += 1
-        outcomes.append({
-            "case_id": case["case_id"],
-            "first_attempt_schema_pass": first_attempt_pass,
-            "attempts": case_adapter_calls,
-            "latency_ms": round(case_latency, 3),
-            "final_schema_success": success,
-            "failure_type": failure,
-        })
+        outcomes.append(
+            {
+                "case_id": case["case_id"],
+                "first_attempt_schema_pass": first_attempt_pass,
+                "attempts": case_adapter_calls,
+                "latency_ms": round(case_latency, 3),
+                "final_schema_success": success,
+                "payload": generated_payload if success else None,
+                "failure_type": failure,
+            }
+        )
 
     succeeded = sum(item["final_schema_success"] for item in outcomes)
     initial_failed = initial_failures
-    recovered = sum(item["final_schema_success"] and not item["first_attempt_schema_pass"] for item in outcomes)
+    recovered = sum(
+        item["final_schema_success"] and not item["first_attempt_schema_pass"] for item in outcomes
+    )
     return {
         "denominators": {"planned_cases": len(cases), "completed_cases": len(outcomes)},
         "counts": {
@@ -115,12 +142,24 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
         },
         "rates": {
             "first_attempt_schema_pass": initial_passes / len(cases) if cases else None,
-            "recovery_among_initial_failures": recovered / initial_failed if initial_failed else None,
+            "recovery_among_initial_failures": (
+                recovered / initial_failed if initial_failed else None
+            ),
             "final_schema_success": succeeded / len(cases) if cases else None,
         },
-        "attempts": {"adapter_calls": adapter_calls, "mean_per_case": adapter_calls / len(cases) if cases else None},
-        "latency_ms": {"total": round(total_latency, 3), "mean_per_case": round(total_latency / len(cases), 3) if cases else None},
-        "cost": {"complete": False, "total": None, "reason": "offline adapter has no provider usage or billing data"},
+        "attempts": {
+            "adapter_calls": adapter_calls,
+            "mean_per_case": adapter_calls / len(cases) if cases else None,
+        },
+        "latency_ms": {
+            "total": round(total_latency, 3),
+            "mean_per_case": round(total_latency / len(cases), 3) if cases else None,
+        },
+        "cost": {
+            "complete": False,
+            "total": None,
+            "reason": "offline adapter has no provider usage or billing data",
+        },
         "outcomes": outcomes,
     }
 
@@ -131,7 +170,90 @@ def main() -> int:
     run = subparsers.add_parser("run")
     run.add_argument("--cases", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
+    review = subparsers.add_parser("review")
+    review.add_argument("--evaluation", type=Path, required=True)
+    review.add_argument("--assessments", type=Path, required=True)
+    review.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.command == "review":
+        evaluation = json.loads(args.evaluation.read_text(encoding="utf-8"))
+        packets = evaluation.get("reference_review_packets", [])
+        packet_by_id = {packet["review_id"]: packet for packet in packets}
+        packet_ids = set(packet_by_id)
+        if len(packet_ids) != len(packets):
+            parser.error("evaluation report contains duplicate reference review IDs")
+        assessments = [
+            json.loads(line)
+            for line in args.assessments.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        try:
+            validated = [ReferenceAssessment.model_validate(item) for item in assessments]
+            summary = summarize_reference_reviews(assessments)
+        except (ValueError, TypeError) as exc:
+            parser.error(f"invalid reference assessment: {exc}")
+        assessment_ids = [item.review_id for item in validated]
+        if len(set(assessment_ids)) != len(assessment_ids):
+            parser.error("assessment review_id values must be unique")
+        if not set(assessment_ids).issubset(packet_ids):
+            parser.error("assessment contains review_id absent from the evaluation packets")
+        if any(
+            item.rubric_version != packet_by_id[item.review_id]["rubric_version"]
+            for item in validated
+        ):
+            parser.error("assessment rubric_version does not match its blinded review packet")
+        by_id = {item.review_id: item.model_dump(mode="json") for item in validated}
+        arm_index: dict[str, set[str]] = {}
+        for arm_name, arm in evaluation.get("arms", {}).items():
+            arm_index[arm_name] = {
+                review_id
+                for outcome in arm.get("outcomes", [])
+                if outcome.get("final_schema_success") and isinstance(outcome.get("payload"), dict)
+                for review_id in [review_packet_id(str(outcome["case_id"]), outcome["payload"])]
+            }
+        summary["packet_count"] = len(packet_ids)
+        summary["assessment_coverage"] = {
+            "numerator": len(assessment_ids),
+            "denominator": len(packet_ids),
+            "rate": round(len(assessment_ids) / len(packet_ids), 4) if packet_ids else None,
+        }
+        summary["by_arm"] = {}
+        for arm_name, review_ids in arm_index.items():
+            arm_assessments = [by_id[review_id] for review_id in sorted(review_ids & by_id.keys())]
+            arm_summary = summarize_reference_reviews(arm_assessments)
+            arm_summary["eligible_packet_count"] = len(review_ids)
+            arm_summary["assessment_coverage"] = {
+                "numerator": len(arm_assessments),
+                "denominator": len(review_ids),
+                "rate": round(len(arm_assessments) / len(review_ids), 4) if review_ids else None,
+            }
+            summary["by_arm"][arm_name] = arm_summary
+        summary["bad_cases"] = [
+            {
+                "review_id": item["review_id"],
+                "status": item["status"],
+                "reason": item.get("disagreement_reason") or item.get("unresolved_reason"),
+                "rubric_findings": {
+                    dimension: result
+                    for dimension, result in item["rubric"].items()
+                    if result["verdict"] != "pass"
+                },
+            }
+            for item in by_id.values()
+            if item["status"] == "unresolved"
+            or item.get("reference_pass") != item.get("judge_pass")
+        ]
+        summary["contribution_boundary"] = (
+            "This evaluation records system behavior only; it does not establish individual "
+            "contribution. Add owner-confirmed contribution facts before interview use."
+        )
+        result = {**evaluation, "reference_review": summary}
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        return 0
 
     frozen = json.loads(args.cases.read_text(encoding="utf-8"))
     cases = frozen["cases"]
@@ -165,13 +287,16 @@ def main() -> int:
         "cases_by_template": counts,
         "provider_calls": 0,
         "arms": arms,
+        "reference_review_packets": build_review_packets(arms),
         "provenance": {
             "code_revision": revision,
             "run_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "case_hashes": [canonical_hash(case) for case in cases],
             "dataset_hash": canonical_hash(frozen),
             "model_config": "deterministic synthetic adapter; no provider/model invoked",
-            "template_config_hashes": {key: canonical_hash(value) for key, value in templates.items()},
+            "template_config_hashes": {
+                key: canonical_hash(value) for key, value in templates.items()
+            },
             "runtime": {"python": sys.version.split()[0]},
             "prompt_config_hashes": prompt_hashes,
         },
@@ -183,7 +308,9 @@ def main() -> int:
         ],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     return 0
 
 
