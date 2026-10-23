@@ -102,6 +102,20 @@ python scripts/structured_retry_eval.py evidence --dataset <local-cases.json> --
 按臂和题型展开；提交数只认已有物理发送。`pending_review` 是待裁决的补充标记，不能
 和其他状态相加。实际物理账目去重，各臂逻辑账目分配共享调用，不能再相加当供应商账单。
 
+`generation_metrics` 在总表、各臂和题型中给出首稿通过/失败/未知、最终结构有效、
+失败后恢复和额外请求。首稿与终稿分母保留全部计划路径；恢复率只用首稿确定失败的路径
+作分母，没有首稿失败时为 `null`（无法评估恢复）。首稿校验缺失或冲突单列未知。
+额外请求分别统计物理发送与语义请求，传输重试不能当作一次新的结构化尝试；缺少
+首稿尝试身份时不推断额外次数。共享首稿在各逻辑路径中占一份，但错误频次按物理调用去重。
+`generation_errors` 按异常类别区分 `json_syntax/schema/content_rule/call_error`，
+缺少历史分类保留 `unknown_validation`，同时列出影响输入、路径和来源调用；
+未验证的复现性和因果归因均标记 `unknown`，不从出现频次推断原因。
+
+`physical.tokens`、`physical_by_stage.*.tokens` 和各组 `logical.tokens` 分别提供
+输入、输出和总 Token 的 `total/known_subtotal/reported_calls/denominator`。
+总 Token 仅在输入与输出均已报告时相加；任一调用用量缺失时完整合计为 `null`，
+仍保留已知小计与覆盖分母。复用的逻辑 Token 不能当作额外的实际消耗。
+
 费用给出已知小计、币种、usage/Trace 覆盖和未知调用标识；证据有缺口时完整费用为
 `null`，不能按零处理。延迟为每次供应商发送的观测值，不能据此宣称任务端到端 P95、
 吞吐或 MTTR。Judge 与参考模型一致率、Kappa 只描述模型间判断；原始坏例、分歧和

@@ -146,6 +146,29 @@ def _account_calls(calls: list[dict[str, Any]]) -> dict[str, Any]:
         and all(row.get("trace_state") == "completed" for row in calls)
     )
     latencies = sorted(row["latency_ms"] for row in calls if row.get("latency_ms") is not None)
+    tokens = {}
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        observed = []
+        for row in calls:
+            usage = row.get("usage") or {}
+            value = usage.get(field)
+            if field == "total_tokens":
+                parts = [
+                    usage[name] for name in ("prompt_tokens", "completion_tokens") if name in usage
+                ]
+                value = (
+                    sum(parts)
+                    if len(parts) == 2 and all(type(v) is int and v >= 0 for v in parts)
+                    else None
+                )
+            if type(value) is int and value >= 0:
+                observed.append(value)
+        tokens[field] = {
+            "total": sum(observed) if len(observed) == len(calls) else None,
+            "known_subtotal": sum(observed),
+            "reported_calls": len(observed),
+            "denominator": len(calls),
+        }
     return {
         "call_count": len(calls),
         "semantic_request_count": len({row.get("request_id", row["call_id"]) for row in calls}),
@@ -165,6 +188,7 @@ def _account_calls(calls: list[dict[str, Any]]) -> dict[str, Any]:
             "reported": sum(row.get("usage") is not None for row in calls),
             "denominator": len(calls),
         },
+        "tokens": tokens,
         "trace_coverage": {
             "persisted": sum(row.get("trace_state") == "completed" for row in calls),
             "denominator": len(calls),
@@ -174,6 +198,100 @@ def _account_calls(calls: list[dict[str, Any]]) -> dict[str, Any]:
             "sum": sum(latencies),
             "p50": latencies[math.ceil(len(latencies) * 0.5) - 1] if latencies else None,
             "p95": latencies[math.ceil(len(latencies) * 0.95) - 1] if latencies else None,
+        },
+    }
+
+
+def _generation_evidence(manifest: dict[str, Any], paths: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive path outcomes from validations, counting shared responses only once for errors."""
+    calls = {row["call_id"]: row for row in manifest.get("provider_calls", [])}
+    first_passed = first_failed = recovered = final_valid = 0
+    selected_calls: dict[str, dict[str, Any]] = {}
+    first_requests: set[str] = set()
+    extra_requests_known = True
+    affected: dict[str, dict[str, set[str]]] = {}
+    for path in paths:
+        attempts = (
+            manifest.get("generation_results", {}).get(path["path_id"], {}).get("attempts", [])
+        )
+        first: dict[str, Any] = next((row for row in attempts if row.get("attempt") == 1), {})
+        first_call = calls.get(first.get("source_call_id"), {})
+        verdicts = {
+            row["success"]
+            for row in first_call.get("validations", [])
+            if type(row.get("success")) is bool
+            and (row["success"] is True or "error_summary" in (row.get("output") or {}))
+        }
+        first_passed += verdicts == {True}
+        first_failed += verdicts == {False}
+        final_valid += path["state"] == "completed"
+        recovered += verdicts == {False} and path["state"] == "completed"
+        if first_call:
+            first_requests.add(first_call.get("request_id", first_call["call_id"]))
+        requested = {row["source_call_id"] for row in attempts}
+        requested.update(
+            calls[key].get("request_id", key) for key in list(requested) if key in calls
+        )
+        for call_id, call in calls.items():
+            if call["stage"] != "generate" or not (
+                call_id in requested or call.get("request_id") in requested
+            ):
+                continue
+            extra_requests_known &= bool(first_call)
+            selected_calls[call_id] = call
+            categories = {
+                (row.get("output") or {}).get("validation_category", "unknown_validation")
+                for row in call.get("validations", [])
+                if row.get("success") is False and "error_summary" in (row.get("output") or {})
+            }
+            if call.get("error_type"):
+                categories.add("call_error")
+            for category in categories:
+                entry = affected.setdefault(
+                    category, {"calls": set(), "inputs": set(), "paths": set()}
+                )
+                entry["calls"].add(call_id)
+                entry["inputs"].add(path["case_id"])
+                entry["paths"].add(path["path_id"])
+    semantic_requests = {row.get("request_id", row["call_id"]) for row in selected_calls.values()}
+    return {
+        "generation_metrics": {
+            "first_draft": {
+                "passed": first_passed,
+                "failed": first_failed,
+                "unknown": len(paths) - first_passed - first_failed,
+                "denominator": len(paths),
+                "pass_rate": first_passed / len(paths) if paths else None,
+            },
+            "final_valid": {
+                "count": final_valid,
+                "denominator": len(paths),
+                "rate": final_valid / len(paths) if paths else None,
+            },
+            "recovery": {
+                "recovered": recovered,
+                "denominator": first_failed,
+                "rate": recovered / first_failed if first_failed else None,
+            },
+            "extra_requests": {
+                "physical_sends": (
+                    len(selected_calls) - len(first_requests) if extra_requests_known else None
+                ),
+                "semantic_requests": (
+                    len(semantic_requests - first_requests) if extra_requests_known else None
+                ),
+            },
+        },
+        "generation_errors": {
+            category: {
+                "frequency": len(entry["calls"]),
+                "affected_inputs": sorted(entry["inputs"]),
+                "affected_paths": sorted(entry["paths"]),
+                "source_call_ids": sorted(entry["calls"]),
+                "reproducibility": "unknown",
+                "causal_attribution": "unknown",
+            }
+            for category, entry in sorted(affected.items())
         },
     }
 
@@ -190,10 +308,15 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
     def group(selected: list[dict[str, Any]]) -> dict[str, Any]:
-        logical = []
+        logical: list[dict[str, Any]] = []
         for path in selected:
             requested = set().union(
                 *(_source_ids(manifest, path["path_id"], stage) for stage in stages)
+            )
+            requested.update(
+                row.get("request_id", row["call_id"])
+                for row in calls
+                if row["call_id"] in requested
             )
             logical.extend(
                 row
@@ -203,6 +326,7 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
         return {
             "stages": {stage: _counts(manifest, selected, stage) for stage in stages},
             "logical": _account_calls(logical),
+            **_generation_evidence(manifest, selected),
         }
 
     bad_cases, disagreements = [], []
@@ -272,6 +396,7 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
         "planned_paths": len(paths),
         "input_cases": len({p["case_id"] for p in paths}),
         "stages": {stage: _counts(manifest, paths, stage) for stage in stages},
+        **_generation_evidence(manifest, paths),
         "physical": _account_calls(calls),
         "physical_by_stage": {
             stage: _account_calls([row for row in calls if row["stage"] == stage])
@@ -295,16 +420,25 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
             "agreement": agreement,
             "kappa": (
                 (agreement - expected) / (1 - expected)
-                if expected is not None and expected != 1
+                if agreement is not None and expected is not None and expected != 1
                 else None
             ),
         },
         "provenance": manifest["frozen"]["dataset"].get("provenance", "unspecified"),
         "limitations": [
             "Judge/reference agreement measures two model judgements, not human gold accuracy.",
-            "Logical arm estimates allocate reused physical calls independently; they are not extra billed calls.",
-            "Provider latency is per-send time, not task end-to-end latency or a throughput benchmark.",
-            "Exploration selects hypotheses; improvements require a separately frozen confirmation run.",
+            (
+                "Logical arm estimates allocate reused physical calls independently; "
+                "they are not extra billed calls."
+            ),
+            (
+                "Provider latency is per-send time, not task end-to-end latency "
+                "or a throughput benchmark."
+            ),
+            (
+                "Exploration selects hypotheses; improvements require "
+                "a separately frozen confirmation run."
+            ),
         ],
     }
 
@@ -312,8 +446,13 @@ def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
 def interview_brief(report: dict[str, Any]) -> str:
     """Keep local interview wording tied to measured counts and explicit attribution."""
     return (
-        f"# 真实质量探索证据（本地）\n\n运行：{report['run_id']}；输入 {report['input_cases']}；计划路径 {report['planned_paths']}。\n\n"
-        f"结构有效 {report['stages']['generation']['success']}；Judge 通过 {report['stages']['judge']['success']}；参考通过 {report['stages']['reference']['success']}，分母均为全部计划路径。\n\n"
-        f"实际物理调用 {report['physical']['call_count']}；已知费用小计 {report['physical']['cost']['known_subtotal']}；完整费用 {report['physical']['cost']['total']}。未知费用不按零处理。\n\n"
+        f"# 真实质量探索证据（本地）\n\n运行：{report['run_id']}；输入 {report['input_cases']}；"
+        f"计划路径 {report['planned_paths']}。\n\n"
+        f"结构有效 {report['stages']['generation']['success']}；"
+        f"Judge 通过 {report['stages']['judge']['success']}；"
+        f"参考通过 {report['stages']['reference']['success']}，分母均为全部计划路径。\n\n"
+        f"实际物理调用 {report['physical']['call_count']}；"
+        f"已知费用小计 {report['physical']['cost']['known_subtotal']}；"
+        f"完整费用 {report['physical']['cost']['total']}。未知费用不按零处理。\n\n"
         "参考评审来自模型，不能宣称人工金标准或已证明质量提升。用户负责方案决策与人工核验，AI 辅助编码，执行器自动运行，Judge 与参考模型提供各自判断。\n"
     )
