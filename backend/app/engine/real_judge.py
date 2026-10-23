@@ -87,7 +87,7 @@ def run_judge(
     profile = config["profiles"]["judge"]
     model = profile["model_name"]
     policies = judge_policies(frozen["templates"], judge["calibration"])
-    transport = client.with_options(max_retries=0, timeout=config["generation"]["timeout_seconds"])
+    transport = client.with_options(max_retries=0, timeout=judge["timeout_seconds"])
     results = manifest.setdefault("judge_results", {})
     for planned in manifest["execution_plan"]:
         if path_ids is not None and planned["path_id"] not in path_ids:
@@ -164,6 +164,7 @@ def run_judge(
                         model=model,
                         messages=messages,
                         temperature=judge["temperature"],
+                        max_tokens=judge["max_output_tokens"],
                         response_format={"type": "json_object"},
                     ),
                 )

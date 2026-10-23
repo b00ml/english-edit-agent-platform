@@ -464,7 +464,18 @@ def generate_structured(
                             else {"binding": "environment"}
                         ),
                     },
-                    output_data={"error_summary": summary},
+                    output_data={
+                        "error_summary": summary,
+                        "validation_category": (
+                            "json_syntax"
+                            if isinstance(exc, json.JSONDecodeError)
+                            else (
+                                "content_rule"
+                                if isinstance(exc, ContentValidationError)
+                                else "schema"
+                            )
+                        ),
+                    },
                     snapshot_data={
                         "messages": messages,
                         "response_text": text,

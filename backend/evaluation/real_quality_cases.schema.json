@@ -18,9 +18,13 @@
   "$defs": {
     "case": {
       "type": "object", "additionalProperties": false,
-      "required": ["case_id", "template_id", "params"],
+      "required": ["case_id", "template_id", "params", "source_family", "teaching_goal", "scope", "judgment_basis"],
       "properties": {
         "case_id": {"type": "string", "minLength": 1},
+        "source_family": {"type": "string", "pattern": "\\S"},
+        "teaching_goal": {"type": "string", "pattern": "\\S"},
+        "scope": {"type": "string", "pattern": "\\S"},
+        "judgment_basis": {"type": "string", "pattern": "\\S"},
         "template_id": {"enum": ["single_choice", "cloze", "reading"]},
         "params": {
           "type": "object", "additionalProperties": false,

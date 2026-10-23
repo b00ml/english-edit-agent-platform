@@ -58,7 +58,12 @@ def local_manifest():
         "frozen": {
             "templates": {"single_choice": template},
             "config": {
-                "generation": {"temperature": 0.4, "timeout_seconds": 45},
+                "generation": {
+                    "temperature": 0.4,
+                    "timeout_seconds": 45,
+                    "max_output_tokens": 2048,
+                    "context_limit_tokens": 8192,
+                },
                 "profiles": {"generation": {"model_name": "fixture-model"}},
                 "prices": {
                     "fixture-model": {
@@ -161,6 +166,7 @@ def test_shared_valid_draft_has_one_physical_trace_and_three_revalidated_paths(t
     assert len(client.requests) == len(traces) == len(saved["provider_calls"]) == 1
     assert client.options == {"max_retries": 0, "timeout": 45}
     assert client.requests[0]["temperature"] == 0.4
+    assert client.requests[0]["max_tokens"] == 2048
     assert "self-authored revision" in client.requests[0]["messages"][1]["content"]
     assert all(p["state"] == "completed" for p in saved["execution_plan"])
     assert [p["payload"] for p in saved["generation_results"].values()] == [VALID] * 3
@@ -291,6 +297,8 @@ def test_fixed_teaching_cardinality_is_enforced_by_real_validator(
     manifest["frozen"]["templates"] = {template_id: original}
     case = manifest["frozen"]["dataset"]["sets"]["exploration"][0]
     case["template_id"] = template_id
+    if template_id == "reading":
+        case["params"]["topic"] = "test-only volcanic island conservation"
     case["params"]["blank_count" if template_id == "cloze" else "question_count"] = count
     manifest["execution_plan"] = manifest["execution_plan"][:1]
     item = dict(VALID)
@@ -301,6 +309,8 @@ def test_fixed_teaching_cardinality_is_enforced_by_real_validator(
     assert manifest["execution_plan"][0]["state"] == "failed"
     assert len(client.requests) == 1
     assert str(count) in client.requests[0]["messages"][1]["content"]
+    if template_id == "reading":
+        assert case["params"]["topic"] in client.requests[0]["messages"][1]["content"]
     assert original["output_schema"]["properties"][field].get("maxItems") != count
 
 
