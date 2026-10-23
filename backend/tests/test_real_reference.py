@@ -14,7 +14,7 @@ def manifest_fixture():
     config = manifest["frozen"]["config"]
     config["profiles"]["reference"] = {"model_name": "fixture-reference", "model_family": "ref"}
     config["prices"]["fixture-reference"] = config["prices"]["fixture-model"]
-    manifest["protocol"] = {"reference_max_format_repairs": 2}
+    manifest["protocol"]["reference_max_format_repairs"] = 2
     manifest["generation_results"] = {}
     for planned in manifest["execution_plan"]:
         planned["state"] = "completed"

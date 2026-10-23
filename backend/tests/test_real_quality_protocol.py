@@ -37,7 +37,12 @@ def test_execute_review_cli_runs_verified_frozen_service(
     config = tmp_path / "config.json"
     config.write_text(json.dumps(runtime_config), "utf-8")
     manifest = freeze_protocol(
-        dataset_path=dataset_path, config_path=config, backend=BACKEND, run_id="judge-cli", seed=21
+        dataset_path=dataset_path,
+        config_path=config,
+        backend=BACKEND,
+        run_id="judge-cli",
+        seed=21,
+        set_name="smoke",
     )
     first = next(row for row in manifest["execution_plan"] if "single_choice" in row["case_id"])
     first["state"] = "completed"
@@ -51,7 +56,7 @@ def test_execute_review_cli_runs_verified_frozen_service(
                 for rule in manifest["frozen"]["templates"][
                     next(
                         case["template_id"]
-                        for case in manifest["frozen"]["dataset"]["sets"]["exploration"]
+                        for case in manifest["frozen"]["dataset"]["sets"]["smoke"]
                         if case["case_id"] == first["case_id"]
                     )
                 ]["quality_rules"]
@@ -107,7 +112,7 @@ def test_execute_review_cli_runs_verified_frozen_service(
         if role == "judge"
         else accounting["full_plan_denominator"]
     )
-    assert denominator == 90
+    assert denominator == 9
 
 
 @pytest.fixture

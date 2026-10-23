@@ -231,6 +231,14 @@ def _interview_brief(evaluation: dict, summary: dict) -> str:
 
 
 def main() -> int:
+    from app.engine.real_experiment import (
+        build_evidence_report,
+        interview_brief,
+        record_smoke_review,
+        require_reviewed_smoke,
+        run_experiment,
+    )
+
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run")
@@ -248,6 +256,7 @@ def main() -> int:
     freeze.add_argument("--output", type=Path, required=True)
     freeze.add_argument("--run-id", required=True)
     freeze.add_argument("--seed", type=int, required=True)
+    freeze.add_argument("--set-name", choices=("smoke", "exploration"), default="exploration")
     resume = subparsers.add_parser("resume", help="Validate frozen inputs without replaying calls")
     resume.add_argument("--manifest", type=Path, required=True)
     resume.add_argument("--dataset", type=Path, required=True)
@@ -257,16 +266,39 @@ def main() -> int:
         "execute-judge": ("judge", run_judge),
         "execute-reference": ("reference", run_reference_review),
     }
-    for command in executors:
+    for command in (*executors, "execute-experiment", "review-smoke", "evidence"):
         execute = subparsers.add_parser(
-            command, help="Explicitly execute frozen evaluation; may incur provider charges"
+            command,
+            help=(
+                "Explicitly execute frozen evaluation; may incur provider charges"
+                if command.startswith("execute-")
+                else "Review or export local evidence without provider calls"
+            ),
         )
         execute.add_argument("--manifest", type=Path, required=True)
         execute.add_argument("--dataset", type=Path, required=True)
         execute.add_argument("--config", type=Path, required=True)
+        if command.startswith("execute-"):
+            execute.add_argument("--reviewed-smoke", type=Path)
+        elif command == "review-smoke":
+            execute.add_argument(
+                "--inspected",
+                action="store_true",
+                required=True,
+                help="Acknowledge inspecting contexts, blind inputs, Trace, usage and persistence",
+            )
+        elif command == "evidence":
+            execute.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    if args.command in {"freeze", "resume", *executors}:
+    if args.command in {
+        "freeze",
+        "resume",
+        *executors,
+        "execute-experiment",
+        "review-smoke",
+        "evidence",
+    }:
         try:
             if args.command == "freeze":
                 manifest = freeze_protocol(
@@ -275,6 +307,7 @@ def main() -> int:
                     backend=BACKEND,
                     run_id=args.run_id,
                     seed=args.seed,
+                    set_name=args.set_name,
                 )
                 write_manifest(args.output, manifest)
             else:
@@ -284,14 +317,42 @@ def main() -> int:
                     config_path=args.config,
                     backend=BACKEND,
                 )
-                if args.command in executors:
+                if args.command == "review-smoke":
+                    record_smoke_review(manifest)
+                    write_manifest(args.manifest, manifest, overwrite=True)
+                    print(json.dumps(manifest["operator_review"]))
+                    return 0
+                if args.command == "evidence":
+                    report = build_evidence_report(manifest)
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(report, ensure_ascii=False, indent=2), "utf-8"
+                    )
+                    args.output.with_suffix(".md").write_text(interview_brief(report), "utf-8")
+                    return 0
+                if args.command in executors or args.command == "execute-experiment":
+                    smoke = (
+                        resume_manifest(
+                            manifest_path=args.reviewed_smoke,
+                            dataset_path=args.dataset,
+                            config_path=args.config,
+                            backend=BACKEND,
+                        )
+                        if args.reviewed_smoke
+                        else None
+                    )
+                    require_reviewed_smoke(manifest, smoke)
                     from app.database import SessionLocal
 
                     with SessionLocal() as session:
                         clients = verified_clients(manifest, session)
-                    role, executor = executors[args.command]
-                    executor(args.manifest, manifest, client=clients[role])
-                    print(json.dumps(manifest[f"{role}_accounting"]))
+                    if args.command == "execute-experiment":
+                        run_experiment(args.manifest, manifest, clients=clients, smoke=smoke)
+                        print(json.dumps(build_evidence_report(manifest), ensure_ascii=False))
+                    else:
+                        role, executor = executors[args.command]
+                        executor(args.manifest, manifest, client=clients[role])
+                        print(json.dumps(manifest[f"{role}_accounting"]))
                     return 0
                 print(
                     json.dumps(
