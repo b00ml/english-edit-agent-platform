@@ -1,9 +1,12 @@
 type_id: reading
 name: 阅读理解
-version: 3
+version: 4
 input_schema:
   type: object
   properties:
+    grade: {type: integer, minimum: 1, maximum: 12}
+    constraints: {type: string}
+    question_count: {type: integer, minimum: 1}
     knowledge_point: {type: string}
     difficulty: {type: string, enum: [易, 中, 难]}
     quantity: {type: integer, minimum: 1, maximum: 50}

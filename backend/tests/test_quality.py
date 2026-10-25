@@ -179,3 +179,25 @@ class TestRunQualityCheckJudgeModelChain:
         monkeypatch.setattr(settings, "JUDGE_MODEL_NAME", "")
         model, _, _ = self._run(monkeypatch, "")
         assert model == settings.LLM_MODEL_NAME
+
+
+class TestJudgeOutputCap:
+    def test_judge_call_passes_configured_max_tokens(self, monkeypatch):
+        from app.engine.quality import _call_judge_once
+
+        captured = {}
+
+        class _Completions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(message=SimpleNamespace(content='{"dimension_scores": {}}'))
+                    ],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                )
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+        monkeypatch.setattr(settings, "JUDGE_MAX_OUTPUT_TOKENS", 2048)
+        _call_judge_once(client, "judge-model", "sys", "user", ["kp_match"])
+        assert captured["max_tokens"] == 2048

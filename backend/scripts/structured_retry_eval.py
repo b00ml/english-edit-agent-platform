@@ -1,4 +1,4 @@
-"""Run the frozen structured-output retry cases with a deterministic offline adapter."""
+"""Freeze, validate, or explicitly execute structured-output evaluation inputs."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import yaml
 
@@ -17,6 +18,14 @@ BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
 from app.engine import structured_output  # noqa: E402
+from app.engine.evaluation_protocol import (  # noqa: E402
+    freeze_protocol,
+    resume_manifest,
+    write_manifest,
+)
+from app.engine.real_evaluation import run_generation, verified_clients  # noqa: E402
+from app.engine.real_judge import run_judge  # noqa: E402
+from app.engine.real_reference import run_reference_review  # noqa: E402
 from app.engine.reference_review import (  # noqa: E402
     ReferenceAssessment,
     build_review_packets,
@@ -97,6 +106,7 @@ def _run_arm(cases: list[dict], templates: dict, max_retry: int, feedback: bool)
                 trace_id=f"offline-eval:{case['case_id']}:{max_retry}:{feedback}",
                 response_adapter=adapter,
                 retry_feedback=feedback,
+                trace_sink=lambda **row: None,
             )
             success = True
             failure = None
@@ -222,6 +232,14 @@ def _interview_brief(evaluation: dict, summary: dict) -> str:
 
 
 def main() -> int:
+    from app.engine.real_experiment import (
+        build_evidence_report,
+        interview_brief,
+        record_smoke_review,
+        require_reviewed_smoke,
+        run_experiment,
+    )
+
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run")
@@ -231,7 +249,299 @@ def main() -> int:
     review.add_argument("--evaluation", type=Path, required=True)
     review.add_argument("--assessments", type=Path, required=True)
     review.add_argument("--output", type=Path, required=True)
+    freeze = subparsers.add_parser(
+        "freeze", help="Freeze explicitly supplied local evaluation inputs"
+    )
+    freeze.add_argument("--dataset", type=Path, required=True)
+    freeze.add_argument("--config", type=Path, required=True)
+    freeze.add_argument("--output", type=Path, required=True)
+    freeze.add_argument("--run-id", required=True)
+    freeze.add_argument("--seed", type=int, required=True)
+    freeze.add_argument("--set-name", choices=("smoke", "exploration"), default="exploration")
+    confirmation_freeze = subparsers.add_parser("freeze-confirmation")
+    confirmation_freeze.add_argument("--source", type=Path, required=True)
+    confirmation_freeze.add_argument("--selection", type=Path, required=True)
+    confirmation_freeze.add_argument("--observations", type=Path, action="append", default=[])
+    confirmation_freeze.add_argument("--run-id", required=True)
+    confirmation_freeze.add_argument("--seed", type=int, required=True)
+    confirmation_freeze.add_argument("--output", type=Path, required=True)
+    amend_reference = subparsers.add_parser("amend-reference")
+    amend_reference.add_argument("--manifest", type=Path, required=True)
+    amend_reference.add_argument(
+        "--reference-model",
+        type=Path,
+        required=True,
+        help="JSON file with the complete changed reference profile and price",
+    )
+    rereview_freeze = subparsers.add_parser("freeze-rereview")
+    rereview_freeze.add_argument("--source", type=Path, required=True)
+    rereview_freeze.add_argument("--run-id", required=True)
+    rereview_freeze.add_argument("--seed", type=int, required=True)
+    rereview_freeze.add_argument("--output", type=Path, required=True)
+    for name in ("execute-rereview", "evidence-package"):
+        rereview = subparsers.add_parser(name)
+        rereview.add_argument("--manifest", type=Path, required=True)
+        if name == "execute-rereview":
+            rereview.add_argument("--reviewed-smoke", type=Path, required=True)
+        else:
+            rereview.add_argument("--output", type=Path, required=True)
+    for name in ("execute-confirmation", "confirmation-evidence"):
+        confirmation = subparsers.add_parser(name)
+        confirmation.add_argument("--manifest", type=Path, required=True)
+        if name == "execute-confirmation":
+            confirmation.add_argument("--reviewed-smoke", type=Path)
+            confirmation.add_argument("--path-limit", type=int)
+        else:
+            confirmation.add_argument("--output", type=Path, required=True)
+    resume = subparsers.add_parser("resume", help="Validate frozen inputs without replaying calls")
+    resume.add_argument("--manifest", type=Path, required=True)
+    resume.add_argument("--dataset", type=Path, required=True)
+    resume.add_argument("--config", type=Path, required=True)
+    executors = {
+        "execute-generation": ("generation", run_generation),
+        "execute-judge": ("judge", run_judge),
+        "execute-reference": ("reference", run_reference_review),
+    }
+    for command in (*executors, "execute-experiment", "review-smoke", "evidence"):
+        execute = subparsers.add_parser(
+            command,
+            help=(
+                "Explicitly execute frozen evaluation; may incur provider charges"
+                if command.startswith("execute-")
+                else "Review or export local evidence without provider calls"
+            ),
+        )
+        execute.add_argument("--manifest", type=Path, required=True)
+        execute.add_argument("--dataset", type=Path, required=True)
+        execute.add_argument("--config", type=Path, required=True)
+        if command.startswith("execute-"):
+            execute.add_argument("--reviewed-smoke", type=Path)
+        elif command == "review-smoke":
+            execute.add_argument(
+                "--inspected",
+                action="store_true",
+                required=True,
+                help="Acknowledge inspecting contexts, blind inputs, Trace, usage and persistence",
+            )
+        elif command == "evidence":
+            execute.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.command in {"freeze-rereview", "execute-rereview", "evidence-package"}:
+        from app.engine.real_rereview import (
+            build_evidence_package,
+            freeze_rereview,
+            run_rereview,
+            validate_rereview,
+        )
+
+        try:
+            if args.command == "freeze-rereview":
+                bundle = freeze_rereview(
+                    json.loads(args.source.read_text("utf-8")),
+                    run_id=args.run_id,
+                    seed=args.seed,
+                )
+                write_manifest(args.output, bundle)
+            else:
+                bundle = json.loads(args.manifest.read_text("utf-8"))
+                validate_rereview(bundle)
+                if args.command == "execute-rereview":
+                    original = bundle["original"]
+                    source = original.get("source", original)
+                    smoke = json.loads(args.reviewed_smoke.read_text("utf-8"))
+                    require_reviewed_smoke(source, smoke)
+                    client_cache: dict[str, Any] = {}
+
+                    def rereview_clients(run: dict[str, Any]) -> dict[str, Any]:
+                        from app.database import SessionLocal
+
+                        identity = canonical_hash(run["frozen"]["config"])
+                        if identity not in client_cache:
+                            with SessionLocal() as session:
+                                client_cache[identity] = verified_clients(run, session)
+                        return client_cache[identity]
+
+                    run_rereview(args.manifest, bundle, clients=rereview_clients)
+                else:
+                    package = build_evidence_package(bundle)
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(package["local"], ensure_ascii=False, indent=2), "utf-8"
+                    )
+                    args.output.with_suffix(".md").write_text(package["summary_zh"], "utf-8")
+                    args.output.with_name(args.output.stem + ".public-candidate.json").write_text(
+                        json.dumps(package["public_candidate"], ensure_ascii=False, indent=2),
+                        "utf-8",
+                    )
+            print(
+                json.dumps(
+                    {
+                        "identity": bundle["identity"],
+                        "selected": len(bundle["selection"]),
+                        "published": False,
+                    }
+                )
+            )
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return 0
+
+    if args.command in {
+        "freeze-confirmation",
+        "execute-confirmation",
+        "confirmation-evidence",
+        "amend-reference",
+    }:
+        from app.engine.real_confirmation import (
+            amend_reference_instrument,
+            confirmation_report,
+            freeze_confirmation,
+            run_confirmation,
+            validate_confirmation,
+        )
+
+        def read_json(path: Path) -> dict[str, Any]:
+            return json.loads(path.read_text("utf-8"))
+
+        try:
+            if args.command == "freeze-confirmation":
+                bundle = freeze_confirmation(
+                    read_json(args.source),
+                    read_json(args.selection),
+                    run_id=args.run_id,
+                    seed=args.seed,
+                    observations=[read_json(path) for path in args.observations],
+                )
+                write_manifest(args.output, bundle)
+            elif args.command == "amend-reference":
+                bundle = read_json(args.manifest)
+                validate_confirmation(bundle)
+                override = read_json(args.reference_model)
+                amend_reference_instrument(
+                    bundle, profile=override["profile"], price=override["price"]
+                )
+                write_manifest(args.manifest, bundle, overwrite=True)
+            else:
+                bundle = read_json(args.manifest)
+                validate_confirmation(bundle)
+                if args.command == "execute-confirmation":
+                    smoke = read_json(args.reviewed_smoke) if args.reviewed_smoke else None
+                    factor = bundle["selection"].get("factor")
+                    if factor not in {None, "judge_threshold", "judge_weights"}:
+                        require_reviewed_smoke(bundle["source"], smoke)
+                    cache: dict[str, Any] = {}
+
+                    def clients(run: dict[str, Any]) -> dict[str, Any]:
+                        from app.database import SessionLocal
+                        from app.engine.evaluation_protocol import canonical_hash
+
+                        identity = canonical_hash(run["frozen"]["config"])
+                        if identity not in cache:
+                            with SessionLocal() as session:
+                                cache[identity] = verified_clients(run, session)
+                        return cache[identity]
+
+                    run_confirmation(
+                        args.manifest,
+                        bundle,
+                        clients=clients,
+                        smoke=smoke,
+                        path_limit=args.path_limit,
+                    )
+                else:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(confirmation_report(bundle), ensure_ascii=False, indent=2),
+                        "utf-8",
+                    )
+            print(
+                json.dumps(
+                    {
+                        "decision_identity": bundle["identity"],
+                        "planned_paths": len(bundle["execution_plan"]),
+                    }
+                )
+            )
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return 0
+
+    if args.command in {
+        "freeze",
+        "resume",
+        *executors,
+        "execute-experiment",
+        "review-smoke",
+        "evidence",
+    }:
+        try:
+            if args.command == "freeze":
+                manifest = freeze_protocol(
+                    dataset_path=args.dataset,
+                    config_path=args.config,
+                    backend=BACKEND,
+                    run_id=args.run_id,
+                    seed=args.seed,
+                    set_name=args.set_name,
+                )
+                write_manifest(args.output, manifest)
+            else:
+                manifest = resume_manifest(
+                    manifest_path=args.manifest,
+                    dataset_path=args.dataset,
+                    config_path=args.config,
+                    backend=BACKEND,
+                )
+                if args.command == "review-smoke":
+                    record_smoke_review(manifest)
+                    write_manifest(args.manifest, manifest, overwrite=True)
+                    print(json.dumps(manifest["operator_review"]))
+                    return 0
+                if args.command == "evidence":
+                    report = build_evidence_report(manifest)
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(report, ensure_ascii=False, indent=2), "utf-8"
+                    )
+                    args.output.with_suffix(".md").write_text(interview_brief(report), "utf-8")
+                    return 0
+                if args.command in executors or args.command == "execute-experiment":
+                    smoke = (
+                        resume_manifest(
+                            manifest_path=args.reviewed_smoke,
+                            dataset_path=args.dataset,
+                            config_path=args.config,
+                            backend=BACKEND,
+                        )
+                        if args.reviewed_smoke
+                        else None
+                    )
+                    require_reviewed_smoke(manifest, smoke)
+                    from app.database import SessionLocal
+
+                    with SessionLocal() as session:
+                        clients = verified_clients(manifest, session)
+                    if args.command == "execute-experiment":
+                        run_experiment(args.manifest, manifest, clients=clients, smoke=smoke)
+                        print(json.dumps(build_evidence_report(manifest), ensure_ascii=False))
+                    else:
+                        role, executor = executors[args.command]
+                        executor(args.manifest, manifest, client=clients[role])
+                        print(json.dumps(manifest[f"{role}_accounting"]))
+                    return 0
+                print(
+                    json.dumps(
+                        {
+                            "run_id": manifest["run_id"],
+                            "compatible": True,
+                            "provider_calls_replayed": 0,
+                        }
+                    )
+                )
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return 0
 
     if args.command == "review":
         evaluation = json.loads(args.evaluation.read_text(encoding="utf-8"))
@@ -320,7 +630,6 @@ def main() -> int:
         path.stem: yaml.safe_load(path.read_text(encoding="utf-8"))
         for path in sorted((BACKEND / "app" / "templates").glob("*.yaml"))
     }
-    structured_output.record_trace = lambda **kwargs: None
     arms = {
         "single_attempt": _run_arm(cases, templates, 1, False),
         "blind_retry": _run_arm(cases, templates, 3, False),

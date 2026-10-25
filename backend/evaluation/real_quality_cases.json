@@ -1,0 +1,4 @@
+{
+  "version": "real-quality-cases-v1",
+  "sets": {"exploration": [], "confirmation": [], "smoke": []}
+}

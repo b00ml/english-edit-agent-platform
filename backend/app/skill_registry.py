@@ -6,14 +6,21 @@
 import os
 from functools import lru_cache
 
+from app.prompt_loader import frozen_skill
+
 # skills 目录（backend/skills）
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "..", "skills")
 # 兜底技能：题型无专属技能时使用的通用出题规范
 _DEFAULT_SKILL = "generate_question"
 
 
-@lru_cache(maxsize=None)
 def get_skill_md(type_id: str) -> str:
+    frozen = frozen_skill(type_id, fallback=True)
+    return frozen if frozen is not None else _get_skill_md(type_id)
+
+
+@lru_cache(maxsize=None)
+def _get_skill_md(type_id: str) -> str:
     """读取 skills/{type_id}/SKILL.md 内容。
 
     优先匹配题型同名技能；缺失时回退到通用技能 generate_question；
@@ -27,8 +34,13 @@ def get_skill_md(type_id: str) -> str:
     return ""
 
 
-@lru_cache(maxsize=None)
 def get_skill_by_id(skill_id: str) -> str:
+    frozen = frozen_skill(skill_id)
+    return frozen if frozen is not None else _get_skill_by_id(skill_id)
+
+
+@lru_cache(maxsize=None)
+def _get_skill_by_id(skill_id: str) -> str:
     """按 skill_id 直接读取 skills/{skill_id}/SKILL.md，不做回退。
 
     用于跨题型的通用技能（如 judge 质检），与题型 type_id 解耦。
@@ -43,5 +55,5 @@ def get_skill_by_id(skill_id: str) -> str:
 
 def clear_cache() -> None:
     """清空技能缓存（开发/测试用，便于重载）。"""
-    get_skill_md.cache_clear()
-    get_skill_by_id.cache_clear()
+    _get_skill_md.cache_clear()
+    _get_skill_by_id.cache_clear()

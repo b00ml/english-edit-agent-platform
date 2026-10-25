@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "sets"],
+  "properties": {
+    "version": {"const": "real-quality-cases-v1"},
+    "sets": {
+      "type": "object", "additionalProperties": false,
+      "required": ["exploration", "confirmation", "smoke"],
+      "properties": {
+        "exploration": {"type": "array", "items": {"$ref": "#/$defs/case"}},
+        "confirmation": {"type": "array", "items": {"$ref": "#/$defs/case"}},
+        "smoke": {"type": "array", "items": {"$ref": "#/$defs/case"}}
+      }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "template_id", "params", "source_family", "teaching_goal", "scope", "judgment_basis"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1},
+        "source_family": {"type": "string", "pattern": "\\S"},
+        "teaching_goal": {"type": "string", "pattern": "\\S"},
+        "scope": {"type": "string", "pattern": "\\S"},
+        "judgment_basis": {"type": "string", "pattern": "\\S"},
+        "template_id": {"enum": ["single_choice", "cloze", "reading"]},
+        "params": {
+          "type": "object", "additionalProperties": false,
+          "required": ["grade", "difficulty", "quantity", "knowledge_point", "constraints"],
+          "properties": {
+            "grade": {"const": 10}, "difficulty": {"const": "中"}, "quantity": {"const": 1},
+            "knowledge_point": {"type": "string", "minLength": 1},
+            "constraints": {"type": "string", "minLength": 1},
+            "topic": {"type": "string", "minLength": 1},
+            "blank_count": {"const": 5}, "question_count": {"const": 3}
+          }
+        }
+      }
+    }
+  }
+}

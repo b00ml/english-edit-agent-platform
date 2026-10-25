@@ -47,6 +47,24 @@ class StructuredOutputError(PlatformError):
     code = "STRUCTURED_OUTPUT_FAILED"
 
 
+class EvaluationUnresolvedError(PlatformError):
+    """A provider request may have been accepted; an automatic resend is forbidden."""
+
+    code = "EVALUATION_UNRESOLVED"
+
+
+class EvaluationTransportError(PlatformError):
+    """Transport evidence, never inferred from an HTTP status or a timeout alone."""
+
+    code = "EVALUATION_TRANSPORT_FAILED"
+
+    def __init__(self, *, accepted: bool | None, completed: bool | None, transient: bool) -> None:
+        super().__init__("Evaluation transport request failed")
+        self.accepted = accepted
+        self.completed = completed
+        self.transient = transient
+
+
 class QualityCheckError(PlatformError):
     """自动质检所有采样均未返回有效结果。"""
 

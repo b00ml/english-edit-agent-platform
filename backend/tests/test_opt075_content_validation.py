@@ -63,7 +63,7 @@ def test_builtin_valid_and_nonmutating(name):
     assert enforce_content(value, t["output_schema"], t["run_config"]).valid
     assert value == before
     assert _validate_template(t) == []
-    assert t["version"] == 3
+    assert t["version"] == 4
 
 
 @pytest.mark.parametrize(

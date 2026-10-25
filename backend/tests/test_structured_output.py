@@ -285,3 +285,12 @@ class TestGenerateStructuredRetry:
         assert "error_summary" in failed["output_data"]
         assert ok["attempt"] == 2 and ok["success"] is True
         assert ok["output_data"] == {"stem": "s", "answer": "A"}
+
+
+class TestExplicitOutputCap:
+    def test_generation_passes_configured_max_tokens(self, monkeypatch):
+        monkeypatch.setattr(settings, "LLM_MAX_OUTPUT_TOKENS", 8192)
+        calls, _, outcome = _run_generate(monkeypatch, ['{"stem": "s", "answer": "A"}'])
+        assert outcome["value"] == {"stem": "s", "answer": "A"}
+        # 供应商默认输出上限（deepseek 4096）会截断长题 JSON，必须显式传递配置上限
+        assert all(call["max_tokens"] == 8192 for call in calls)

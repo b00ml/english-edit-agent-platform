@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     # 生成/judge 采样温度（此前硬编码于引擎，配置化对齐"全配置驱动"口径）
     LLM_TEMPERATURE: float = 0.7
     JUDGE_TEMPERATURE: float = 0.3
+    # 单次生成/质检请求最大输出 token。显式上限避免供应商默认值（deepseek 为 4096）
+    # 截断长题 JSON——实测打满默认上限的生成 100% 因截断校验失败（OPT-093）。
+    LLM_MAX_OUTPUT_TOKENS: int = 8192
+    JUDGE_MAX_OUTPUT_TOKENS: int = 2048
     # 分模型价目表（每 1K token 单价）：{"模型名": {"prompt": x, "completion": y}}。
     # 未命中的模型回退 COST_PER_1K_TOKENS 单一单价（历史数据口径不变）。
     MODEL_PRICES: dict[str, Any] = (

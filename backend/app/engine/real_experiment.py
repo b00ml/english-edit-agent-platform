@@ -1,0 +1,466 @@
+"""Compose frozen evaluation stages and report their durable local evidence."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from app.engine.evaluation_protocol import canonical_hash, write_manifest
+from app.engine.real_evaluation import run_generation
+from app.engine.real_judge import run_judge
+from app.engine.real_reference import run_reference_review
+from app.engine.reference_review import model_agreement
+from app.engine.trace import record_trace
+
+_TERMINAL_PLAN_STATES = {"completed", "failed", "cancelled"}
+_TERMINAL_STAGE_STATES = {"completed", "missing", "failed", "unresolved"}
+
+
+def _smoke_evidence(smoke: dict[str, Any]) -> str:
+    plan = smoke["execution_plan"]
+    calls = smoke.get("provider_calls", [])
+    generation_results = smoke.get("generation_results", {})
+    stage_results = {
+        stage: smoke.get(stage, {}) for stage in ("judge_results", "reference_results")
+    }
+    if (
+        smoke["protocol"].get("set_name") != "smoke"
+        or len(plan) != 9
+        or not all(row["state"] in _TERMINAL_PLAN_STATES for row in plan)
+        or not all(
+            stage_results[stage].get(row["path_id"], {}).get("state", "missing")
+            in _TERMINAL_STAGE_STATES
+            for stage in stage_results
+            for row in plan
+        )
+        # A valid generation payload without its Judge/reference entry is a real gap;
+        # missing entries are only legitimate where generation produced no payload.
+        or any(
+            stage_results[stage].get(row["path_id"], {}).get("state", "missing") == "missing"
+            and "payload" in generation_results.get(row["path_id"], {})
+            for stage in stage_results
+            for row in plan
+        )
+        or not {"generate", "qc", "reference_solve", "reference_review"}.issubset(
+            {row["stage"] for row in calls}
+        )
+        or not all(row.get("trace_state") == "completed" for row in calls)
+    ):
+        raise ValueError("Smoke execution and Trace persistence must be complete before review")
+    return canonical_hash(
+        {
+            "identities": smoke["identities"],
+            "plan": plan,
+            "calls": calls,
+            "generation": smoke.get("generation_results"),
+            "judge": smoke["judge_results"],
+            "reference": smoke["reference_results"],
+        }
+    )
+
+
+def record_smoke_review(smoke: dict[str, Any]) -> None:
+    """Record an explicit operator acknowledgement only after inspecting actual smoke evidence."""
+    smoke["operator_review"] = {
+        "evidence_hash": _smoke_evidence(smoke),
+        "reviewed_at": datetime.now(UTC).isoformat(),
+        "scope": (
+            "contexts, blind inputs, Trace, usage, local persistence, "
+            "failed and unresolved outcomes inspected"
+        ),
+    }
+
+
+def require_reviewed_smoke(manifest: dict[str, Any], smoke: dict[str, Any] | None) -> None:
+    """Block formal sends until separately executed smoke evidence has been acknowledged."""
+    if manifest["protocol"].get("set_name") == "smoke":
+        return
+    if smoke is None or smoke.get("operator_review", {}).get("evidence_hash") != _smoke_evidence(
+        smoke
+    ):
+        raise ValueError("Exploration requires reviewed smoke evidence")
+    exploration_assets = {k: v for k, v in manifest["identities"].items() if k != "execution_plan"}
+    smoke_assets = {k: v for k, v in smoke["identities"].items() if k != "execution_plan"}
+    if exploration_assets != smoke_assets:
+        raise ValueError("Reviewed smoke does not match frozen exploration assets/config/dataset")
+
+
+def run_experiment(
+    path: Path,
+    manifest: dict[str, Any],
+    *,
+    clients: dict[str, Any],
+    smoke: dict[str, Any] | None = None,
+    trace_sink: Callable[..., bool | None] = record_trace,
+) -> dict[str, Any]:
+    """Resume generation, production Judge and independent reference through existing services."""
+    require_reviewed_smoke(manifest, smoke)
+    for role, executor in (
+        ("generation", run_generation),
+        ("judge", run_judge),
+        ("reference", run_reference_review),
+    ):
+        executor(path, manifest, client=clients[role], trace_sink=trace_sink)
+    write_manifest(path, manifest, overwrite=True)
+    return manifest
+
+
+def _source_ids(manifest: dict[str, Any], path_id: str, stage: str) -> set[str]:
+    row = manifest.get(f"{stage}_results", {}).get(path_id, {})
+    if stage == "generation":
+        return {attempt["source_call_id"] for attempt in row.get("attempts", [])}
+    return set(row.get("source_call_ids", []))
+
+
+def _counts(manifest: dict[str, Any], paths: list[dict[str, Any]], stage: str) -> dict[str, int]:
+    counts = {
+        key: 0
+        for key in (
+            "planned",
+            "submitted",
+            "completed",
+            "success",
+            "failure",
+            "cancelled",
+            "missing",
+            "unresolved",
+            "pending_review",
+        )
+    }
+    counts["planned"] = len(paths)
+    sent_ids = {
+        identity
+        for call in manifest.get("provider_calls", [])
+        for identity in (call["call_id"], call.get("request_id"))
+    }
+    for path in paths:
+        row = manifest.get(f"{stage}_results", {}).get(path["path_id"], {})
+        state = path["state"] if stage == "generation" else row.get("state", "missing")
+        counts["submitted"] += bool(_source_ids(manifest, path["path_id"], stage) & sent_ids)
+        counts["completed"] += state in {"completed", "failed"}
+        verdict = (
+            True
+            if stage == "generation"
+            else row.get("passed" if stage == "judge" else "reference_pass")
+        )
+        counts["success"] += state == "completed" and verdict is True
+        counts["failure"] += state == "failed" or (state == "completed" and verdict is False)
+        counts["cancelled"] += state == "cancelled"
+        counts["missing"] += state in {"missing", "planned"}
+        counts["unresolved"] += state in {"unresolved", "in_flight"}
+        counts["pending_review"] += (
+            stage == "reference" and bool(row.get("questions")) and verdict is None
+        )
+    return counts
+
+
+def _account_calls(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    known = [row for row in calls if row.get("cost") is not None]
+    currencies = sorted({row["currency"] for row in calls if row.get("currency")})
+    complete = (
+        len(known) == len(calls)
+        and len(currencies) <= 1
+        and all(row.get("trace_state") == "completed" for row in calls)
+    )
+    latencies = sorted(row["latency_ms"] for row in calls if row.get("latency_ms") is not None)
+    tokens = {}
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        observed = []
+        for row in calls:
+            usage = row.get("usage") or {}
+            value = usage.get(field)
+            if field == "total_tokens":
+                parts = [
+                    usage[name] for name in ("prompt_tokens", "completion_tokens") if name in usage
+                ]
+                value = (
+                    sum(parts)
+                    if len(parts) == 2 and all(type(v) is int and v >= 0 for v in parts)
+                    else None
+                )
+            if type(value) is int and value >= 0:
+                observed.append(value)
+        tokens[field] = {
+            "total": sum(observed) if len(observed) == len(calls) else None,
+            "known_subtotal": sum(observed),
+            "reported_calls": len(observed),
+            "denominator": len(calls),
+        }
+    return {
+        "call_count": len(calls),
+        "semantic_request_count": len({row.get("request_id", row["call_id"]) for row in calls}),
+        "cost": {
+            "complete": complete,
+            "total": sum(row["cost"] for row in known) if complete else None,
+            "known_subtotal": sum(row["cost"] for row in known) if len(currencies) <= 1 else None,
+            "known_by_currency": {
+                currency: sum(row["cost"] for row in known if row.get("currency") == currency)
+                for currency in currencies
+            },
+            "known_calls": len(known),
+            "denominator": len(calls),
+            "currencies": currencies,
+        },
+        "usage_coverage": {
+            "reported": sum(row.get("usage") is not None for row in calls),
+            "denominator": len(calls),
+        },
+        "tokens": tokens,
+        "trace_coverage": {
+            "persisted": sum(row.get("trace_state") == "completed" for row in calls),
+            "denominator": len(calls),
+        },
+        "provider_latency_ms": {
+            "observed_calls": len(latencies),
+            "sum": sum(latencies),
+            "p50": latencies[math.ceil(len(latencies) * 0.5) - 1] if latencies else None,
+            "p95": latencies[math.ceil(len(latencies) * 0.95) - 1] if latencies else None,
+        },
+    }
+
+
+def _generation_evidence(manifest: dict[str, Any], paths: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive path outcomes from validations, counting shared responses only once for errors."""
+    calls = {row["call_id"]: row for row in manifest.get("provider_calls", [])}
+    first_passed = first_failed = recovered = final_valid = 0
+    selected_calls: dict[str, dict[str, Any]] = {}
+    first_requests: set[str] = set()
+    extra_requests_known = True
+    affected: dict[str, dict[str, set[str]]] = {}
+    for path in paths:
+        attempts = (
+            manifest.get("generation_results", {}).get(path["path_id"], {}).get("attempts", [])
+        )
+        first: dict[str, Any] = next((row for row in attempts if row.get("attempt") == 1), {})
+        first_call = calls.get(first.get("source_call_id"), {})
+        verdicts = {
+            row["success"]
+            for row in first_call.get("validations", [])
+            if type(row.get("success")) is bool
+            and (row["success"] is True or "error_summary" in (row.get("output") or {}))
+        }
+        first_passed += verdicts == {True}
+        first_failed += verdicts == {False}
+        final_valid += path["state"] == "completed"
+        recovered += verdicts == {False} and path["state"] == "completed"
+        if first_call:
+            first_requests.add(first_call.get("request_id", first_call["call_id"]))
+        requested = {row["source_call_id"] for row in attempts}
+        requested.update(
+            calls[key].get("request_id", key) for key in list(requested) if key in calls
+        )
+        for call_id, call in calls.items():
+            if call["stage"] != "generate" or not (
+                call_id in requested or call.get("request_id") in requested
+            ):
+                continue
+            extra_requests_known &= bool(first_call)
+            selected_calls[call_id] = call
+            categories = {
+                (row.get("output") or {}).get("validation_category", "unknown_validation")
+                for row in call.get("validations", [])
+                if row.get("success") is False and "error_summary" in (row.get("output") or {})
+            }
+            if call.get("error_type"):
+                categories.add("call_error")
+            for category in categories:
+                entry = affected.setdefault(
+                    category, {"calls": set(), "inputs": set(), "paths": set()}
+                )
+                entry["calls"].add(call_id)
+                entry["inputs"].add(path["case_id"])
+                entry["paths"].add(path["path_id"])
+    semantic_requests = {row.get("request_id", row["call_id"]) for row in selected_calls.values()}
+    return {
+        "generation_metrics": {
+            "first_draft": {
+                "passed": first_passed,
+                "failed": first_failed,
+                "unknown": len(paths) - first_passed - first_failed,
+                "denominator": len(paths),
+                "pass_rate": first_passed / len(paths) if paths else None,
+            },
+            "final_valid": {
+                "count": final_valid,
+                "denominator": len(paths),
+                "rate": final_valid / len(paths) if paths else None,
+            },
+            "recovery": {
+                "recovered": recovered,
+                "denominator": first_failed,
+                "rate": recovered / first_failed if first_failed else None,
+            },
+            "extra_requests": {
+                "physical_sends": (
+                    len(selected_calls) - len(first_requests) if extra_requests_known else None
+                ),
+                "semantic_requests": (
+                    len(semantic_requests - first_requests) if extra_requests_known else None
+                ),
+            },
+        },
+        "generation_errors": {
+            category: {
+                "frequency": len(entry["calls"]),
+                "affected_inputs": sorted(entry["inputs"]),
+                "affected_paths": sorted(entry["paths"]),
+                "source_call_ids": sorted(entry["calls"]),
+                "reproducibility": "unknown",
+                "causal_attribution": "unknown",
+            }
+            for category, entry in sorted(affected.items())
+        },
+    }
+
+
+def build_evidence_report(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Report all planned paths, including missing/unknown outcomes; never submit a call."""
+    paths = manifest["execution_plan"]
+    calls = manifest.get("provider_calls", [])
+    stages = ("generation", "judge", "reference")
+    case_lookup = {
+        row["case_id"]: row
+        for rows in manifest["frozen"]["dataset"]["sets"].values()
+        for row in rows
+    }
+
+    def group(selected: list[dict[str, Any]]) -> dict[str, Any]:
+        logical: list[dict[str, Any]] = []
+        for path in selected:
+            requested = set().union(
+                *(_source_ids(manifest, path["path_id"], stage) for stage in stages)
+            )
+            requested.update(
+                row.get("request_id", row["call_id"])
+                for row in calls
+                if row["call_id"] in requested
+            )
+            logical.extend(
+                row
+                for row in calls
+                if row["call_id"] in requested or row.get("request_id") in requested
+            )
+        return {
+            "stages": {stage: _counts(manifest, selected, stage) for stage in stages},
+            "logical": _account_calls(logical),
+            **_generation_evidence(manifest, selected),
+        }
+
+    bad_cases, disagreements = [], []
+    pairs: dict[str, tuple[bool, bool]] = {}
+    paired_paths = 0
+    for path in paths:
+        judge = manifest.get("judge_results", {}).get(path["path_id"], {})
+        reference = manifest.get("reference_results", {}).get(path["path_id"], {})
+        decisive = judge.get("state") == reference.get("state") == "completed"
+        disagreement = (
+            decisive
+            and type(judge.get("passed")) is bool
+            and type(reference.get("reference_pass")) is bool
+            and judge["passed"] != reference["reference_pass"]
+        )
+        if (
+            decisive
+            and type(judge.get("passed")) is bool
+            and type(reference.get("reference_pass")) is bool
+        ):
+            pairs.setdefault(
+                reference.get("content_id", path["path_id"]),
+                (judge["passed"], reference["reference_pass"]),
+            )
+            paired_paths += 1
+        if disagreement:
+            disagreements.append(
+                {
+                    "path_id": path["path_id"],
+                    "case_id": path["case_id"],
+                    "content_id": reference.get("content_id"),
+                    "judge_pass": judge["passed"],
+                    "reference_pass": reference["reference_pass"],
+                }
+            )
+        if (
+            any(
+                state in {"failed", "unresolved", "in_flight"}
+                for state in (path["state"], judge.get("state"), reference.get("state"))
+            )
+            or judge.get("passed") is False
+            or reference.get("reference_pass") is False
+            or (reference.get("questions") and reference.get("reference_pass") is None)
+        ):
+            bad_cases.append(
+                {
+                    "path": path,
+                    "generation": manifest.get("generation_results", {}).get(path["path_id"]),
+                    "judge": judge,
+                    "reference": reference,
+                }
+            )
+    agreement_metrics = model_agreement(list(pairs.values()), len(paths))
+    return {
+        "run_id": manifest["run_id"],
+        "identities": manifest["identities"],
+        "set_name": manifest["protocol"].get("set_name"),
+        "planned_paths": len(paths),
+        "input_cases": len({p["case_id"] for p in paths}),
+        "stages": {stage: _counts(manifest, paths, stage) for stage in stages},
+        **_generation_evidence(manifest, paths),
+        "physical": _account_calls(calls),
+        "physical_by_stage": {
+            stage: _account_calls([row for row in calls if row["stage"] == stage])
+            for stage in sorted({row["stage"] for row in calls})
+        },
+        "arms": {
+            arm: group([p for p in paths if p["arm"] == arm])
+            for arm in sorted({p["arm"] for p in paths})
+        },
+        "templates": {
+            name: group([p for p in paths if case_lookup[p["case_id"]]["template_id"] == name])
+            for name in sorted({case_lookup[p["case_id"]]["template_id"] for p in paths})
+        },
+        "unknown_cost_call_ids": [row["call_id"] for row in calls if row.get("cost") is None],
+        "bad_cases": bad_cases,
+        "disagreements": disagreements,
+        "model_agreement": {
+            "paired": len(pairs),
+            "paired_paths": paired_paths,
+            "planned": len(paths),
+            "agreement": agreement_metrics["agreement"],
+            "kappa": agreement_metrics["kappa"],
+            "kappa_status": agreement_metrics["kappa_status"],
+        },
+        "provenance": manifest["frozen"]["dataset"].get("provenance", "unspecified"),
+        "limitations": [
+            "Judge/reference agreement measures two model judgements, not human gold accuracy.",
+            (
+                "Logical arm estimates allocate reused physical calls independently; "
+                "they are not extra billed calls."
+            ),
+            (
+                "Provider latency is per-send time, not task end-to-end latency "
+                "or a throughput benchmark."
+            ),
+            (
+                "Exploration selects hypotheses; improvements require "
+                "a separately frozen confirmation run."
+            ),
+        ],
+    }
+
+
+def interview_brief(report: dict[str, Any]) -> str:
+    """Keep local interview wording tied to measured counts and explicit attribution."""
+    return (
+        f"# 真实质量探索证据（本地）\n\n运行：{report['run_id']}；输入 {report['input_cases']}；"
+        f"计划路径 {report['planned_paths']}。\n\n"
+        f"结构有效 {report['stages']['generation']['success']}；"
+        f"Judge 通过 {report['stages']['judge']['success']}；"
+        f"参考通过 {report['stages']['reference']['success']}，分母均为全部计划路径。\n\n"
+        f"实际物理调用 {report['physical']['call_count']}；"
+        f"已知费用小计 {report['physical']['cost']['known_subtotal']}；"
+        f"完整费用 {report['physical']['cost']['total']}。未知费用不按零处理。\n\n"
+        "参考评审来自模型，不能宣称人工金标准或已证明质量提升。用户负责方案决策与人工核验，AI 辅助编码，执行器自动运行，Judge 与参考模型提供各自判断。\n"
+    )

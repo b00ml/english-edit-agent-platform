@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import jsonschema
@@ -30,6 +31,18 @@ from app.skill_registry import get_skill_md
 from app.versioning import hash_value
 
 logger = logging.getLogger("app.engine.structured_output")
+
+
+@dataclass(frozen=True)
+class StructuredResponse:
+    """An adapter response can explicitly identify a previously paid source call."""
+
+    text: str
+    latency_ms: float
+    usage: Any
+    source_call_id: str
+    replayed: bool = False
+
 
 # ---------------------------------------------------------------------------
 # 关于 Outlines 约束解码的说明（本实现以 OpenAI 客户端 + 强制 JSON 实现）
@@ -271,6 +284,7 @@ def _call_openai_json(
     resp = client.chat.completions.create(
         model=model,
         temperature=settings.LLM_TEMPERATURE,
+        max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
         response_format={"type": "json_object"},
         messages=messages,
     )
@@ -289,6 +303,7 @@ def generate_structured(
     *,
     response_adapter: Any = None,
     retry_feedback: Optional[bool] = None,
+    trace_sink: Any = None,
 ) -> Dict[str, Any]:
     """根据模板生成符合 output_schema 的单条结构化内容。
 
@@ -304,15 +319,12 @@ def generate_structured(
     max_retry = int(run_config.get("max_retry", 3))
 
     model_name = (model_profile.model_name if model_profile else None) or settings.LLM_MODEL_NAME
-    client = (
-        None
-        if response_adapter is not None
-        else (
+    if response_adapter is None:
+        client = (
             client_for_profile(model_profile)
             if getattr(model_profile, "provider_id", None)
             else _get_openai_client()
         )
-    )
 
     schema = template.output_schema
     output_model = _build_pydantic_from_schema(schema)
@@ -340,16 +352,27 @@ def generate_structured(
 
     last_error: Exception | None = None
     attempt_summaries: List[str] = []
+    recorder = trace_sink if trace_sink is not None else record_trace
     for attempt in range(1, max_retry + 1):
-        try:
+        response: StructuredResponse | None = None
+
+        def emit(**row: Any) -> None:
+            if response is None or not response.replayed or trace_sink is not None:
+                recorder(**row)
+
+        if response_adapter is not None:
+            adapted = response_adapter(messages, attempt)
+            if isinstance(adapted, StructuredResponse):
+                response = adapted
+                text, latency_ms, usage = response.text, response.latency_ms, response.usage
+            else:
+                text, latency_ms, usage = adapted
+        else:
             try:
-                if response_adapter is None:
-                    text, latency_ms, usage = _call_openai_json(client, model_name, messages)
-                else:
-                    text, latency_ms, usage = response_adapter(messages, attempt)
+                text, latency_ms, usage = _call_openai_json(client, model_name, messages)
             except OpenAIError as exc:
                 if trace_id:
-                    record_trace(
+                    emit(
                         snapshot_data={
                             "messages": messages,
                             "response_text": None,
@@ -386,6 +409,7 @@ def generate_structured(
                         status_code=status_code, detail=f"Provider调用失败: {type(exc).__name__}"
                     ) from None
                 raise
+        try:
             raw = json.loads(text)
             # 兜底展平偶发嵌套包装后再做 Pydantic 二次校验
             normalized = _normalize_flat(schema, raw)
@@ -416,7 +440,6 @@ def generate_structured(
             ValidationError,
             jsonschema.ValidationError,
             json.JSONDecodeError,
-            KeyError,
             ContentValidationError,
         ) as exc:
             summary = _summarize_validation_error(exc)
@@ -425,7 +448,7 @@ def generate_structured(
             cost = compute_cost(usage, model_name)
             tokens = token_breakdown(usage, model_name)
             if trace_id:
-                record_trace(
+                emit(
                     trace_id=trace_id,
                     task_id=task_id,
                     template_id=template_id,
@@ -442,7 +465,18 @@ def generate_structured(
                             else {"binding": "environment"}
                         ),
                     },
-                    output_data={"error_summary": summary},
+                    output_data={
+                        "error_summary": summary,
+                        "validation_category": (
+                            "json_syntax"
+                            if isinstance(exc, json.JSONDecodeError)
+                            else (
+                                "content_rule"
+                                if isinstance(exc, ContentValidationError)
+                                else "schema"
+                            )
+                        ),
+                    },
                     snapshot_data={
                         "messages": messages,
                         "response_text": text,
@@ -495,7 +529,7 @@ def generate_structured(
         cost = compute_cost(usage, model_name)
         tokens = token_breakdown(usage, model_name)
         if trace_id:
-            record_trace(
+            emit(
                 trace_id=trace_id,
                 task_id=task_id,
                 template_id=template_id,

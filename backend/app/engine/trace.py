@@ -180,7 +180,7 @@ def record_trace(
     trace_id: str,
     model: str,
     latency_ms: float,
-    cost: float,
+    cost: float | None,
     prompt_version: str = "",
     task_id: Optional[str] = None,
     template_id: Optional[str] = None,
@@ -197,12 +197,12 @@ def record_trace(
     prompt_cost: float | None = None,
     completion_cost: float | None = None,
     snapshot_data: Dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     """组装一条 trace 并分发到所有配置的 Sink（失败尝试同样记录）。
 
     attempt/success 用于结构化符合率统计（P0-2）：generate 阶段每次调用
     （含校验失败的尝试）各写一行，失败行 output_data 为 {"error_summary": ...}。
-    单个 Sink 失败仅告警，不中断其余 Sink 与生成主流程。
+    单个 Sink 失败仅告警，不中断其余 Sink 与生成主流程。返回数据库或补偿目录是否已持久化。
     """
     from app.engine.observability import TraceLogSink
     from app.engine.trace_snapshots import prepare_snapshot
@@ -258,6 +258,7 @@ def record_trace(
     note_durability(durable)
     if not durable and settings.TRACE_REQUIRE_DURABILITY:
         raise TracePersistenceError("Trace 无法写入数据库或持久化补偿目录，拒绝静默丢失")
+    return durable
 
 
 def record_lifecycle_event(
