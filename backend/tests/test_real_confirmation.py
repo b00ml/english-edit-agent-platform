@@ -91,6 +91,161 @@ def test_feedback_plan_is_paired_interleaved_and_has_separate_blind_control(expl
         freeze_confirmation(exploration, invalid, run_id="invalid", seed=1)
 
 
+def test_reference_timeout_override_applies_to_every_variant_uniformly(exploration):
+    from app.engine.real_confirmation import confirmation_report, freeze_confirmation
+
+    selection = choice(exploration)
+    selection["reference_timeout_seconds"] = 300
+    bundle = freeze_confirmation(exploration, selection, run_id="confirm", seed=13)
+    for variant in bundle["variants"].values():
+        assert variant["config"]["reference"]["timeout_seconds"] == 300
+    for run in bundle["runs"].values():
+        assert run["frozen"]["config"]["reference"]["timeout_seconds"] == 300
+    assert (
+        bundle["variants"]["new"]["prompts"]["retry-feedback.st"]
+        != bundle["variants"]["old"]["prompts"]["retry-feedback.st"]
+    )
+    assert confirmation_report(bundle)["planned_main_paths"] == 360
+    frozen_timeout = exploration["frozen"]["config"]["reference"]["timeout_seconds"]
+    for invalid_value in (frozen_timeout, 0, -5, "300", 300.5, True):
+        bad = choice(exploration)
+        bad["reference_timeout_seconds"] = invalid_value
+        with pytest.raises(ValueError, match="reference_timeout_seconds"):
+            freeze_confirmation(exploration, bad, run_id="invalid", seed=1)
+
+
+def test_reference_model_override_swaps_instrument_for_every_variant(exploration):
+    from app.engine.real_confirmation import freeze_confirmation
+
+    def override(model_name, family):
+        profile = dict(exploration["frozen"]["config"]["profiles"]["reference"])
+        profile.update({"model_name": model_name, "model_family": family, "profile_hash": "hash"})
+        return {
+            "profile": profile,
+            "price": {
+                "prompt_per_1k": None,
+                "completion_per_1k": None,
+                "currency": "fixture-currency",
+                "verified": False,
+            },
+        }
+
+    selection = choice(exploration)
+    selection["reference_model"] = override("fixture-flash", "family-c")
+    bundle = freeze_confirmation(exploration, selection, run_id="ref-swap", seed=13)
+    for variant in bundle["variants"].values():
+        assert variant["config"]["profiles"]["reference"]["model_name"] == "fixture-flash"
+        assert "fixture-flash" in variant["config"]["prices"]
+    assert (
+        bundle["variants"]["new"]["prompts"]["retry-feedback.st"]
+        != bundle["variants"]["old"]["prompts"]["retry-feedback.st"]
+    )
+
+    same = choice(exploration)
+    same["reference_model"] = {
+        "profile": dict(exploration["frozen"]["config"]["profiles"]["reference"]),
+        "price": {
+            "prompt_per_1k": None,
+            "completion_per_1k": None,
+            "currency": "u",
+            "verified": False,
+        },
+    }
+    with pytest.raises(ValueError, match="reference_model"):
+        freeze_confirmation(exploration, same, run_id="invalid", seed=1)
+
+    # Family isolation still applies to the swapped instrument.
+    clashing = choice(exploration)
+    clashing["reference_model"] = override("fixture-flash", "family-a")
+    with pytest.raises(ValueError, match="independent model family"):
+        freeze_confirmation(exploration, clashing, run_id="invalid", seed=1)
+
+
+def test_generation_output_cap_override_applies_to_every_variant(exploration):
+    from app.engine.real_confirmation import freeze_confirmation
+
+    selection = choice(exploration)
+    selection["generation_max_output_tokens"] = 4096
+    bundle = freeze_confirmation(exploration, selection, run_id="cap", seed=13)
+    for variant in bundle["variants"].values():
+        assert variant["config"]["generation"]["max_output_tokens"] == 4096
+    source_cap = exploration["frozen"]["config"]["generation"]["max_output_tokens"]
+    context = exploration["frozen"]["config"]["generation"]["context_limit_tokens"]
+    for invalid in (source_cap, 0, -1, "4096", 1.5, True, context, context + 1):
+        bad = choice(exploration)
+        bad["generation_max_output_tokens"] = invalid
+        with pytest.raises(ValueError, match="generation_max_output_tokens"):
+            freeze_confirmation(exploration, bad, run_id="invalid", seed=1)
+
+
+def test_rounds_override_reduces_schedule_and_scales_call_limits(exploration):
+    from app.engine.real_confirmation import confirmation_report, freeze_confirmation
+
+    selection = choice(exploration)
+    selection["rounds"] = 1
+    bundle = freeze_confirmation(exploration, selection, run_id="one-round", seed=13)
+    assert len(bundle["execution_plan"]) == 180
+    assert {row["round"] for row in bundle["execution_plan"]} == {1}
+    assert len({row["first_draft_id"] for row in bundle["execution_plan"]}) == 60
+    limits = next(iter(bundle["runs"].values()))["protocol"]["call_limits"]
+    assert limits["generate"] == {"semantic": 60 * 7, "physical": 60 * 7 * 3}
+    assert confirmation_report(bundle)["planned_main_paths"] == 120
+    for invalid in (0, 3, 4, "1", 1.5, True):
+        bad = choice(exploration)
+        bad["rounds"] = invalid
+        with pytest.raises(ValueError, match="rounds"):
+            freeze_confirmation(exploration, bad, run_id="invalid", seed=1)
+
+
+def test_reference_instrument_amendment_preserves_outcomes_and_reidentifies(exploration):
+    from app.engine.real_confirmation import (
+        amend_reference_instrument,
+        freeze_confirmation,
+        validate_confirmation,
+    )
+
+    bundle = freeze_confirmation(exploration, choice(exploration), run_id="amend", seed=13)
+    first = bundle["execution_plan"][0]
+    completed_row = next(
+        row
+        for row in bundle["runs"][first["run_key"]]["execution_plan"]
+        if row["path_id"] == first["path_id"]
+    )
+    completed_row["state"] = "completed"
+    bundle["runs"][first["run_key"]].setdefault("generation_results", {})[first["path_id"]] = {
+        "payload": {"fixture": True}
+    }
+    old_identity = bundle["identity"]
+    profile = dict(bundle["variants"]["old"]["config"]["profiles"]["reference"])
+    profile.update({"model_name": "fixture-flash", "profile_hash": "fixture-flash-hash"})
+    price = {"prompt_per_1k": None, "completion_per_1k": None, "currency": "u", "verified": False}
+    amend_reference_instrument(bundle, profile=profile, price=price)
+    validate_confirmation(bundle)
+    assert bundle["identity"] != old_identity
+    assert bundle["instrument_amendments"][-1]["previous_identity"] == old_identity
+    assert bundle["instrument_amendments"][-1]["from_model"] != "fixture-flash"
+    for variant in bundle["variants"].values():
+        assert variant["config"]["profiles"]["reference"]["model_name"] == "fixture-flash"
+    for run in bundle["runs"].values():
+        assert run["frozen"]["config"]["profiles"]["reference"]["model_name"] == "fixture-flash"
+        assert "fixture-flash" in run["frozen"]["config"]["prices"]
+    amended_row = next(
+        row
+        for row in bundle["runs"][first["run_key"]]["execution_plan"]
+        if row["path_id"] == first["path_id"]
+    )
+    assert amended_row["state"] == "completed"
+    assert bundle["runs"][first["run_key"]]["generation_results"][first["path_id"]]["payload"] == {
+        "fixture": True
+    }
+    with pytest.raises(ValueError, match="must change"):
+        amend_reference_instrument(
+            bundle,
+            profile=bundle["source"]["frozen"]["config"]["profiles"]["reference"],
+            price=price,
+        )
+
+
 def test_changed_generation_prompt_is_executed_from_snapshot_with_independent_drafts(
     tmp_path, exploration
 ):
@@ -389,15 +544,29 @@ def test_confirmation_prefix_cold_resume_preserves_shared_draft_and_unknown_acce
             for version, roles in clients.items()
         }
     output = tmp_path / "confirmation.json"
+    # workers=1: this test asserts exact physical send counts, which the shared
+    # iterator fixtures can only guarantee under serial consumption.
     run_confirmation(
-        output, bundle, clients=clients, smoke=smoke, trace_sink=lambda **_: None, path_limit=limit
+        output,
+        bundle,
+        clients=clients,
+        smoke=smoke,
+        trace_sink=lambda **_: None,
+        path_limit=limit,
+        workers=1,
     )
     before = sum(len(client.requests) for roles in clients.values() for client in roles.values())
     assert sum(len(roles["generation"].requests) for roles in clients.values()) == 1
     saved = json.loads(output.read_text("utf-8"))
     assert all("provider_calls" not in run for run in saved["runs"].values())
     run_confirmation(
-        output, saved, clients=clients, smoke=smoke, trace_sink=lambda **_: None, path_limit=limit
+        output,
+        saved,
+        clients=clients,
+        smoke=smoke,
+        trace_sink=lambda **_: None,
+        path_limit=limit,
+        workers=1,
     )
     assert (
         sum(len(client.requests) for roles in clients.values() for client in roles.values())
@@ -420,7 +589,13 @@ def test_confirmation_prefix_cold_resume_preserves_shared_draft_and_unknown_acce
     )
     cancelled["state"] = "cancelled"
     run_confirmation(
-        output, saved, clients=clients, smoke=smoke, trace_sink=lambda **_: None, path_limit=1
+        output,
+        saved,
+        clients=clients,
+        smoke=smoke,
+        trace_sink=lambda **_: None,
+        path_limit=1,
+        workers=1,
     )
     assert cancelled["state"] == "cancelled"
 

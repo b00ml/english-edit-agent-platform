@@ -7,6 +7,7 @@ Only the external transport may affirm that a transient request was not accepted
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,41 @@ from app.prompt_loader import teaching_constraints, with_frozen_assets
 from app.versioning import hash_value, model_profile_hash
 
 EvaluationResponse = StructuredResponse
+
+#: Process-wide lock: every ledger instance in one executor process shares it, so
+#: concurrent paths serialize only their manifest mutations and file writes while
+#: provider sends stay outside the lock.
+_LEDGER_LOCK = threading.RLock()
+#: Live in-process sends, keyed by the ledger's records-list identity and request_id:
+#: concurrent callers of the same shared request (shared first drafts, content-addressed
+#: reviews) wait for the owning thread instead of sending duplicates. Keying by the
+#: records list keeps unrelated manifests (and stale rows loaded from disk) on the
+#: never-replay conversion path instead of waiting on a foreign event.
+_REQUEST_EVENTS: dict[int, tuple[list, dict[str, threading.Event]]] = {}
+#: Consecutive transport-level failures across every ledger in this process; the
+#: instance counter could never see cross-path burn because executors create a
+#: ledger per stage call.
+_TRANSPORT_FAILURE_STREAK = 0
+
+
+def _request_events(records: list) -> dict[str, threading.Event]:
+    """Per-ledger event table; pinning the records list keeps its id() unique."""
+    entry = _REQUEST_EVENTS.get(id(records))
+    if entry is None:
+        entry = (records, {})
+        _REQUEST_EVENTS[id(records)] = entry
+    return entry[1]
+
+
+def _notify_request_done(records: list, call_id: str) -> None:
+    """Wake every waiter of a shared request; a missing event means no waiters."""
+    entry = _REQUEST_EVENTS.get(id(records))
+    if entry is not None:
+        event = entry[1].pop(call_id, None)
+        if event is not None:
+            event.set()
+        if not entry[1]:
+            _REQUEST_EVENTS.pop(id(records), None)
 
 
 def frozen_teaching_context(case: dict[str, Any]) -> dict[str, Any]:
@@ -132,6 +168,16 @@ def _cost(usage: dict[str, Any] | None, price: dict[str, Any]) -> dict[str, Any]
 class EvaluationLedger:
     """One local durable ledger for generation, Judge and independent reference calls."""
 
+    #: Provider-affirmed rejection statuses (auth/permission/balance). The provider
+    #: answered with an explicit terminal status, so acceptance is known false; this
+    #: is transport evidence, not inference from silence or a timeout.
+    REJECTED_STATUSES = frozenset({401, 402, 403})
+    #: Stop the live run after this many consecutive transport-level failures
+    #: (not_accepted/unresolved); validation failures are completed responses and
+    #: never trip the breaker. The counter is per process: a deliberate resume
+    #: after fixing the cause starts fresh.
+    CONSECUTIVE_FAILURE_BREAKER = 10
+
     def __init__(
         self,
         path: Path,
@@ -146,10 +192,11 @@ class EvaluationLedger:
         self.persist = persist
 
     def save(self) -> None:
-        if self.persist is not None:
-            self.persist()
-        else:
-            write_manifest(self.path, self.manifest, overwrite=True)
+        with _LEDGER_LOCK:
+            if self.persist is not None:
+                self.persist()
+            else:
+                write_manifest(self.path, self.manifest, overwrite=True)
 
     def call(
         self,
@@ -163,6 +210,7 @@ class EvaluationLedger:
         metadata: dict[str, Any] | None = None,
     ) -> EvaluationResponse:
         """Persist before send and after response; completed responses are reused locally."""
+        global _TRANSPORT_FAILURE_STREAK  # noqa: PLW0603
         identity = canonical_hash(
             {
                 "messages": messages,
@@ -172,56 +220,118 @@ class EvaluationLedger:
                 "metadata": metadata,
             }
         )
-        records = self.manifest.setdefault("provider_calls", [])
         for transport_attempt in range(3):
-            physical_id = (
-                call_id if transport_attempt == 0 else f"{call_id}:transport-{transport_attempt}"
-            )
-            existing = next((row for row in records if row["call_id"] == physical_id), None)
-            if existing is not None:
-                if existing["request_hash"] != identity:
-                    raise ValueError("Call identity drift; use a new run")
-                if existing["state"] == "not_accepted":
-                    if existing["retry_allowed"]:
-                        continue
-                    raise EvaluationTransportError(accepted=False, completed=False, transient=False)
-                if existing["state"] != "completed":
-                    existing["state"] = "unresolved"
+            wait_event: threading.Event | None = None
+            with _LEDGER_LOCK:
+                records = self.manifest.setdefault("provider_calls", [])
+                same_request = [r for r in records if r["request_id"] == call_id]
+                matching = [r for r in same_request if r["request_hash"] == identity]
+                if transport_attempt == 0:
+                    if matching:
+                        physical_id = matching[0]["call_id"]
+                    elif same_request:
+                        # No row of this exact identity: either fatal within-instrument
+                        # drift, or a declared instrument amendment re-sending the same
+                        # logical request under a changed model (fresh physical row).
+                        if any(r.get("model") == model for r in same_request):
+                            raise ValueError("Call identity drift; use a new run")
+                        taken = {r["call_id"] for r in same_request}
+                        physical_id = next(
+                            f"{call_id}:send-{index}"
+                            for index in range(1, len(same_request) + 2)
+                            if f"{call_id}:send-{index}" not in taken
+                        )
+                    else:
+                        physical_id = call_id
+                else:
+                    physical_id = f"{physical_id}:transport-{transport_attempt}"
+                existing = next((row for row in records if row["call_id"] == physical_id), None)
+                if existing is not None:
+                    if existing["state"] == "not_accepted":
+                        if existing["retry_allowed"]:
+                            continue
+                        raise EvaluationTransportError(
+                            accepted=False, completed=False, transient=False
+                        )
+                    if existing["state"] == "in_flight":
+                        wait_event = _request_events(records).get(call_id)
+                        if wait_event is None:
+                            existing["state"] = "unresolved"
+                            self.save()
+                            raise EvaluationUnresolvedError(
+                                "Existing provider request cannot be resent"
+                            )
+                    elif existing["state"] == "completed":
+                        return EvaluationResponse(
+                            existing["response_text"],
+                            existing["latency_ms"],
+                            SimpleNamespace(**existing["usage"]) if existing["usage"] else None,
+                            physical_id,
+                            True,
+                        )
+                    else:
+                        existing["state"] = "unresolved"
+                        self.save()
+                        raise EvaluationUnresolvedError(
+                            "Existing provider request cannot be resent"
+                        )
+                else:
+                    # Retire stale in_flight rows left by a pre-amendment process:
+                    # a swapped instrument can never complete them.
+                    for stale in same_request:
+                        if stale["state"] == "in_flight" and stale.get("model") != model:
+                            stale["state"] = "unresolved"
+                    limits = self.manifest["protocol"]["call_limits"][stage]
+                    stage_calls = [item for item in records if item["stage"] == stage]
+                    if len(stage_calls) >= limits["physical"]:
+                        raise ValueError(f"{stage} physical call limit reached")
+                    semantic_ids = {item["request_id"] for item in stage_calls}
+                    if call_id not in semantic_ids and len(semantic_ids) >= limits["semantic"]:
+                        raise ValueError(f"{stage} semantic call limit reached")
+                    row: dict[str, Any] = {
+                        "call_id": physical_id,
+                        "request_id": call_id,
+                        "trace_id": physical_id,
+                        "stage": stage,
+                        "model": model,
+                        "transport_attempt": transport_attempt + 1,
+                        "messages": copy.deepcopy(messages),
+                        "metadata": copy.deepcopy(metadata),
+                        "request_hash": identity,
+                        "state": "in_flight",
+                        "trace_state": "pending",
+                        "usage": None,
+                        "response_text": None,
+                        "latency_ms": None,
+                        **_cost(None, price),
+                    }
+                    records.append(row)
+                    _request_events(records)[call_id] = threading.Event()
                     self.save()
-                    raise EvaluationUnresolvedError("Existing provider request cannot be resent")
-                return EvaluationResponse(
-                    existing["response_text"],
-                    existing["latency_ms"],
-                    SimpleNamespace(**existing["usage"]) if existing["usage"] else None,
-                    physical_id,
-                    True,
-                )
-            limits = self.manifest["protocol"]["call_limits"][stage]
-            stage_calls = [item for item in records if item["stage"] == stage]
-            if len(stage_calls) >= limits["physical"]:
-                raise ValueError(f"{stage} physical call limit reached")
-            semantic_ids = {item["request_id"] for item in stage_calls}
-            if call_id not in semantic_ids and len(semantic_ids) >= limits["semantic"]:
-                raise ValueError(f"{stage} semantic call limit reached")
-            row: dict[str, Any] = {
-                "call_id": physical_id,
-                "request_id": call_id,
-                "trace_id": physical_id,
-                "stage": stage,
-                "model": model,
-                "transport_attempt": transport_attempt + 1,
-                "messages": copy.deepcopy(messages),
-                "metadata": copy.deepcopy(metadata),
-                "request_hash": identity,
-                "state": "in_flight",
-                "trace_state": "pending",
-                "usage": None,
-                "response_text": None,
-                "latency_ms": None,
-                **_cost(None, price),
-            }
-            records.append(row)
-            self.save()
+            if wait_event is not None:
+                # Another thread in this process owns the physical send; reuse its
+                # outcome instead of issuing a duplicate request.
+                wait_event.wait()
+                with _LEDGER_LOCK:
+                    rows = [
+                        r
+                        for r in records
+                        if r["request_id"] == call_id and r["request_hash"] == identity
+                    ]
+                    done = next((r for r in rows if r["state"] == "completed"), None)
+                    if done is not None:
+                        return EvaluationResponse(
+                            done["response_text"],
+                            done["latency_ms"],
+                            SimpleNamespace(**done["usage"]) if done["usage"] else None,
+                            done["call_id"],
+                            True,
+                        )
+                    if rows[-1]["state"] == "not_accepted":
+                        raise EvaluationTransportError(
+                            accepted=False, completed=False, transient=False
+                        )
+                    raise EvaluationUnresolvedError("Parallel provider request failed")
             start = time.perf_counter_ns()
             try:
                 response = invoke()
@@ -236,44 +346,62 @@ class EvaluationLedger:
                     isinstance(exc, EvaluationTransportError)
                     and exc.accepted is False
                     and exc.completed is False
-                )
-                row.update(
-                    state="not_accepted" if safe else "unresolved",
-                    usage=None,
-                    response_text=None,
-                    latency_ms=(time.perf_counter_ns() - start) / 1e6,
-                    error_type=type(exc).__name__,
-                    retry_allowed=safe
-                    and isinstance(exc, EvaluationTransportError)
-                    and exc.transient
-                    and transport_attempt < 2,
-                )
-                row.update(_cost(None, price))
-                if safe:
+                ) or getattr(exc, "status_code", None) in self.REJECTED_STATUSES
+                with _LEDGER_LOCK:
                     row.update(
-                        cost=0.0, prompt_cost=0.0, completion_cost=0.0, cost_status="complete"
+                        state="not_accepted" if safe else "unresolved",
+                        usage=None,
+                        response_text=None,
+                        latency_ms=(time.perf_counter_ns() - start) / 1e6,
+                        error_type=type(exc).__name__,
+                        retry_allowed=safe
+                        and isinstance(exc, EvaluationTransportError)
+                        and exc.transient
+                        and transport_attempt < 2,
                     )
-                self.save()
-                self.record_validation(
-                    physical_id, success=False, output_data={"error_type": type(exc).__name__}
-                )
+                    row.update(_cost(None, price))
+                    if safe:
+                        row.update(
+                            cost=0.0,
+                            prompt_cost=0.0,
+                            completion_cost=0.0,
+                            cost_status="complete",
+                        )
+                    self.save()
+                    self.record_validation(
+                        physical_id, success=False, output_data={"error_type": type(exc).__name__}
+                    )
+                    _TRANSPORT_FAILURE_STREAK += 1
+                    tripped = _TRANSPORT_FAILURE_STREAK >= self.CONSECUTIVE_FAILURE_BREAKER
+                if tripped:
+                    _notify_request_done(records, call_id)
+                    raise ValueError(
+                        f"circuit breaker: {_TRANSPORT_FAILURE_STREAK} consecutive failed "
+                        "provider calls; provider appears unavailable, fix the cause before "
+                        "resuming"
+                    ) from None
                 if row["retry_allowed"]:
                     continue
                 if safe:
+                    _notify_request_done(records, call_id)
                     raise EvaluationTransportError(
                         accepted=False, completed=False, transient=False
                     ) from None
+                _notify_request_done(records, call_id)
                 raise EvaluationUnresolvedError(
                     "Provider acceptance or billing is unknown"
                 ) from None
-            row.update(
-                state="completed",
-                response_text=text,
-                latency_ms=(time.perf_counter_ns() - start) / 1e6,
-                usage=usage,
-            )
-            row.update(_cost(row["usage"], price))
-            self.save()
+            with _LEDGER_LOCK:
+                row.update(
+                    state="completed",
+                    response_text=text,
+                    latency_ms=(time.perf_counter_ns() - start) / 1e6,
+                    usage=usage,
+                )
+                row.update(_cost(row["usage"], price))
+                _TRANSPORT_FAILURE_STREAK = 0
+                self.save()
+            _notify_request_done(records, call_id)
             return EvaluationResponse(
                 row["response_text"],
                 row["latency_ms"],
@@ -292,49 +420,50 @@ class EvaluationLedger:
 
     def record_validation(self, source_call_id: str, **trace: Any) -> None:
         """Record validation locally, and emit each physical request's Trace at most once."""
-        row = next(r for r in self.manifest["provider_calls"] if r["call_id"] == source_call_id)
-        row.setdefault("validations", []).append(
-            {"success": trace.get("success"), "output": trace.get("output_data")}
-        )
-        if row["trace_state"] != "pending":
+        with _LEDGER_LOCK:
+            row = next(r for r in self.manifest["provider_calls"] if r["call_id"] == source_call_id)
+            row.setdefault("validations", []).append(
+                {"success": trace.get("success"), "output": trace.get("output_data")}
+            )
+            if row["trace_state"] != "pending":
+                self.save()
+                return
+            row["trace_state"] = "in_flight"
             self.save()
-            return
-        row["trace_state"] = "in_flight"
-        self.save()
-        usage = row["usage"] or {}
-        trace.update(
-            trace_id=row["trace_id"],
-            model=row["model"],
-            stage=row["stage"],
-            latency_ms=row["latency_ms"],
-            cost=row["cost"],
-            prompt_tokens=usage.get("prompt_tokens"),
-            completion_tokens=usage.get("completion_tokens"),
-            usage_reported=row["usage"] is not None,
-            prompt_cost=row["prompt_cost"],
-            completion_cost=row["completion_cost"],
-        )
-        trace.setdefault("input_data", {"messages": row["messages"]})
-        metadata = row["metadata"] or {}
-        settings = metadata.get("settings", {})
-        request_kwargs = {
-            "temperature": settings.get("temperature"),
-            "max_tokens": settings.get("max_output_tokens"),
-            "response_format": {"type": "json_object"},
-        }
-        trace["snapshot_data"] = {
-            **trace.get("snapshot_data", {}),
-            "messages": copy.deepcopy(row["messages"]),
-            "response_text": row["response_text"],
-            "model": row["model"],
-            **request_kwargs,
-            "request_kwargs": request_kwargs,
-            "model_profile": metadata.get("model_profile"),
-            "settings": settings,
-        }
-        durable = self.trace_sink(**trace)
-        row["trace_state"] = "failed" if durable is False else "completed"
-        self.save()
+            usage = row["usage"] or {}
+            trace.update(
+                trace_id=row["trace_id"],
+                model=row["model"],
+                stage=row["stage"],
+                latency_ms=row["latency_ms"],
+                cost=row["cost"],
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                usage_reported=row["usage"] is not None,
+                prompt_cost=row["prompt_cost"],
+                completion_cost=row["completion_cost"],
+            )
+            trace.setdefault("input_data", {"messages": row["messages"]})
+            metadata = row["metadata"] or {}
+            settings = metadata.get("settings", {})
+            request_kwargs = {
+                "temperature": settings.get("temperature"),
+                "max_tokens": settings.get("max_output_tokens"),
+                "response_format": {"type": "json_object"},
+            }
+            trace["snapshot_data"] = {
+                **trace.get("snapshot_data", {}),
+                "messages": copy.deepcopy(row["messages"]),
+                "response_text": row["response_text"],
+                "model": row["model"],
+                **request_kwargs,
+                "request_kwargs": request_kwargs,
+                "model_profile": metadata.get("model_profile"),
+                "settings": settings,
+            }
+            durable = self.trace_sink(**trace)
+            row["trace_state"] = "failed" if durable is False else "completed"
+            self.save()
 
 
 def _account(manifest: dict[str, Any]) -> None:

@@ -46,6 +46,246 @@ def test_caps_count_every_transport_send_across_resume(tmp_path):
     assert len(client.requests) == 2
 
 
+def test_consecutive_transport_failures_trip_the_breaker(tmp_path):
+    from test_real_generation import FakeClient, local_manifest
+
+    from app.engine import real_evaluation as real_eval
+    from app.engine.real_evaluation import EvaluationLedger
+
+    class ProviderRejected(Exception):
+        status_code = 402
+
+    real_eval._TRANSPORT_FAILURE_STREAK = 0
+    manifest = local_manifest()
+    manifest["protocol"] = {"call_limits": {"generate": {"semantic": 50, "physical": 50}}}
+    path = tmp_path / "run.json"
+    limit = EvaluationLedger.CONSECUTIVE_FAILURE_BREAKER
+    client = FakeClient([ProviderRejected("Insufficient Balance")] * limit)
+    ledger = EvaluationLedger(path, manifest, trace_sink=lambda **_: None)
+    kwargs = {
+        "stage": "generate",
+        "model": "fixture-model",
+        "price": manifest["frozen"]["config"]["prices"]["fixture-model"],
+        "invoke": lambda: client.create(messages=[]),
+    }
+    from app.errors import EvaluationTransportError
+
+    with pytest.raises(ValueError, match="circuit breaker"):
+        for n in range(limit):
+            try:
+                ledger.call(f"call-{n}", [], **kwargs)
+            except EvaluationTransportError:
+                continue
+    assert len(client.requests) == limit
+    rows = json.loads(path.read_text("utf-8"))["provider_calls"]
+    assert len(rows) == limit
+    # Provider-affirmed rejection statuses are known not accepted: no unresolved
+    # ambiguity and no billed cost.
+    assert all(row["state"] == "not_accepted" for row in rows)
+    assert all(row["cost"] == 0.0 for row in rows)
+
+
+def test_breaker_resets_after_a_completed_response(tmp_path):
+    from test_real_generation import VALID, FakeClient, local_manifest
+
+    from app.engine import real_evaluation as real_eval
+    from app.engine.real_evaluation import EvaluationLedger
+
+    class ProviderRejected(Exception):
+        status_code = 402
+
+    real_eval._TRANSPORT_FAILURE_STREAK = 0
+    manifest = local_manifest()
+    manifest["protocol"] = {"call_limits": {"generate": {"semantic": 50, "physical": 50}}}
+    path = tmp_path / "run.json"
+    limit = EvaluationLedger.CONSECUTIVE_FAILURE_BREAKER
+    outcomes = [ProviderRejected("Insufficient Balance")] * (limit - 1) + [VALID]
+    outcomes += [ProviderRejected("Insufficient Balance")] * (limit - 1)
+    client = FakeClient(outcomes)
+    ledger = EvaluationLedger(path, manifest, trace_sink=lambda **_: None)
+    kwargs = {
+        "stage": "generate",
+        "model": "fixture-model",
+        "price": manifest["frozen"]["config"]["prices"]["fixture-model"],
+        "invoke": lambda: client.create(messages=[]),
+    }
+    from app.errors import EvaluationTransportError
+
+    for n in range(len(outcomes)):
+        try:
+            ledger.call(f"call-{n}", [], **kwargs)
+        except EvaluationTransportError:
+            continue
+    saved = json.loads(path.read_text("utf-8"))["provider_calls"]
+    assert sum(row["state"] == "completed" for row in saved) == 1
+
+
+def test_concurrent_shared_request_sends_once_and_waiters_reuse(tmp_path):
+    import threading
+
+    from test_real_generation import VALID, local_manifest
+
+    from app.engine import real_evaluation as real_eval
+    from app.engine.real_evaluation import EvaluationLedger
+
+    real_eval._TRANSPORT_FAILURE_STREAK = 0
+
+    class SlowClient:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def create(self, **kwargs):
+            import time
+
+            self.requests.append(kwargs)
+            time.sleep(0.25)
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(VALID)))],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+            )
+
+    manifest = local_manifest()
+    manifest["protocol"] = {"call_limits": {"generate": {"semantic": 50, "physical": 50}}}
+    path = tmp_path / "run.json"
+    client = SlowClient()
+    # Two ledger instances over one shared manifest mirror the nested confirmation
+    # runs sharing a single physical ledger.
+    ledgers = [EvaluationLedger(path, manifest, trace_sink=lambda **_: None) for _ in range(2)]
+    kwargs = {
+        "stage": "generate",
+        "model": "fixture-model",
+        "price": manifest["frozen"]["config"]["prices"]["fixture-model"],
+        "invoke": client.create,
+    }
+    results: list = []
+    errors: list = []
+
+    def worker(ledger):
+        try:
+            results.append(ledger.call("shared-draft", [], **kwargs))
+        except Exception as exc:  # noqa: BLE001 - collect for assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(ledgers[i % 2],)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(client.requests) == 1
+    assert len(results) == 6
+    rows = manifest["provider_calls"]
+    assert len(rows) == 1 and rows[0]["state"] == "completed"
+    assert sum(response.replayed for response in results) == 5
+
+
+def test_breaker_counts_across_ledger_instances(tmp_path):
+    from test_real_generation import FakeClient, local_manifest
+
+    from app.engine import real_evaluation as real_eval
+    from app.engine.real_evaluation import EvaluationLedger
+
+    class ProviderRejected(Exception):
+        status_code = 402
+
+    real_eval._TRANSPORT_FAILURE_STREAK = 0
+    manifest = local_manifest()
+    manifest["protocol"] = {"call_limits": {"generate": {"semantic": 50, "physical": 50}}}
+    path = tmp_path / "run.json"
+    limit = EvaluationLedger.CONSECUTIVE_FAILURE_BREAKER
+    client = FakeClient([ProviderRejected("Insufficient Balance")] * limit)
+    ledgers = [EvaluationLedger(path, manifest, trace_sink=lambda **_: None) for _ in range(2)]
+    kwargs = {
+        "stage": "generate",
+        "model": "fixture-model",
+        "price": manifest["frozen"]["config"]["prices"]["fixture-model"],
+        "invoke": client.create,
+    }
+    from app.errors import EvaluationTransportError
+
+    with pytest.raises(ValueError, match="circuit breaker"):
+        for n in range(limit):
+            try:
+                ledgers[n % 2].call(f"call-{n}", [], **kwargs)
+            except EvaluationTransportError:
+                continue
+    assert len(client.requests) == limit
+
+
+def test_instrument_amendment_re_sends_same_request_under_new_model(tmp_path):
+    from test_real_generation import VALID, FakeClient, local_manifest
+
+    from app.engine.real_evaluation import EvaluationLedger
+
+    manifest = local_manifest()
+    manifest["protocol"] = {"call_limits": {"generate": {"semantic": 50, "physical": 50}}}
+    path = tmp_path / "run.json"
+    price = manifest["frozen"]["config"]["prices"]["fixture-model"]
+    flash_price = {
+        "prompt_per_1k": None,
+        "completion_per_1k": None,
+        "currency": "u",
+        "verified": False,
+    }
+
+    def invoke(client):
+        return client.create
+
+    old_client = FakeClient([{"role": "user", "content": "same"}, VALID])
+    ledger = EvaluationLedger(path, manifest, trace_sink=lambda **_: None)
+    base = {
+        "stage": "generate",
+        "price": price,
+        "invoke": old_client.create,
+    }
+    ledger.call(
+        "shared-request", [{"role": "user", "content": "same"}], model="fixture-model", **base
+    )
+    assert len(old_client.requests) == 1
+
+    # Same instrument, changed messages stays fatal drift.
+    with pytest.raises(ValueError, match="identity drift"):
+        ledger.call(
+            "shared-request",
+            [{"role": "user", "content": "changed"}],
+            model="fixture-model",
+            **{**base, "invoke": old_client.create},
+        )
+
+    # Swapped instrument: same logical request, new model and price, fresh send.
+    new_client = FakeClient([VALID])
+    ledger.call(
+        "shared-request",
+        [{"role": "user", "content": "same"}],
+        model="fixture-flash",
+        price=flash_price,
+        invoke=new_client.create,
+        stage="generate",
+    )
+    assert len(new_client.requests) == 1
+    rows = manifest["provider_calls"]
+    assert [row["call_id"] for row in rows] == ["shared-request", "shared-request:send-1"]
+    assert [row["model"] for row in rows] == ["fixture-model", "fixture-flash"]
+    assert all(row["state"] == "completed" for row in rows)
+
+    # Replaying under the new instrument reuses only its own row; the old
+    # instrument's completed row must never serve the swapped era.
+    replay_client = FakeClient([])
+    response = ledger.call(
+        "shared-request",
+        [{"role": "user", "content": "same"}],
+        model="fixture-flash",
+        price=flash_price,
+        invoke=replay_client.create,
+        stage="generate",
+    )
+    assert response.replayed is True
+    assert response.source_call_id == "shared-request:send-1"
+    assert replay_client.requests == []
+
+
 def test_smoke_is_frozen_separately_with_derived_call_limits(
     tmp_path, dataset_path, runtime_config
 ):
@@ -299,6 +539,57 @@ def test_full_smoke_review_then_exploration_resume_without_duplicate_calls(
     frozen["provider_calls"][0]["trace_state"] = "failed"
     with pytest.raises(ValueError, match="complete"):
         require_reviewed_smoke(exploration, frozen)
+
+
+def test_smoke_review_accepts_failed_and_unresolved_outcomes(
+    tmp_path, dataset_path, runtime_config
+):
+    """Terminal failures and unresolved outcomes are inspectable smoke reality: the
+    receipt records them as-is instead of requiring universal success, while a valid
+    generation payload without its Judge/reference entry stays blocked."""
+    from app.engine.real_experiment import (
+        record_smoke_review,
+        require_reviewed_smoke,
+        run_experiment,
+    )
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(runtime_config), "utf-8")
+    smoke = freeze_protocol(
+        dataset_path=dataset_path,
+        config_path=config,
+        backend=BACKEND,
+        run_id="partial-smoke",
+        seed=11,
+        set_name="smoke",
+    )
+    clients = _fixture_clients(smoke)
+    run_experiment(tmp_path / "smoke.json", smoke, clients=clients, trace_sink=lambda **_: None)
+    failed_pid, ok_pid, complete_pid = [row["path_id"] for row in smoke["execution_plan"][:3]]
+    smoke["generation_results"][failed_pid] = {
+        "attempts": smoke["generation_results"][failed_pid]["attempts"],
+        "error": "structured generation failed after retries",
+    }
+    smoke["judge_results"][failed_pid] = {"state": "missing"}
+    smoke["reference_results"][failed_pid] = {"state": "missing"}
+    smoke["reference_results"][ok_pid] = {
+        **smoke["reference_results"][ok_pid],
+        "state": "unresolved",
+    }
+    record_smoke_review(smoke)
+    assert smoke["operator_review"]["scope"].endswith("failed and unresolved outcomes inspected")
+    write_manifest(tmp_path / "smoke.json", smoke, overwrite=True)
+    exploration = freeze_protocol(
+        dataset_path=dataset_path,
+        config_path=config,
+        backend=BACKEND,
+        run_id="partial-exploration",
+        seed=11,
+    )
+    require_reviewed_smoke(exploration, smoke)
+    smoke["judge_results"][complete_pid] = {"state": "missing"}
+    with pytest.raises(ValueError, match="complete"):
+        record_smoke_review(smoke)
 
 
 def test_semantic_cap_reuses_completed_response_but_blocks_new_send(tmp_path):

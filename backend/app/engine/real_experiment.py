@@ -15,17 +15,33 @@ from app.engine.real_reference import run_reference_review
 from app.engine.reference_review import model_agreement
 from app.engine.trace import record_trace
 
+_TERMINAL_PLAN_STATES = {"completed", "failed", "cancelled"}
+_TERMINAL_STAGE_STATES = {"completed", "missing", "failed", "unresolved"}
+
 
 def _smoke_evidence(smoke: dict[str, Any]) -> str:
     plan = smoke["execution_plan"]
     calls = smoke.get("provider_calls", [])
+    generation_results = smoke.get("generation_results", {})
+    stage_results = {
+        stage: smoke.get(stage, {}) for stage in ("judge_results", "reference_results")
+    }
     if (
         smoke["protocol"].get("set_name") != "smoke"
         or len(plan) != 9
-        or not all(row["state"] == "completed" for row in plan)
+        or not all(row["state"] in _TERMINAL_PLAN_STATES for row in plan)
         or not all(
-            smoke.get(stage, {}).get(row["path_id"], {}).get("state") == "completed"
-            for stage in ("judge_results", "reference_results")
+            stage_results[stage].get(row["path_id"], {}).get("state", "missing")
+            in _TERMINAL_STAGE_STATES
+            for stage in stage_results
+            for row in plan
+        )
+        # A valid generation payload without its Judge/reference entry is a real gap;
+        # missing entries are only legitimate where generation produced no payload.
+        or any(
+            stage_results[stage].get(row["path_id"], {}).get("state", "missing") == "missing"
+            and "payload" in generation_results.get(row["path_id"], {})
+            for stage in stage_results
             for row in plan
         )
         or not {"generate", "qc", "reference_solve", "reference_review"}.issubset(
@@ -51,7 +67,10 @@ def record_smoke_review(smoke: dict[str, Any]) -> None:
     smoke["operator_review"] = {
         "evidence_hash": _smoke_evidence(smoke),
         "reviewed_at": datetime.now(UTC).isoformat(),
-        "scope": "contexts, blind inputs, Trace, usage and local persistence inspected",
+        "scope": (
+            "contexts, blind inputs, Trace, usage, local persistence, "
+            "failed and unresolved outcomes inspected"
+        ),
     }
 
 

@@ -265,6 +265,14 @@ def main() -> int:
     confirmation_freeze.add_argument("--run-id", required=True)
     confirmation_freeze.add_argument("--seed", type=int, required=True)
     confirmation_freeze.add_argument("--output", type=Path, required=True)
+    amend_reference = subparsers.add_parser("amend-reference")
+    amend_reference.add_argument("--manifest", type=Path, required=True)
+    amend_reference.add_argument(
+        "--reference-model",
+        type=Path,
+        required=True,
+        help="JSON file with the complete changed reference profile and price",
+    )
     rereview_freeze = subparsers.add_parser("freeze-rereview")
     rereview_freeze.add_argument("--source", type=Path, required=True)
     rereview_freeze.add_argument("--run-id", required=True)
@@ -379,8 +387,14 @@ def main() -> int:
             parser.error(str(exc))
         return 0
 
-    if args.command in {"freeze-confirmation", "execute-confirmation", "confirmation-evidence"}:
+    if args.command in {
+        "freeze-confirmation",
+        "execute-confirmation",
+        "confirmation-evidence",
+        "amend-reference",
+    }:
         from app.engine.real_confirmation import (
+            amend_reference_instrument,
             confirmation_report,
             freeze_confirmation,
             run_confirmation,
@@ -400,6 +414,14 @@ def main() -> int:
                     observations=[read_json(path) for path in args.observations],
                 )
                 write_manifest(args.output, bundle)
+            elif args.command == "amend-reference":
+                bundle = read_json(args.manifest)
+                validate_confirmation(bundle)
+                override = read_json(args.reference_model)
+                amend_reference_instrument(
+                    bundle, profile=override["profile"], price=override["price"]
+                )
+                write_manifest(args.manifest, bundle, overwrite=True)
             else:
                 bundle = read_json(args.manifest)
                 validate_confirmation(bundle)

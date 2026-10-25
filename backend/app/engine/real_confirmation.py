@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import random
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,10 @@ from app.engine.evaluation_protocol import (
     write_manifest,
 )
 from app.engine.real_experiment import _account_calls, _source_ids, build_evidence_report
+
+#: Concurrent paths per confirmation run. Shared requests (first drafts, deduplicated
+#: reviews) coalesce in the ledger, so this bounds provider load, not correctness.
+CONFIRMATION_WORKERS = 6
 
 
 def _identity(bundle: dict[str, Any]) -> str:
@@ -32,6 +38,56 @@ def _identity(bundle: dict[str, Any]) -> str:
     for key in ("variants", "run_definitions", "observations"):
         design[key] = bundle.get(key, {})
     return canonical_hash(design)
+
+
+def amend_reference_instrument(
+    bundle: dict[str, Any], *, profile: dict[str, Any], price: dict[str, Any]
+) -> dict[str, Any]:
+    """Swap the reference instrument of a partly executed run and re-freeze identities.
+
+    The treatment, hypothesis, analysis and recorded outcomes stay untouched; only the
+    measurement instrument changes for the not-yet-executed remainder. The operator
+    must archive the pre-amendment manifest first: the previous identity is recorded
+    here, and reference-based metrics become per-instrument segments.
+    """
+    if profile == bundle["source"]["frozen"]["config"]["profiles"]["reference"]:
+        raise ValueError("reference_model must change the frozen instrument")
+    previous_identity = bundle["identity"]
+    for holder in (
+        *bundle["variants"].values(),
+        *(run["frozen"] for run in bundle["runs"].values()),
+    ):
+        holder["config"]["profiles"]["reference"] = copy.deepcopy(profile)
+        holder["config"]["prices"][profile["model_name"]] = copy.deepcopy(price)
+        _validate_runtime(holder)
+    for run in bundle["runs"].values():
+        run["identities"] = {name: canonical_hash(value) for name, value in run["frozen"].items()}
+        run["identities"]["execution_plan"] = canonical_hash(
+            {"protocol": run["protocol"], "paths": run["execution_plan"]}
+        )
+    bundle["run_definitions"] = {
+        key: canonical_hash(
+            {
+                "run_id": run["run_id"],
+                "protocol": run["protocol"],
+                "identities": run["identities"],
+                "execution_plan": [{**row, "state": "planned"} for row in run["execution_plan"]],
+            }
+        )
+        for key, run in bundle["runs"].items()
+    }
+    bundle["identity"] = _identity(bundle)
+    bundle.setdefault("instrument_amendments", []).append(
+        {
+            "previous_identity": previous_identity,
+            "from_model": bundle["source"]["frozen"]["config"]["profiles"]["reference"][
+                "model_name"
+            ],
+            "to_model": profile["model_name"],
+            "amended_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    return bundle
 
 
 def freeze_confirmation(
@@ -107,14 +163,70 @@ def _validate_source(source: dict[str, Any]) -> None:
 
 
 def _variant(source: dict[str, Any], selection: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"decision", "factor", "key", "new", "hypothesis", "analysis", "evidence_refs"}
-    if set(selection) != allowed or selection["decision"] != "change":
+    required = {"decision", "factor", "key", "new", "hypothesis", "analysis", "evidence_refs"}
+    allowed = required | {
+        "reference_timeout_seconds",
+        "reference_model",
+        "generation_max_output_tokens",
+        "rounds",
+    }
+    if (
+        selection.get("decision") != "change"
+        or not required <= set(selection)
+        or not set(selection) <= allowed
+    ):
         raise ValueError("Confirmation requires exactly one single factor")
     if not all(
         isinstance(selection[key], str) and selection[key].strip()
         for key in ("hypothesis", "analysis")
     ):
         raise ValueError("Freeze a hypothesis and analysis before confirmation")
+    override = selection.get("reference_timeout_seconds")
+    if override is not None and (
+        isinstance(override, bool)
+        or not isinstance(override, int)
+        or override <= 0
+        or override == source["frozen"]["config"]["reference"]["timeout_seconds"]
+    ):
+        raise ValueError(
+            "reference_timeout_seconds must be a positive integer that changes the frozen value"
+        )
+    reference_override = selection.get("reference_model")
+    if reference_override is not None and (
+        not isinstance(reference_override, dict)
+        or set(reference_override) != {"profile", "price"}
+        or not isinstance(reference_override.get("profile"), dict)
+        or set(reference_override["profile"])
+        != {
+            "name",
+            "provider_id",
+            "provider_config_hash",
+            "model_name",
+            "model_family",
+            "profile_hash",
+        }
+        or reference_override["profile"] == source["frozen"]["config"]["profiles"]["reference"]
+    ):
+        raise ValueError(
+            "reference_model requires a complete changed profile snapshot and an explicit price"
+        )
+    gen_cap = selection.get("generation_max_output_tokens")
+    generation_settings = source["frozen"]["config"]["generation"]
+    if gen_cap is not None and (
+        isinstance(gen_cap, bool)
+        or not isinstance(gen_cap, int)
+        or gen_cap <= 0
+        or gen_cap >= generation_settings["context_limit_tokens"]
+        or gen_cap == generation_settings["max_output_tokens"]
+    ):
+        raise ValueError(
+            "generation_max_output_tokens must change and stay below the context limit"
+        )
+    rounds = selection.get("rounds")
+    if rounds is not None and (
+        isinstance(rounds, bool) or not isinstance(rounds, int) or not 1 <= rounds < 3
+    ):
+        raise ValueError("rounds must reduce the pre-registered three-round schedule (1 or 2)")
     evidence = {row["path"]["path_id"] for row in build_evidence_report(source)["bad_cases"]}
     if not selection["evidence_refs"] or not set(selection["evidence_refs"]) <= evidence:
         raise ValueError("The factor must cite existing exploration evidence")
@@ -211,15 +323,42 @@ def _schedule(bundle: dict[str, Any]) -> None:
     bundle["variants"] = {"old": copy.deepcopy(source["frozen"]), "new": new}
     if factor == "feedback_prompt":
         bundle["variants"]["blind_control"] = copy.deepcopy(source["frozen"])
+    override = selection.get("reference_timeout_seconds")
+    if override is not None:
+        # A runtime-envelope override applies uniformly to every variant; the single
+        # treatment factor still differs only where _variant changed it.
+        for variant in bundle["variants"].values():
+            variant["config"]["reference"]["timeout_seconds"] = override
+            _validate_runtime(variant)
+    gen_cap = selection.get("generation_max_output_tokens")
+    if gen_cap is not None:
+        # Generation output headroom is an envelope parameter applied uniformly;
+        # exceeding the source cap dominated validation failures by truncation.
+        for variant in bundle["variants"].values():
+            variant["config"]["generation"]["max_output_tokens"] = gen_cap
+            _validate_runtime(variant)
+    reference_override = selection.get("reference_model")
+    if reference_override is not None:
+        # The reference is the measurement instrument, not the treatment: swapping
+        # it applies uniformly to every variant, with family isolation re-validated.
+        for variant in bundle["variants"].values():
+            variant["config"]["profiles"]["reference"] = copy.deepcopy(
+                reference_override["profile"]
+            )
+            variant["config"]["prices"][reference_override["profile"]["model_name"]] = (
+                copy.deepcopy(reference_override["price"])
+            )
+            _validate_runtime(variant)
     first_changes = factor.startswith("generation_")
+    total_rounds = selection.get("rounds", 3)
     rng = random.Random(bundle["seed"])
     cases = [
         (set_name, case, repeat)
         for set_name in ("exploration", "confirmation")
         for case in source["frozen"]["dataset"]["sets"][set_name]
-        for repeat in range(1, 4)
+        for repeat in range(1, total_rounds + 1)
     ]
-    if len(cases) != 180:
+    if len(cases) != 60 * total_rounds:
         raise ValueError("Confirmation requires two frozen thirty-input sets and three rounds")
     rng.shuffle(cases)
     for set_name, case, repeat in cases:
@@ -258,7 +397,9 @@ def _schedule(bundle: dict[str, Any]) -> None:
     count = len(bundle["execution_plan"])
     semantics = {
         "generate": (
-            180 * (1 + 2 * len(bundle["variants"])) if factor == "feedback_prompt" else count * 3
+            60 * total_rounds * (1 + 2 * len(bundle["variants"]))
+            if factor == "feedback_prompt"
+            else count * 3
         ),
         "qc": count
         * source["frozen"]["config"]["judge"]["sample_rounds"]
@@ -376,10 +517,11 @@ def run_confirmation(
     smoke: dict[str, Any] | None = None,
     trace_sink: Callable[..., bool | None] | None = None,
     path_limit: int | None = None,
+    workers: int | None = None,
 ) -> dict[str, Any]:
     """Resume seeded paired paths through the existing durable stages and one ledger."""
     from app.engine.quality import _aggregate_score
-    from app.engine.real_evaluation import run_generation
+    from app.engine.real_evaluation import _LEDGER_LOCK, run_generation
     from app.engine.real_experiment import require_reviewed_smoke
     from app.engine.real_judge import run_judge
     from app.engine.real_reference import run_reference_review
@@ -395,22 +537,23 @@ def run_confirmation(
         run["provider_calls"] = bundle["provider_calls"]
 
     def persist() -> None:
-        # The physical ledger is serialized once; stage views rebind it on resume.
-        for nested in bundle["runs"].values():
-            nested.pop("provider_calls", None)
-        try:
-            write_manifest(path, bundle, overwrite=True)
-        finally:
-            for nested in bundle["runs"].values():
-                nested["provider_calls"] = bundle["provider_calls"]
+        with _LEDGER_LOCK:
+            # Serialize through a stripped view instead of mutating shared runs:
+            # concurrent paths keep reading their run dicts (never a missing-key
+            # window), and the physical ledger is written exactly once.
+            stripped = {
+                key: {k: v for k, v in run.items() if k != "provider_calls"}
+                for key, run in bundle["runs"].items()
+            }
+            write_manifest(path, {**bundle, "runs": stripped}, overwrite=True)
 
     persist()
-    # A bounded execution prefix retains the full frozen denominator and order on disk.
-    for planned in bundle["execution_plan"][:path_limit]:
+
+    def process(planned: dict[str, Any]) -> None:
         run = bundle["runs"][planned["run_key"]]
         row = next(item for item in run["execution_plan"] if item["path_id"] == planned["path_id"])
         if row["state"] == "cancelled":
-            continue
+            return
         if factor.startswith("judge_"):
             _inherit(bundle, run, row)
         if offline:
@@ -449,7 +592,7 @@ def run_confirmation(
                         "source_hash": canonical_hash(observed),
                     },
                 }
-            continue
+            return
         bound = clients(run) if callable(clients) else clients[planned["version"]]
         kwargs: dict[str, Any] = {"path_ids": {row["path_id"]}, "persist": persist}
         if trace_sink is not None:
@@ -473,6 +616,24 @@ def run_confirmation(
         run_judge(path, run, client=bound["judge"], **kwargs)
         run_reference_review(path, run, client=bound["reference"], **kwargs)
         persist()
+
+    # A bounded execution prefix retains the full frozen denominator and order on disk.
+    prefix = bundle["execution_plan"][:path_limit]
+    if offline:
+        for planned in prefix:
+            process(planned)
+    else:
+        # Bounded concurrency over independent paths: shared requests (first drafts,
+        # content-addressed reviews) coalesce inside the ledger, so parallel versions
+        # never issue duplicate physical sends. Tests asserting exact send counts
+        # pass workers=1 for deterministic serial accounting.
+        max_workers = workers if workers is not None else CONFIRMATION_WORKERS
+        if max_workers <= 1:
+            for planned in prefix:
+                process(planned)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                list(pool.map(process, prefix))
     persist()
     return bundle
 
