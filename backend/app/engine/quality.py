@@ -188,6 +188,7 @@ def _call_judge_once(
     resp = client.chat.completions.create(
         model=model,
         temperature=settings.JUDGE_TEMPERATURE if temperature is None else temperature,
+        max_tokens=settings.JUDGE_MAX_OUTPUT_TOKENS,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
