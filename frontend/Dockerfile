@@ -1,6 +1,6 @@
 # frontend/Dockerfile —— 多阶段构建前端
 # 阶段 1：使用 Node 构建静态资源
-FROM node:22-alpine AS build
+FROM node:26-alpine AS build
 
 WORKDIR /app
 
