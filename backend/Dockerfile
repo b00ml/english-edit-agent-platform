@@ -1,6 +1,6 @@
 # backend/Dockerfile —— 后端服务镜像
 # 基础镜像：Python 3.12 精简版
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 # 设置工作目录
 WORKDIR /code
